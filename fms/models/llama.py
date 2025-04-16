@@ -130,34 +130,82 @@ class LLaMABlock(nn.Module):
         #     self_attn_past_key_value = None
 
         # first we do MHA and Add&Norm
-        residual = x
+        # residual = x
         x = self.ln(x)
-        x = self.attn(
-            q=x,
-            mask=mask,
-            position_ids=position_ids,
-            attn_algorithm=attn_algorithm,
-            past_key_value_state=self_attn_past_key_value,
-            use_cache=use_cache,
-            is_self=True,
-            is_causal_mask=is_causal_mask,
-        )
-        cache = None
+        
+        # TODO: make a BPT flag or something
+        # TODO: parameterize the following: B_q
+        B_q = 16
+        B_kv = 16
+        
+        # TODO: ask about "cache" here
         if use_cache:
-            x, cache = x
-        if self.config.p_dropout != 0:
-            x = self.dropout(x)
-        # residual connection
-        x = x + residual
+            q_b = torch.split(x, x.shape[1]/B_q, dim=1)
+            k_b= torch.split(past_key_value_state[0], past_key_value_state[0].shape[1]/B_kv, dim=1)
+            v_b = torch.split(past_key_value_state[1], past_key_value_state[0].shape[1]/B_kv, dim=1)
 
-        # then we do FF and Add&Norm
-        residual = x
-        x = self.ff_ln(x)
-        x = self.ff_sub_layer(x)
-        if self.config.p_dropout != 0:
-            x = self.dropout(x)
-        # another residual
-        x = x + residual
+        output = []
+        for i in range(B_q):
+            max = None
+            outer_attn = []
+            qk_b = []
+            residual = q_b[i]
+            for j in range(B_kv):
+                # Replace w/ q_b[i], qkt = self.att()
+                
+                qk = q_b[i] @ k_b[j].transpose(-2, -1)
+                # Safe Softmax??
+                curr_max = torch.max(qk)
+                att = torch.softmax(q_b[i] - curr_max)
+                
+                
+                outer_attn.append(att)
+                qk_b.append(qk)
+                # Update normalization statistic
+                if max:
+                    max = torch.max(max, curr_max)
+                else:
+                    max = curr_max
+            
+            scale = [torch.exp(qk - max) for qk in qk_b]
+            # Att(q_i, k, v)
+            outer_attn = torch.cat([outer_attn[i] * scale[i] for i in range(B_kv)], dim=1)
+            # This does the FF layer on Qi to get ith output block
+            output.append(self.ff_ln(self.ff_sub_layer(outer_attn) + residual) + outer_attn + residual)
+            
+        x = torch.cat(output, dim=1)
+            
+                
+        
+        
+
+        # ! Below is forward NOT using BPT        
+        # x = self.attn(
+        #     q=x,
+        #     mask=mask,
+        #     position_ids=position_ids,
+        #     attn_algorithm=attn_algorithm,
+        #     past_key_value_state=self_attn_past_key_value,
+        #     use_cache=use_cache,
+        #     is_self=True,
+        #     is_causal_mask=is_causal_mask,
+        # )
+        # cache = None
+        # if use_cache:
+        #     x, cache = x
+        # if self.config.p_dropout != 0:
+        #     x = self.dropout(x)
+        # # residual connection
+        # x = x + residual
+
+        # # then we do FF and Add&Norm
+        # residual = x
+        # x = self.ff_ln(x)
+        # x = self.ff_sub_layer(x)
+        # if self.config.p_dropout != 0:
+        #     x = self.dropout(x)
+        # # another residual
+        # x = x + residual
 
         if use_cache:
             return (x, cache)

@@ -12,6 +12,8 @@ from fms.distributed.strategy import (
     NoOpStrategy,
     TensorParallelStrategy,
 )
+
+from fms.models.attentionhelper import RingAttentionEngine
 from fms.modules.attention import MultiHeadAttention
 from fms.modules.embedding import WordEmbedding
 from fms.modules.feedforward import GatedLinearUnit
@@ -111,7 +113,77 @@ class LLaMABlock(nn.Module):
         if self.config.p_dropout != 0:
             self.dropout = nn.Dropout(self.config.p_dropout)
 
+    def compute_local_qkv_and_rope(self, attn_data, q, k=None, v=None, position_ids=None, use_cache=False, past_key_value_state=None, is_self=True):
+        B, T, _ = q.shape
+        q_out, k_out, v_out = attn_data.in_proj(q, k, v)
+
+        queries = q_out.view(B, T, attn_data.nheads, attn_data.emb_kq_per_head)
+        keys = k_out.view(B, T, attn_data.kvheads, attn_data.emb_kq_per_head)
+        values = v_out.view(B, T, attn_data.kvheads, attn_data.emb_v_per_head)
+
+        if attn_data.position_encoder is not None:
+            if position_ids is None:
+                position_ids = torch.arange(T, device=q.device).unsqueeze(0).expand(B, -1)
+            queries, keys = attn_data.position_encoder.adjusted_qk(queries, keys, position_ids, past_key_value_state, use_cache)
+
+        return queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
+    
     def forward(
+        self,
+        x,
+        *,
+        mask=None,
+        position_ids=None,
+        past_key_value_state=None,
+        use_cache=False,
+        is_causal_mask=False,
+        attn_algorithm=None,
+    ):
+        x_ln = self.ln(x)
+
+        queries, keys, values = self.compute_local_qkv_and_rope(
+            self.attn,
+            q=x_ln,
+            k=x_ln,
+            v=x_ln,
+            position_ids=position_ids,
+            use_cache=use_cache,
+            past_key_value_state=past_key_value_state,
+            is_self=True,
+        )
+
+        # === Cache handling
+        if use_cache and past_key_value_state is not None and past_key_value_state[0].numel() > 0:
+            keys = torch.cat((past_key_value_state[0], keys), dim=2)
+            values = torch.cat((past_key_value_state[1], values), dim=2)
+
+        # === Expand for GQA
+        expansion = self.attn.nheads // self.attn.kvheads
+        keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
+        values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
+
+        engine_is_causal = is_causal_mask and mask is None
+
+        engine = RingAttentionEngine(
+            block_size=32,
+            attn=self.attn,
+            ff=self.ff_sub_layer,
+            ff_norm=self.ff_ln,
+            is_causal=engine_is_causal 
+        )
+
+        x_out = engine.forward_full(
+            q_global=queries,
+            k_global=keys_e,
+            v_global=values_e,
+            mask_global=mask, 
+            x_global=x   
+        )
+
+        return (x_out, (keys, values)) if use_cache else x_out
+
+    # will later change this to be configurable once we decide on the final architecture
+    def forward_old(
         self,
         x,
         *,

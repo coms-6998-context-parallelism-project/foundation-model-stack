@@ -2,7 +2,7 @@ import dataclasses
 import logging
 import math
 import re
-from typing import Any, List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,7 @@ from fms.modules.ssm import SSM, SSMCacheUnit
 from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
+import 
 
 
 logger = logging.getLogger(__name__)
@@ -439,7 +440,7 @@ class Bamba(nn.Module):
         mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value_states: Optional[
-            List[SSMCacheUnit | Tuple[torch.FloatTensor,]]
+            List[Union[SSMCacheUnit, Tuple[torch.FloatTensor]]]
         ] = None,
         use_cache: bool = False,
         only_last_token: bool = False,

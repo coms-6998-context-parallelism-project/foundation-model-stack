@@ -191,7 +191,7 @@ class RingAttentionEngine:
     def update_max_attn(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, current_max_score: Tensor) -> Tensor:
 
         attn_scores = self.raw_attention(q, k, mask, q_indices, k_indices)
-        block_max = attn_scores.masked_fill(attn_scores == -torch.inf, -1e10).amax(dim=-1, keepdim=True)
+        block_max = attn_scores.masked_fill(attn_scores == -torch.inf, torch.finfo(attn_scores.dtype).min).amax(dim=-1, keepdim=True)
         return torch.maximum(current_max_score, block_max)
 
     def update_totals(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, final_max_score: Tensor, current_num: Tensor, current_den: Tensor) -> Tuple[Tensor, Tensor]:

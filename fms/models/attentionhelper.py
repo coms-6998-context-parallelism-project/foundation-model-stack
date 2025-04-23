@@ -3,6 +3,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, List
 import threading
+import torch.distributed as dist
 import queue
 
 import torch
@@ -48,67 +49,98 @@ class RingAttentionEngine:
 
 
     # main method
-    def forward_full(self, q_global: Tensor, k_global: Tensor, v_global: Tensor, mask_global: Optional[Tensor], x_global: Tensor) -> Tensor:
+    import torch.multiprocessing as mp
+    import torch.distributed as dist
+    from typing import List
+
+    def forward_full(self, q_global: Tensor, k_global: Tensor, v_global: Tensor,
+                    mask_global: Optional[Tensor], x_global: Tensor) -> Tensor:
 
         T_q = q_global.shape[2]
-
         q_starts = list(range(0, T_q, self.block_size))
-        num_blocks = len(q_starts) # Renamed from num_threads
-        if num_blocks == 0: return torch.empty_like(x_global)
+        num_blocks = len(q_starts)
+        if num_blocks == 0:
+            return torch.empty_like(x_global)
 
-        result_buffer: Dict[int, Tensor] = {}
+        # --- Shared holder for results ---
+        mp_manager = mp.Manager()
+        result_holder = mp_manager.dict()
 
-        block_queues = [queue.Queue() for _ in range(num_blocks)] # Renamed
-        max_barrier = threading.Barrier(num_blocks) # Renamed
-        sum_barrier = threading.Barrier(num_blocks) # Renamed
+        # --- Launch worker processes ---
+        def worker_fn(rank, q_global, k_global, v_global, x_global, mask_global, result_holder):
+            dist.init_process_group(backend="nccl", rank=rank, world_size=num_blocks)
+            torch.cuda.set_device(rank)
 
-        threads = []
-        for block_id, q_start in enumerate(q_starts):
+            q_start = q_starts[rank]
             q_end = min(q_start + self.block_size, T_q)
-            q_block, k_block, v_block, x_block = (
-                q_global[:, :, q_start:q_end, :],
-                k_global[:, :, q_start:q_end, :],
-                v_global[:, :, q_start:q_end, :],
-                x_global[:, q_start:q_end, :]
-            )
 
             block_data = BlockData(
-                engine_instance=self, block_id=block_id, num_blocks=num_blocks, q_start=q_start, q_end=q_end, mask_global=mask_global, block_queues=block_queues, 
-                await_max=max_barrier, await_sums=sum_barrier, result_buffer=result_buffer, q_block=q_block, k_local=k_block, v_local=v_block, x_block=x_block
+                engine_instance=self,
+                block_id=rank,
+                num_blocks=num_blocks,
+                q_start=q_start,
+                q_end=q_end,
+                mask_global=mask_global,
+                block_queues=None,  # unused in CUDA version
+                await_max=None,
+                await_sums=None,
+                result_buffer=None,
+                q_block=q_global[:, :, q_start:q_end, :].to(rank),
+                k_local=k_global[:, :, q_start:q_end, :].to(rank),
+                v_local=v_global[:, :, q_start:q_end, :].to(rank),
+                x_block=x_global[:, q_start:q_end, :].to(rank)
             )
 
-            thread = threading.Thread(target=RingAttentionEngine.block_worker, args=(block_data,), daemon=True)
-            threads.append(thread)
-            thread.start()
+            result = self.block_worker(rank, num_blocks, self, block_data)
+            result_holder[rank] = result.cpu()
 
-        for thread in threads: thread.join()
+            dist.barrier()
+            dist.destroy_process_group()
 
-        ordered_results = [result_buffer[q_start] for q_start in q_starts]
-        return torch.cat(ordered_results, dim=1)
-    
+        mp.spawn(
+            fn=worker_fn,
+            args=(q_global, k_global, v_global, x_global, mask_global, result_holder),
+            nprocs=num_blocks,
+            join=True
+        )
+
+        # --- Merge final result ---
+        ordered_results: List[Tensor] = [result_holder[i] for i in range(num_blocks)]
+        return torch.cat(ordered_results, dim=1).to(q_global.device)
+
     # block outline
     @staticmethod
-    def block_worker(args: BlockData):
+    def block_worker(rank: int, world_size: int, engine: 'RingAttentionEngine', args: BlockData) -> Tensor:
+        """
+        Run attention block worker as a distributed process (rank = block_id).
+        Each process must have its own args, where args.block_id == rank.
+        """
+        torch.cuda.set_device(rank)  # Set device if needed (multi-GPU setup)
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
 
-        engine = args.engine_instance
+        # Step 1: Init values
         initial_max_score, initial_num, initial_den = engine.init_values(args.q_block)
 
+        # Step 2: Max pass
         final_max_score = engine.compute_max_score(args, initial_max_score)
-        args.await_max.wait()
+        dist.barrier()  # Sync all ranks before next step
 
+        # Step 3: Sum pass
         final_num, final_den = engine.compute_sums(args, final_max_score, initial_num, initial_den)
-        args.await_sums.wait()
+        dist.barrier()  # Sync all ranks again
 
-        args.result_buffer[args.q_start] = engine.compute_block_output(args.x_block, final_num, final_den)
+        # Step 4: Final output for this block
+        result = engine.compute_block_output(args.x_block, final_num, final_den)
+
+        return result  # You can collect this in the caller
 
 
     """ compute max scores for stability (first flash pass) """
     def compute_max_score(self, args: BlockData, initial_max_score: Tensor) -> Tensor:
-
         engine = args.engine_instance
 
         next_block_id = (args.block_id + 1) % args.num_blocks
-        send_q, recv_q = args.block_queues[next_block_id], args.block_queues[args.block_id]
+        prev_block_id = (args.block_id - 1 + args.num_blocks) % args.num_blocks
 
         device = args.q_block.device
         q_indices = torch.arange(args.q_start, args.q_end, device=device)
@@ -118,22 +150,38 @@ class RingAttentionEngine:
         current_k, current_k_idx, current_k_global_start = args.k_local, local_k_indices, args.q_start
 
         for i in range(args.num_blocks):
-            mask = args.mask_global[:, :, args.q_start:args.q_end, current_k_global_start:current_k_global_start+current_k.shape[2]] if args.mask_global is not None else None
+            if args.mask_global is not None:
+                mask = args.mask_global[:, :, args.q_start:args.q_end, current_k_global_start:current_k_global_start+current_k.shape[2]]
+            else:
+                mask = None
 
             max_score = engine.update_max_attn(args.q_block, current_k, mask, q_indices, current_k_idx, max_score)
+
             if i < args.num_blocks - 1:
-                send_q.put((current_k, current_k_idx, current_k_global_start))
-                current_k, current_k_idx, current_k_global_start = recv_q.get()
+                # Send to next block
+                dist.send(current_k, dst=next_block_id)
+                dist.send(current_k_idx, dst=next_block_id)
+                dist.send(torch.tensor([current_k_global_start], dtype=torch.long, device=device), dst=next_block_id)
+
+                # Receive from previous block
+                current_k = torch.empty_like(current_k)
+                dist.recv(current_k, src=prev_block_id)
+
+                current_k_idx = torch.empty_like(current_k_idx)
+                dist.recv(current_k_idx, src=prev_block_id)
+
+                g_start_tensor = torch.empty((1,), dtype=torch.long, device=device)
+                dist.recv(g_start_tensor, src=prev_block_id)
+                current_k_global_start = g_start_tensor.item()
 
         return max_score
 
+
     """ sum loop """
     def compute_sums(self, args: BlockData, final_max_score: Tensor, initial_num: Tensor, initial_den: Tensor) -> Tuple[Tensor, Tensor]:
-
         engine = args.engine_instance
         prev_block_id = (args.block_id - 1 + args.num_blocks) % args.num_blocks
         next_block_id = (args.block_id + 1) % args.num_blocks
-        send_q, recv_q = args.block_queues[next_block_id], args.block_queues[args.block_id]
 
         device = args.q_block.device
         q_indices = torch.arange(args.q_start, args.q_end, device=device)
@@ -143,14 +191,36 @@ class RingAttentionEngine:
         current_k, current_v, current_k_idx, current_k_global_start = args.k_local, args.v_local, local_k_indices, args.q_start
 
         for i in range(args.num_blocks):
-            mask = args.mask_global[:, :, args.q_start:args.q_end, current_k_global_start:current_k_global_start+current_k.shape[2]] if args.mask_global is not None else None
+            if args.mask_global is not None:
+                mask = args.mask_global[:, :, args.q_start:args.q_end, current_k_global_start:current_k_global_start+current_k.shape[2]]
+            else:
+                mask = None
 
             num, den = engine.update_totals(args.q_block, current_k, current_v, mask, q_indices, current_k_idx, final_max_score, num, den)
+
             if i < args.num_blocks - 1:
-                send_q.put((current_k, current_v, current_k_idx, current_k_global_start))
-                current_k, current_v, current_k_idx, current_k_global_start = recv_q.get()
+                # Send to next block
+                dist.send(current_k, dst=next_block_id)
+                dist.send(current_v, dst=next_block_id)
+                dist.send(current_k_idx, dst=next_block_id)
+                dist.send(torch.tensor([current_k_global_start], dtype=torch.long, device=device), dst=next_block_id)
+
+                # Receive from previous block
+                current_k = torch.empty_like(current_k)
+                dist.recv(current_k, src=prev_block_id)
+
+                current_v = torch.empty_like(current_v)
+                dist.recv(current_v, src=prev_block_id)
+
+                current_k_idx = torch.empty_like(current_k_idx)
+                dist.recv(current_k_idx, src=prev_block_id)
+
+                g_start_tensor = torch.empty((1,), dtype=torch.long, device=device)
+                dist.recv(g_start_tensor, src=prev_block_id)
+                current_k_global_start = g_start_tensor.item()
 
         return num, den
+
     
     """ final output """
     def compute_block_output(self, x: Tensor, num: Tensor, den: Tensor) -> Tensor:

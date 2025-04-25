@@ -140,8 +140,6 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
     ):
-        
-
         rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
 
@@ -152,16 +150,6 @@ class LLaMABlock(nn.Module):
         end_idx = min((rank + 1) * bs_per_rank, B)
 
         x = x[start_idx:end_idx]
-
-        if x.size(0) == 0:
-            # This rank has no batch slice — return dummy
-            dummy = torch.zeros((0, x.size(1), self.ln.normalized_shape), device=x.device, dtype=x.dtype)
-
-
-            return dummy
-
-        if x.shape[0] == 0:
-            return torch.empty(0, *x.shape[1:], device=x.device, dtype=x.dtype)
         position_ids = position_ids[start_idx:end_idx] if position_ids is not None else None
         mask = mask[start_idx:end_idx] if mask is not None else None
         if past_key_value_state is not None and past_key_value_state[0] is not None:
@@ -169,6 +157,18 @@ class LLaMABlock(nn.Module):
                 past_key_value_state[0][:, :, start_idx:end_idx, :],
                 past_key_value_state[1][:, :, start_idx:end_idx, :]
             )
+
+        # --- Early exit if no batch slice ---
+        if x.size(0) == 0:
+            dummy = torch.zeros((0, 1, self.ln.normalized_shape[0]), device=x.device, dtype=x.dtype)
+            if use_cache:
+                empty_kv = (
+                    torch.zeros((self.attn.kvheads, dummy.size(1), 0, self.attn.head_dim), device=x.device, dtype=x.dtype),
+                    torch.zeros((self.attn.kvheads, dummy.size(1), 0, self.attn.head_dim), device=x.device, dtype=x.dtype),
+                )
+                return dummy, empty_kv
+            else:
+                return dummy
 
         # --- Normal forward ---
         x_ln = self.ln(x)
@@ -199,7 +199,7 @@ class LLaMABlock(nn.Module):
             attn=self.attn,
             ff=self.ff_sub_layer,
             ff_norm=self.ff_ln,
-            is_causal=engine_is_causal
+            is_causal=engine_is_causal,
         )
 
         x_out = engine.forward_full(
@@ -207,10 +207,11 @@ class LLaMABlock(nn.Module):
             k_global=keys_e,
             v_global=values_e,
             mask_global=mask,
-            x_global=x
+            x_global=x,
         )
 
         return (x_out, (keys, values)) if use_cache else x_out
+
 
 
     # will later change this to be configurable once we decide on the final architecture

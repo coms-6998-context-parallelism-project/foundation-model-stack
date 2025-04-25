@@ -105,6 +105,10 @@ class RingAttentionEngine:
         Each process must have its own args, where args.block_id == rank.
         """
 
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+
+
         # Step 1: Init values
         initial_max_score, initial_num, initial_den = engine.init_values(args.q_block)
 

@@ -153,6 +153,11 @@ class LLaMABlock(nn.Module):
 
         x = x[start_idx:end_idx]
 
+        if x.size(0) == 0:
+            # This rank has no batch slice — return dummy
+            dummy = torch.zeros((0, x.size(1), self.ln.normalized_shape[0]), device=x.device, dtype=x.dtype)
+            return dummy
+
         if x.shape[0] == 0:
             return torch.empty(0, *x.shape[1:], device=x.device, dtype=x.dtype)
         position_ids = position_ids[start_idx:end_idx] if position_ids is not None else None

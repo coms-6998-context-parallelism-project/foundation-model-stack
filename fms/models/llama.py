@@ -156,6 +156,7 @@ class LLaMABlock(nn.Module):
         if x.size(0) == 0:
             # This rank has no batch slice — return dummy
             dummy = torch.zeros((0, x.size(1), self.ln.normalized_shape[0]), device=x.device, dtype=x.dtype)
+
             return dummy
 
         if x.shape[0] == 0:

@@ -159,8 +159,9 @@ class LLaMABlock(nn.Module):
             )
 
         # --- Early exit if no batch slice ---
-        if x.size(0) == 0:
-            dummy = torch.zeros((0, 1, self.ln.normalized_shape[0]), device=x.device, dtype=x.dtype)
+        if x.shape[0] == 0:
+            hidden_dim = self.ln.normalized_shape[0]  # <- FIX here!
+            dummy = torch.zeros((0, 1, hidden_dim), device=x.device, dtype=x.dtype)
             if use_cache:
                 empty_kv = (
                     torch.zeros((self.attn.kvheads, dummy.size(1), 0, self.attn.head_dim), device=x.device, dtype=x.dtype),
@@ -169,6 +170,7 @@ class LLaMABlock(nn.Module):
                 return dummy, empty_kv
             else:
                 return dummy
+
 
         # --- Normal forward ---
         x_ln = self.ln(x)

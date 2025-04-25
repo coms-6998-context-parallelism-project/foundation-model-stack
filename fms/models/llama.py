@@ -225,10 +225,19 @@ class LLaMABlock(nn.Module):
         )
 
                 # --- Defensive fix before returning output ---
-        if x_out.shape[-1] == 0:
-            # Patch to match expected hidden size
+       # Defensive fix: always return tensor with correct hidden_dim
+        if x.shape[0] == 0:
             hidden_dim = self.ln.normalized_shape if isinstance(self.ln.normalized_shape, int) else self.ln.normalized_shape[0]
-            x_out = x_out.new_empty(x_out.shape[0], x_out.shape[1], hidden_dim)
+            seq_len = x.shape[1]
+            dummy = x.new_empty((0, seq_len, hidden_dim), dtype=x.dtype, device=x.device)
+
+            if use_cache:
+                k = x.new_empty((self.attn.kvheads, seq_len, 0, self.attn.head_dim), dtype=x.dtype, device=x.device)
+                v = x.new_empty_like(k)
+                return dummy, (k, v)
+            
+            return dummy
+
 
 
         return (x_out, (keys, values)) if use_cache else x_out

@@ -140,10 +140,25 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
     ):
-        
-
         rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+        # --- Batch sharding ---
+        B = x.shape[0]
+        bs_per_rank = (B + world_size - 1) // world_size
+        start_idx = rank * bs_per_rank
+        end_idx = min((rank + 1) * bs_per_rank, B)
+
+        x = x[start_idx:end_idx]
+        position_ids = position_ids[start_idx:end_idx] if position_ids is not None else None
+        mask = mask[start_idx:end_idx] if mask is not None else None
+        if past_key_value_state is not None and past_key_value_state[0] is not None:
+            past_key_value_state = (
+                past_key_value_state[0][:, :, start_idx:end_idx, :],
+                past_key_value_state[1][:, :, start_idx:end_idx, :]
+            )
+
+        # --- Normal forward ---
         x_ln = self.ln(x)
 
         queries, keys, values = self.compute_local_qkv_and_rope(
@@ -157,12 +172,10 @@ class LLaMABlock(nn.Module):
             is_self=True,
         )
 
-        # === Cache handling
         if use_cache and past_key_value_state is not None and past_key_value_state[0].numel() > 0:
             keys = torch.cat((past_key_value_state[0], keys), dim=2)
             values = torch.cat((past_key_value_state[1], values), dim=2)
 
-        # === Expand for GQA
         expansion = self.attn.nheads // self.attn.kvheads
         keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
         values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
@@ -174,18 +187,19 @@ class LLaMABlock(nn.Module):
             attn=self.attn,
             ff=self.ff_sub_layer,
             ff_norm=self.ff_ln,
-            is_causal=engine_is_causal 
+            is_causal=engine_is_causal
         )
 
         x_out = engine.forward_full(
             q_global=queries,
             k_global=keys_e,
             v_global=values_e,
-            mask_global=mask, 
-            x_global=x   
+            mask_global=mask,
+            x_global=x
         )
 
         return (x_out, (keys, values)) if use_cache else x_out
+
 
     # will later change this to be configurable once we decide on the final architecture
     def forward_old(

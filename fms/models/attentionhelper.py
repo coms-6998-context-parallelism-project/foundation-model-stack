@@ -57,58 +57,40 @@ class RingAttentionEngine:
 
     def forward_full(self, q_global: Tensor, k_global: Tensor, v_global: Tensor,
                     mask_global: Optional[Tensor], x_global: Tensor) -> Tensor:
-
         T_q = q_global.shape[2]
         q_starts = list(range(0, T_q, self.block_size))
         num_blocks = len(q_starts)
         if num_blocks == 0:
             return torch.empty_like(x_global)
 
-        # --- Shared holder for results ---
-        mp_manager = mp.Manager()
-        result_holder = mp_manager.dict()
+        results = []
 
-        # --- Launch worker processes ---
-        def worker_fn(rank, q_global, k_global, v_global, x_global, mask_global, result_holder):
-            dist.init_process_group(backend="nccl", rank=rank, world_size=num_blocks)
-            torch.cuda.set_device(rank)
-
-            q_start = q_starts[rank]
+        for block_id, q_start in enumerate(q_starts):
             q_end = min(q_start + self.block_size, T_q)
 
             block_data = BlockData(
                 engine_instance=self,
-                block_id=rank,
+                block_id=block_id,
                 num_blocks=num_blocks,
                 q_start=q_start,
                 q_end=q_end,
                 mask_global=mask_global,
-                block_queues=None,  # unused in CUDA version
+                block_queues=None,  # unused
                 await_max=None,
                 await_sums=None,
                 result_buffer=None,
-                q_block=q_global[:, :, q_start:q_end, :].to(rank),
-                k_local=k_global[:, :, q_start:q_end, :].to(rank),
-                v_local=v_global[:, :, q_start:q_end, :].to(rank),
-                x_block=x_global[:, q_start:q_end, :].to(rank)
+                q_block=q_global[:, :, q_start:q_end, :],
+                k_local=k_global[:, :, q_start:q_end, :],
+                v_local=v_global[:, :, q_start:q_end, :],
+                x_block=x_global[:, q_start:q_end, :]
             )
 
-            result = self.block_worker(rank, num_blocks, self, block_data)
-            result_holder[rank] = result.cpu()
+            # Directly call worker (no spawn)
+            result = self.block_worker(block_id, num_blocks, self, block_data)
+            results.append(result)
 
-            dist.barrier()
-            dist.destroy_process_group()
+        return torch.cat(results, dim=1)
 
-        mp.spawn(
-            fn=worker_fn,
-            args=(q_global, k_global, v_global, x_global, mask_global, result_holder),
-            nprocs=num_blocks,
-            join=True
-        )
-
-        # --- Merge final result ---
-        ordered_results: List[Tensor] = [result_holder[i] for i in range(num_blocks)]
-        return torch.cat(ordered_results, dim=1).to(q_global.device)
 
     # block outline
     @staticmethod
@@ -117,8 +99,6 @@ class RingAttentionEngine:
         Run attention block worker as a distributed process (rank = block_id).
         Each process must have its own args, where args.block_id == rank.
         """
-        torch.cuda.set_device(rank)  # Set device if needed (multi-GPU setup)
-        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
 
         # Step 1: Init values
         initial_max_score, initial_num, initial_den = engine.init_values(args.q_block)

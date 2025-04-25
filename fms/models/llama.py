@@ -129,6 +129,7 @@ class LLaMABlock(nn.Module):
 
         return queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
     
+    
     def forward(
         self,
         x,
@@ -160,18 +161,17 @@ class LLaMABlock(nn.Module):
 
         # --- Early exit if no batch slice ---
         if x.shape[0] == 0:
-            hidden_dim = self.ln.normalized_shape  # <- no [0] !!!
-            dummy = torch.zeros((0, 1, hidden_dim), device=x.device, dtype=x.dtype)
+            hidden_dim = self.ln.normalized_shape[0]
+            seq_len = x.shape[1]
+            dummy = torch.zeros((0, seq_len, hidden_dim), device=x.device, dtype=x.dtype)
             if use_cache:
                 empty_kv = (
-                    torch.zeros((self.attn.kvheads, dummy.size(1), 0, self.attn.head_dim), device=x.device, dtype=x.dtype),
-                    torch.zeros((self.attn.kvheads, dummy.size(1), 0, self.attn.head_dim), device=x.device, dtype=x.dtype),
+                    torch.zeros((self.attn.kvheads, seq_len, 0, self.attn.head_dim), device=x.device, dtype=x.dtype),
+                    torch.zeros((self.attn.kvheads, seq_len, 0, self.attn.head_dim), device=x.device, dtype=x.dtype),
                 )
                 return dummy, empty_kv
             else:
                 return dummy
-
-
 
         # --- Normal forward ---
         x_ln = self.ln(x)
@@ -214,6 +214,7 @@ class LLaMABlock(nn.Module):
         )
 
         return (x_out, (keys, values)) if use_cache else x_out
+
 
 
 

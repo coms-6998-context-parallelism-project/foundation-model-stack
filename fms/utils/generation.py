@@ -4,6 +4,7 @@ from typing import Any, Callable, Iterable, List, MutableMapping, Optional, Tupl
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 
 
 logger = logging.getLogger(__name__)
@@ -280,11 +281,21 @@ def generate(
                 i + prompt_length, logits, next_val, kwargs
             )
 
-        if next_val.shape[-1] == 0:
-            # If the next_val is empty in hidden_dim, skip
-            print(f"[RANK {dist.get_rank()} WARNING] next_val empty at token {i}, skipping append")
-        else:
-            result = torch.cat((result, next_val), dim=-1)
+        # --- Defensive check ---
+        if next_val is None or next_val.numel() == 0:
+            # Skip if the next_val is completely empty
+            if dist.is_initialized():
+                print(f"[RANK {dist.get_rank()} WARNING] next_val empty at token {i}, skipping append")
+            else:
+                print(f"[WARNING] next_val empty at token {i}, skipping append")
+            continue
+
+        if result.shape[0] != next_val.shape[0]:
+            raise ValueError(
+                f"Batch size mismatch: result {result.shape} vs next_val {next_val.shape}"
+            )
+
+        result = torch.cat((result, next_val), dim=-1)
 
 
         # avoid continuing to generate if all have reached EOS

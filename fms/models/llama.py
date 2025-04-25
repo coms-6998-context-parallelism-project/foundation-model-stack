@@ -141,8 +141,6 @@ class LLaMABlock(nn.Module):
         attn_algorithm=None,
     ):
         
-        if x.shape[0] == 0:
-            return torch.empty(0, *x.shape[1:], device=x.device, dtype=x.dtype)
 
         rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -154,6 +152,9 @@ class LLaMABlock(nn.Module):
         end_idx = min((rank + 1) * bs_per_rank, B)
 
         x = x[start_idx:end_idx]
+
+        if x.shape[0] == 0:
+            return torch.empty(0, *x.shape[1:], device=x.device, dtype=x.dtype)
         position_ids = position_ids[start_idx:end_idx] if position_ids is not None else None
         mask = mask[start_idx:end_idx] if mask is not None else None
         if past_key_value_state is not None and past_key_value_state[0] is not None:

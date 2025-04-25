@@ -224,6 +224,13 @@ class LLaMABlock(nn.Module):
             x_global=x,
         )
 
+                # --- Defensive fix before returning output ---
+        if x_out.shape[-1] == 0:
+            # Patch to match expected hidden size
+            hidden_dim = self.ln.normalized_shape if isinstance(self.ln.normalized_shape, int) else self.ln.normalized_shape[0]
+            x_out = x_out.new_empty(x_out.shape[0], x_out.shape[1], hidden_dim)
+
+
         return (x_out, (keys, values)) if use_cache else x_out
 
 

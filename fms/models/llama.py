@@ -144,20 +144,35 @@ class LLaMABlock(nn.Module):
         rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-        # --- Batch sharding ---
-        B = x.shape[0]
-        bs_per_rank = (B + world_size - 1) // world_size
-        start_idx = rank * bs_per_rank
-        end_idx = min((rank + 1) * bs_per_rank, B)
+        # --- Safe batch sharding using torch.chunk ---
+        chunks_x = torch.chunk(x, world_size, dim=0)
+        x = chunks_x[rank] if rank < len(chunks_x) else x.new_empty((0, x.shape[1], x.shape[2]))
 
-        x = x[start_idx:end_idx]
-        position_ids = position_ids[start_idx:end_idx] if position_ids is not None else None
-        mask = mask[start_idx:end_idx] if mask is not None else None
+        if mask is not None:
+            chunks_mask = torch.chunk(mask, world_size, dim=0)
+            mask = chunks_mask[rank] if rank < len(chunks_mask) else mask.new_empty((0,) + mask.shape[1:], dtype=mask.dtype)
+
+        if position_ids is not None:
+            chunks_pos = torch.chunk(position_ids, world_size, dim=0)
+            position_ids = chunks_pos[rank] if rank < len(chunks_pos) else position_ids.new_empty((0, position_ids.shape[1]), dtype=position_ids.dtype)
+
         if past_key_value_state is not None and past_key_value_state[0] is not None:
-            past_key_value_state = (
-                past_key_value_state[0][:, :, start_idx:end_idx, :],
-                past_key_value_state[1][:, :, start_idx:end_idx, :]
-            )
+            k, v = past_key_value_state
+            chunks_k = torch.chunk(k, world_size, dim=2)  # dim=2 is batch dim in shape [n_heads, seq, B, dim]
+            chunks_v = torch.chunk(v, world_size, dim=2)
+            k_chunk = chunks_k[rank] if rank < len(chunks_k) else k.new_empty(k.shape[:2] + (0, k.shape[3]), dtype=k.dtype)
+            v_chunk = chunks_v[rank] if rank < len(chunks_v) else v.new_empty(v.shape[:2] + (0, v.shape[3]), dtype=v.dtype)
+            past_key_value_state = (k_chunk, v_chunk)
+
+
+        # x = x[start_idx:end_idx]
+        # position_ids = position_ids[start_idx:end_idx] if position_ids is not None else None
+        # mask = mask[start_idx:end_idx] if mask is not None else None
+        # if past_key_value_state is not None and past_key_value_state[0] is not None:
+        #     past_key_value_state = (
+        #         past_key_value_state[0][:, :, start_idx:end_idx, :],
+        #         past_key_value_state[1][:, :, start_idx:end_idx, :]
+        #     )
 
         # --- Early exit if no batch slice ---
         if x.shape[0] == 0:

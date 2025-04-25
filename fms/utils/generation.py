@@ -280,7 +280,12 @@ def generate(
                 i + prompt_length, logits, next_val, kwargs
             )
 
-        result = torch.cat((result, next_val), dim=-1)
+        if next_val.shape[-1] == 0:
+            # If the next_val is empty in hidden_dim, skip
+            print(f"[RANK {dist.get_rank()} WARNING] next_val empty at token {i}, skipping append")
+        else:
+            result = torch.cat((result, next_val), dim=-1)
+
 
         # avoid continuing to generate if all have reached EOS
         if eos_token_id is not None:

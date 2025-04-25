@@ -89,7 +89,12 @@ class RingAttentionEngine:
             result = self.block_worker(block_id, num_blocks, self, block_data)
             results.append(result)
 
-        return torch.cat(results, dim=1)
+        non_empty_results = [r for r in results if r.numel() > 0]
+        if not non_empty_results:
+            return torch.empty(0, *x_global.shape[1:], device=x_global.device, dtype=x_global.dtype)
+
+        return torch.cat(non_empty_results, dim=1)
+
 
 
     # block outline

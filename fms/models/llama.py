@@ -165,16 +165,6 @@ class LLaMABlock(nn.Module):
             past_key_value_state = (k_chunk, v_chunk)
 
 
-        # x = x[start_idx:end_idx]
-        # position_ids = position_ids[start_idx:end_idx] if position_ids is not None else None
-        # mask = mask[start_idx:end_idx] if mask is not None else None
-        # if past_key_value_state is not None and past_key_value_state[0] is not None:
-        #     past_key_value_state = (
-        #         past_key_value_state[0][:, :, start_idx:end_idx, :],
-        #         past_key_value_state[1][:, :, start_idx:end_idx, :]
-        #     )
-
-        # --- Early exit if no batch slice ---
         if x.shape[0] == 0:
             # Get hidden size from layer norm (can be int or tuple)
             hidden_dim = self.ln.normalized_shape if isinstance(self.ln.normalized_shape, int) else self.ln.normalized_shape[0]

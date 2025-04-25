@@ -68,6 +68,9 @@ class RingAttentionEngine:
         for block_id, q_start in enumerate(q_starts):
             q_end = min(q_start + self.block_size, T_q)
 
+            if q_end <= q_start:
+                continue
+
             block_data = BlockData(
                 engine_instance=self,
                 block_id=block_id,
@@ -217,7 +220,8 @@ class RingAttentionEngine:
     def compute_block_output(self, x: Tensor, num: Tensor, den: Tensor) -> Tensor:
 
         B, q_len, E = x.shape; H, D_v = num.shape[1], num.shape[3]
-        attn_out_h = num / (den + 10-10)
+        den = den.clamp(min=1e-6)
+        attn_out_h = num / den
         attn_out = attn_out_h.transpose(1, 2).contiguous().view(B, q_len, H * D_v)
         attn_out = self.attn.dense(attn_out)
         residual_1 = x + attn_out

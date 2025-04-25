@@ -140,6 +140,10 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
     ):
+        
+        if x.shape[0] == 0:
+            return torch.empty(0, *x.shape[1:], device=x.device, dtype=x.dtype)
+
         rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
 

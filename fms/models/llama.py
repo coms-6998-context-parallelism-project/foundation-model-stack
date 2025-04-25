@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Tuple
 
+import os
 import torch
 import torch.nn as nn
 
@@ -139,6 +140,10 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
     ):
+        
+
+        rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
         x_ln = self.ln(x)
 
         queries, keys, values = self.compute_local_qkv_and_rope(

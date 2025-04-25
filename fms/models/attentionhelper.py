@@ -13,6 +13,11 @@ from torch import Tensor, nn
 from fms.modules.attention import MultiHeadAttention
 from fms.modules.feedforward import GatedLinearUnit
 
+# main method
+import torch.multiprocessing as mp
+import torch.distributed as dist
+from typing import List
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -48,10 +53,7 @@ class RingAttentionEngine:
         self.scale = math.sqrt(self.head_dim)
 
 
-    # main method
-    import torch.multiprocessing as mp
-    import torch.distributed as dist
-    from typing import List
+
 
     def forward_full(self, q_global: Tensor, k_global: Tensor, v_global: Tensor,
                     mask_global: Optional[Tensor], x_global: Tensor) -> Tensor:

@@ -131,17 +131,22 @@ if args.deterministic:
     np.random.seed(SEED)  # numpy random seed
     torch.use_deterministic_algorithms(True)
 
-if args.distributed:
-    dist.init_process_group()
+local_rank = int(os.getenv("LOCAL_RANK", 0))
+world_size = int(os.getenv("WORLD_SIZE", 1))
+
+if world_size > 1 and not dist.is_initialized():
+    backend = "nccl" if args.device_type == "cuda" else "gloo"
+    dist.init_process_group(backend=backend, init_method="env://")
+
 
 print("loading model")
-if args.distributed:
+if world_size > 1:
     distr_param = "tp"
+elif args.device_type == "cuda" and torch.cuda.device_count() > 1:
+    distr_param = "mp"
 else:
-    if torch.cuda.device_count() > 1 and world_size == 1:
-        distr_param = "mp"
-    else:
-        distr_param = None
+    distr_param = None
+
 
 model = get_model(
     args.architecture,
@@ -188,9 +193,10 @@ else:
     template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{}\n\n### Response:"
 
     prompt1 = template.format(
-        "Explain the difference between a CPU and a GPU and why one might use one over the other."
+        "One plus two"
     )
-    prompt2 = template.format("Explain some popular greetings in Spanish.")
+    # prompt1 = "Tell me, what is one plus two?"
+    prompt2 = "" #template.format("Explain some popular greetings in Spanish.")
 
 prompt1 = ids_for_prompt(prompt1)
 prompt2 = ids_for_prompt(prompt2)
@@ -245,7 +251,7 @@ def infer(use_cache, do_sample):
     result = generate(
         model,
         ids,
-        max_new_tokens=100,
+        max_new_tokens=15,
         use_cache=use_cache,
         do_sample=do_sample,
         max_seq_len=max_seq_len,

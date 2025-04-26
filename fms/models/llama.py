@@ -6,6 +6,7 @@ from typing import Any, List, Mapping, Optional, Tuple
 import torch
 import torch.nn as nn
 
+import torch.distributed as dist
 from fms import models
 from fms.distributed.strategy import (
     DistributedStrategy,
@@ -176,6 +177,22 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
     ):
+        
+
+
+
+        # After x_ln = self.ln(x)
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+
+        # Optional: Print for debugging (remove later if noisy)
+        # if rank == 0:
+        # print(f"[Rank {rank}/{world_size}] Entered LLaMABlock forward")
+
         x_ln = self.ln(x)
 
         queries, keys, values = self.compute_local_qkv_and_rope(
@@ -203,23 +220,11 @@ class LLaMABlock(nn.Module):
 
         self.is_causal = engine_is_causal
 
-
-        # engine = RingAttentionEngine(
-        #     block_size=32,
-        #     attn=self.attn,
-        #     ff=self.ff_sub_layer,
-        #     ff_norm=self.ff_ln,
-        #     is_causal=engine_is_causal 
-        # )
-
-
         q_global=queries
         k_global=keys_e
         v_global=values_e
         mask_global=mask 
         x_global=x   
-
-
 
         T_q = q_global.shape[2]
 
@@ -256,14 +261,6 @@ class LLaMABlock(nn.Module):
 
         ordered_results = [result_buffer[q_start] for q_start in q_starts]
         x_out = torch.cat(ordered_results, dim=1)
-
-        # x_out = engine.forward_full(
-        #     q_global=queries,
-        #     k_global=keys_e,
-        #     v_global=values_e,
-        #     mask_global=mask, 
-        #     x_global=x   
-        # )
 
         return (x_out, (keys, values)) if use_cache else x_out
 

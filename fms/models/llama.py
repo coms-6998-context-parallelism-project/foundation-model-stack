@@ -177,21 +177,13 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
     ):
-        
-
-
-
-        # After x_ln = self.ln(x)
+        # Distributed setup
         if dist.is_initialized():
             rank = dist.get_rank()
             world_size = dist.get_world_size()
         else:
             rank = 0
             world_size = 1
-
-        # Optional: Print for debugging (remove later if noisy)
-        # if rank == 0:
-        # print(f"[Rank {rank}/{world_size}] Entered LLaMABlock forward")
 
         x_ln = self.ln(x)
 
@@ -206,148 +198,140 @@ class LLaMABlock(nn.Module):
             is_self=True,
         )
 
-        # === Cache handling
+        # Cache handling
         if use_cache and past_key_value_state is not None and past_key_value_state[0].numel() > 0:
             keys = torch.cat((past_key_value_state[0], keys), dim=2)
             values = torch.cat((past_key_value_state[1], values), dim=2)
 
-        # === Expand for GQA
+        # Expand for GQA
         expansion = self.attn.nheads // self.attn.kvheads
         keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
         values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
 
-        engine_is_causal = is_causal_mask and mask is None
+        self.is_causal = is_causal_mask and mask is None
 
-        self.is_causal = engine_is_causal
+        # Save full keys and values globally
+        self.kv_global = keys_e
+        self.vv_global = values_e
+        self.kv_total_len = keys_e.shape[2]
 
-        q_global=queries
-        k_global=keys_e
-        v_global=values_e
-        mask_global=mask 
-        x_global=x   
+        q_global = queries
+        mask_global = mask
+        x_global = x
 
         T_q = q_global.shape[2]
 
         q_starts = list(range(0, T_q, self.block_size))
-        num_blocks = len(q_starts) # Renamed from num_threads
-        if num_blocks == 0: return torch.empty_like(x_global)
+        num_blocks = len(q_starts)
+        if num_blocks == 0:
+            return torch.empty_like(x_global)
 
         result_buffer: Dict[int, Tensor] = {}
 
-        block_queues = [queue.Queue() for _ in range(num_blocks)] # Renamed
-        max_barrier = threading.Barrier(num_blocks) # Renamed
-        sum_barrier = threading.Barrier(num_blocks) # Renamed
-
-        threads = []
         for block_id, q_start in enumerate(q_starts):
             q_end = min(q_start + self.block_size, T_q)
-            q_block, k_block, v_block, x_block = (
-                q_global[:, :, q_start:q_end, :],
-                k_global[:, :, q_start:q_end, :],
-                v_global[:, :, q_start:q_end, :],
-                x_global[:, q_start:q_end, :]
-            )
+            q_block = q_global[:, :, q_start:q_end, :]
+            x_block = x_global[:, q_start:q_end, :]
 
             block_data = BlockData(
-                engine_instance=self, block_id=block_id, num_blocks=num_blocks, q_start=q_start, q_end=q_end, mask_global=mask_global, block_queues=block_queues, 
-                await_max=max_barrier, await_sums=sum_barrier, result_buffer=result_buffer, q_block=q_block, k_local=k_block, v_local=v_block, x_block=x_block
+                engine_instance=self,
+                block_id=block_id,
+                num_blocks=num_blocks,
+                q_start=q_start,
+                q_end=q_end,
+                mask_global=mask_global,
+                block_queues=None,  # No queues
+                await_max=None,     # No barriers
+                await_sums=None,
+                result_buffer=result_buffer,
+                q_block=q_block,
+                k_local=None,  # No per-block k_local anymore
+                v_local=None,  # No per-block v_local anymore
+                x_block=x_block
             )
 
-            thread = threading.Thread(target=LLaMABlock.block_worker, args=(block_data,), daemon=True)
-            threads.append(thread)
-            thread.start()
-
-        for thread in threads: thread.join()
+            self.block_worker(block_data)
 
         ordered_results = [result_buffer[q_start] for q_start in q_starts]
         x_out = torch.cat(ordered_results, dim=1)
 
         return (x_out, (keys, values)) if use_cache else x_out
 
-    @staticmethod
-    def block_worker(args: BlockData):
 
-        engine = args.engine_instance
-        initial_max_score, initial_num, initial_den = engine.init_values(args.q_block)
+    def block_worker(self, args: BlockData):
+        initial_max_score, initial_num, initial_den = self.init_values(args.q_block)
 
-        final_max_score = engine.compute_max_score(args, initial_max_score)
-        args.await_max.wait()
+        final_max_score = self.compute_max_score(args, initial_max_score)
+        final_num, final_den = self.compute_sums(args, final_max_score, initial_num, initial_den)
 
-        final_num, final_den = engine.compute_sums(args, final_max_score, initial_num, initial_den)
-        args.await_sums.wait()
-
-        args.result_buffer[args.q_start] = engine.compute_block_output(args.x_block, final_num, final_den)
+        args.result_buffer[args.q_start] = self.compute_block_output(args.x_block, final_num, final_den)
 
 
     """ compute max scores for stability (first flash pass) """
     def compute_max_score(self, args: BlockData, initial_max_score: Tensor) -> Tensor:
-
-        engine = args.engine_instance
-
-        next_block_id = (args.block_id + 1) % args.num_blocks
-        send_q, recv_q = args.block_queues[next_block_id], args.block_queues[args.block_id]
-
         device = args.q_block.device
         q_indices = torch.arange(args.q_start, args.q_end, device=device)
-        local_k_indices = torch.arange(args.q_start, args.q_end, device=device)
 
         max_score = initial_max_score
-        current_k, current_k_idx, current_k_global_start = args.k_local, local_k_indices, args.q_start
 
-        for i in range(args.num_blocks):
-            mask = args.mask_global[:, :, args.q_start:args.q_end, current_k_global_start:current_k_global_start+current_k.shape[2]] if args.mask_global is not None else None
+        for block_idx in range(args.num_blocks):
+            k_start = block_idx * self.block_size
+            k_end = min(k_start + self.block_size, self.kv_total_len)
 
-            max_score = engine.update_max_attn(args.q_block, current_k, mask, q_indices, current_k_idx, max_score)
-            if i < args.num_blocks - 1:
-                send_q.put((current_k, current_k_idx, current_k_global_start))
-                current_k, current_k_idx, current_k_global_start = recv_q.get()
+            current_k = self.kv_global[:, :, k_start:k_end, :]
+            current_k_idx = torch.arange(k_start, k_end, device=device)
+
+            mask = None
+            if args.mask_global is not None:
+                mask = args.mask_global[:, :, args.q_start:args.q_end, k_start:k_end]
+
+            max_score = self.update_max_attn(args.q_block, current_k, mask, q_indices, current_k_idx, max_score)
 
         return max_score
 
+
     """ sum loop """
     def compute_sums(self, args: BlockData, final_max_score: Tensor, initial_num: Tensor, initial_den: Tensor) -> Tuple[Tensor, Tensor]:
-
-        engine = args.engine_instance
-        prev_block_id = (args.block_id - 1 + args.num_blocks) % args.num_blocks
-        next_block_id = (args.block_id + 1) % args.num_blocks
-        send_q, recv_q = args.block_queues[next_block_id], args.block_queues[args.block_id]
-
         device = args.q_block.device
         q_indices = torch.arange(args.q_start, args.q_end, device=device)
-        local_k_indices = torch.arange(args.q_start, args.q_end, device=device)
 
         num, den = initial_num, initial_den
-        current_k, current_v, current_k_idx, current_k_global_start = args.k_local, args.v_local, local_k_indices, args.q_start
 
-        for i in range(args.num_blocks):
-            mask = args.mask_global[:, :, args.q_start:args.q_end, current_k_global_start:current_k_global_start+current_k.shape[2]] if args.mask_global is not None else None
+        for block_idx in range(args.num_blocks):
+            k_start = block_idx * self.block_size
+            k_end = min(k_start + self.block_size, self.kv_total_len)
 
-            num, den = engine.update_totals(args.q_block, current_k, current_v, mask, q_indices, current_k_idx, final_max_score, num, den)
-            if i < args.num_blocks - 1:
-                send_q.put((current_k, current_v, current_k_idx, current_k_global_start))
-                current_k, current_v, current_k_idx, current_k_global_start = recv_q.get()
+            current_k = self.kv_global[:, :, k_start:k_end, :]
+            current_v = self.vv_global[:, :, k_start:k_end, :]
+            current_k_idx = torch.arange(k_start, k_end, device=device)
+
+            mask = None
+            if args.mask_global is not None:
+                mask = args.mask_global[:, :, args.q_start:args.q_end, k_start:k_end]
+
+            num, den = self.update_totals(args.q_block, current_k, current_v, mask, q_indices, current_k_idx, final_max_score, num, den)
 
         return num, den
-    
+
+
     """ final output """
     def compute_block_output(self, x: Tensor, num: Tensor, den: Tensor) -> Tensor:
-
-        B, q_len, E = x.shape; H, D_v = num.shape[1], num.shape[3]
+        B, q_len, E = x.shape
+        H, D_v = num.shape[1], num.shape[3]
         attn_out_h = num / (den + 1e-6)
         attn_out = attn_out_h.transpose(1, 2).contiguous().view(B, q_len, H * D_v)
         attn_out = self.attn.dense(attn_out)
         residual_1 = x + attn_out
         ff_out = self.ff_sub_layer(self.ff_ln(residual_1))
         return residual_1 + ff_out
-    
 
 
-    """ Helper Functions"""
+    """ Helper Functions """
 
     def raw_attention(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor) -> Tensor:
-
         scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / self.scale
-        if mask is not None: scores = scores + mask
+        if mask is not None:
+            scores = scores + mask
         if self.is_causal:
             q_indices_dev = q_indices.to(k_indices.device)
             causal_mask = (k_indices[None, :] > q_indices_dev[:, None]).unsqueeze(0).unsqueeze(0)
@@ -355,8 +339,8 @@ class LLaMABlock(nn.Module):
         return scores
 
     def init_values(self, q: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-
-        B, H, q_len, D_head = q.shape; device, dtype = q.device, q.dtype
+        B, H, q_len, D_head = q.shape
+        device, dtype = q.device, q.dtype
         D_v = self.attn.emb_v_per_head
 
         max_score = torch.full((B, H, q_len, 1), -torch.inf, dtype=dtype, device=device)
@@ -366,7 +350,6 @@ class LLaMABlock(nn.Module):
         return max_score, numerator, denominator
 
     def update_max_attn(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, current_max_score: Tensor) -> Tensor:
-
         attn_scores = self.raw_attention(q, k, mask, q_indices, k_indices)
         block_max = attn_scores.masked_fill(attn_scores == -torch.inf, torch.finfo(attn_scores.dtype).min).amax(dim=-1, keepdim=True)
         return torch.maximum(current_max_score, block_max)
@@ -378,11 +361,6 @@ class LLaMABlock(nn.Module):
         num_update = torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
         den_update = exp_scores.sum(dim=-1, keepdim=True)
         return current_num + num_update, current_den + den_update
-
-
-
-
-
 
 
 

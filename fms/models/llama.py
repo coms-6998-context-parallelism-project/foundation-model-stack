@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Tuple
 
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 
@@ -153,18 +154,29 @@ class LLaMABlock(nn.Module):
 
     def compute_local_qkv_and_rope(self, attn_data, q, k=None, v=None, position_ids=None, use_cache=False, past_key_value_state=None, is_self=True):
         B, T, _ = q.shape
+
         q_out, k_out, v_out = attn_data.in_proj(q, k, v)
 
-        queries = q_out.view(B, T, attn_data.nheads, attn_data.emb_kq_per_head)
-        keys = k_out.view(B, T, attn_data.kvheads, attn_data.emb_kq_per_head)
-        values = v_out.view(B, T, attn_data.kvheads, attn_data.emb_v_per_head)
+        # Reshape q, k, v to (B, n_heads, T, d_head)
+        queries = q_out.view(B, T, attn_data.nheads, attn_data.emb_kq_per_head).contiguous()
+        keys = k_out.view(B, T, attn_data.kvheads, attn_data.emb_kq_per_head).contiguous()
+        values = v_out.view(B, T, attn_data.kvheads, attn_data.emb_v_per_head).contiguous()
 
         if attn_data.position_encoder is not None:
             if position_ids is None:
                 position_ids = torch.arange(T, device=q.device).unsqueeze(0).expand(B, -1)
-            queries, keys = attn_data.position_encoder.adjusted_qk(queries, keys, position_ids, past_key_value_state, use_cache)
+            queries, keys = attn_data.position_encoder.adjusted_qk(
+                queries, keys, position_ids, past_key_value_state, use_cache
+            )
 
-        return queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
+        # Transpose to (B, n_heads, T, d_head)
+        queries = queries.transpose(1, 2).contiguous()
+        keys = keys.transpose(1, 2).contiguous()
+        values = values.transpose(1, 2).contiguous()
+
+        return queries, keys, values
+
+
     
     def forward(
         self,
@@ -177,7 +189,9 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
     ):
-        # Distributed setup
+        self.is_causal = is_causal_mask and mask is None
+
+        # === Distributed setup
         if dist.is_initialized():
             rank = dist.get_rank()
             world_size = dist.get_world_size()
@@ -185,8 +199,61 @@ class LLaMABlock(nn.Module):
             rank = 0
             world_size = 1
 
+        # === 1. LayerNorm
+        # === 1. LayerNorm
         x_ln = self.ln(x)
 
+        # Save original x separately
+        x_raw = x
+
+        # === 2. Gather x_ln and x_raw across ranks if needed
+        if world_size > 1:
+            x_ln_list = [torch.empty_like(x_ln) for _ in range(world_size)]
+            dist.all_gather(x_ln_list, x_ln)
+            x_ln = torch.cat(x_ln_list, dim=1).contiguous()
+
+            x_raw_list = [torch.empty_like(x_raw) for _ in range(world_size)]
+            dist.all_gather(x_raw_list, x_raw)
+            x_raw = torch.cat(x_raw_list, dim=1).contiguous()
+
+
+        # if rank == 0:
+        #     print(f"[Debug Rank {rank}] After x_ln all-gather: shape = {x_ln.shape}")
+
+        # === 3. Handle position_ids
+        if position_ids is None:
+            position_ids = torch.arange(
+                0, x_ln.shape[1], dtype=torch.long, device=x_ln.device
+            ).unsqueeze(0)  # (B, T)
+        elif world_size > 1:
+            pos_list = [torch.empty_like(position_ids) for _ in range(world_size)]
+            dist.all_gather(pos_list, position_ids)
+            position_ids = torch.cat(pos_list, dim=1).contiguous()
+
+        # if rank == 0:
+        #     print(f"[Debug Rank {rank}] position_ids shape: {position_ids.shape}")
+
+        # === 4. Gather mask if needed
+        if mask is not None and world_size > 1:
+            mask_list = [torch.empty_like(mask) for _ in range(world_size)]
+            dist.all_gather(mask_list, mask)
+            mask = torch.cat(mask_list, dim=3).contiguous()  # assume (B, H, T, T)
+
+        # if mask is not None:
+        #     if rank == 0:
+        #         print(f"[Debug Rank {rank}] mask shape after gathering: {mask.shape}")
+
+        if world_size > 1:
+            dist.barrier()
+
+        # === 6. If mask None + causal, build causal mask
+        if mask is None and self.is_causal:
+            T = x_ln.shape[1]
+            mask = torch.full((T, T), float('-inf'), device=x_ln.device, dtype=x_ln.dtype)
+            mask = torch.triu(mask, diagonal=1)  # upper triangular
+            mask = mask.unsqueeze(0).unsqueeze(0)
+
+        # === 7. Compute queries, keys, values
         queries, keys, values = self.compute_local_qkv_and_rope(
             self.attn,
             q=x_ln,
@@ -198,33 +265,31 @@ class LLaMABlock(nn.Module):
             is_self=True,
         )
 
-        # Cache handling
+        # if rank == 0:
+        #     print(f"[Debug Rank {rank}] queries.shape = {queries.shape}, keys.shape = {keys.shape}, values.shape = {values.shape}")
+
+        # === 8. If use_cache and past states exist
         if use_cache and past_key_value_state is not None and past_key_value_state[0].numel() > 0:
             keys = torch.cat((past_key_value_state[0], keys), dim=2)
             values = torch.cat((past_key_value_state[1], values), dim=2)
 
-        # Expand for GQA
+        # === Expand for GQA
         expansion = self.attn.nheads // self.attn.kvheads
         keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
         values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
 
-        self.is_causal = is_causal_mask and mask is None
-
-        # Save full keys and values globally
+        # === Save globals
         self.kv_global = keys_e
         self.vv_global = values_e
         self.kv_total_len = keys_e.shape[2]
 
+        x_global = x_ln if world_size > 1 else x
         q_global = queries
         mask_global = mask
-        x_global = x
 
         T_q = q_global.shape[2]
-
         q_starts = list(range(0, T_q, self.block_size))
         num_blocks = len(q_starts)
-        if num_blocks == 0:
-            return torch.empty_like(x_global)
 
         result_buffer: Dict[int, Tensor] = {}
 
@@ -240,22 +305,43 @@ class LLaMABlock(nn.Module):
                 q_start=q_start,
                 q_end=q_end,
                 mask_global=mask_global,
-                block_queues=None,  # No queues
-                await_max=None,     # No barriers
+                block_queues=None,
+                await_max=None,
                 await_sums=None,
                 result_buffer=result_buffer,
                 q_block=q_block,
-                k_local=None,  # No per-block k_local anymore
-                v_local=None,  # No per-block v_local anymore
+                k_local=None,
+                v_local=None,
                 x_block=x_block
             )
 
             self.block_worker(block_data)
 
+        if num_blocks == 0:
+            dummy_out = torch.empty_like(x_global)
+            if world_size > 1:
+                T_local = x.shape[1]
+                start_idx = rank * T_local
+                end_idx = (rank + 1) * T_local
+                dummy_out = dummy_out[:, start_idx:end_idx, :].contiguous()
+            return dummy_out
+
         ordered_results = [result_buffer[q_start] for q_start in q_starts]
         x_out = torch.cat(ordered_results, dim=1)
 
+        if world_size > 1:
+            T_local = x.shape[1]
+            start_idx = rank * T_local
+            end_idx = (rank + 1) * T_local
+            x_out = x_out[:, start_idx:end_idx, :].contiguous()
+
+        if rank == 0:
+        #     print(f"[Debug Rank {rank}] Final output shape: {x_out.shape}")
+            print(f"[Debug Rank {rank}] Final output first few values: {x_out.flatten()[:5]}")
+
         return (x_out, (keys, values)) if use_cache else x_out
+
+
 
 
     def block_worker(self, args: BlockData):
@@ -486,7 +572,9 @@ class LLaMA(nn.Module):
         layers = []
         for i in range(self.config.nlayers):
             block: nn.Module = LLaMABlock(self.config, self.rot_emb)
-            block = self.distributed_strategy.distribute_layer(block, i)
+            if not isinstance(self.distributed_strategy, TensorParallelStrategy):
+                block = self.distributed_strategy.distribute_layer(block, i)
+
             layers.append(block)
         self.layers = nn.ModuleList(layers)
 

@@ -200,11 +200,13 @@ class LLaMABlock(nn.Module):
             world_size = 1
 
         # === 1. LayerNorm
-        # === 1. LayerNorm
         x_ln = self.ln(x)
 
         # Save original x separately
         x_raw = x
+
+        # if rank == 0:
+        #     print(f"[Debug Rank {rank}] After LayerNorm: x_ln.shape = {x_ln.shape}, mean={x_ln.mean().item():.5f}, std={x_ln.std().item():.5f}")
 
         # === 2. Gather x_ln and x_raw across ranks if needed
         if world_size > 1:
@@ -216,10 +218,6 @@ class LLaMABlock(nn.Module):
             dist.all_gather(x_raw_list, x_raw)
             x_raw = torch.cat(x_raw_list, dim=1).contiguous()
 
-
-        # if rank == 0:
-        #     print(f"[Debug Rank {rank}] After x_ln all-gather: shape = {x_ln.shape}")
-
         # === 3. Handle position_ids
         if position_ids is None:
             position_ids = torch.arange(
@@ -230,30 +228,27 @@ class LLaMABlock(nn.Module):
             dist.all_gather(pos_list, position_ids)
             position_ids = torch.cat(pos_list, dim=1).contiguous()
 
-        # if rank == 0:
-        #     print(f"[Debug Rank {rank}] position_ids shape: {position_ids.shape}")
+        # === 4. Build block-diagonal mask if needed
+        if mask is None and self.is_causal:
+            B, T_full, _ = x_ln.shape  # B=1 usually, T_full = total tokens
+            H = self.attn.nheads
+            T_local = T_full // world_size
+            mask = torch.full((B, H, T_full, T_full), float('-inf'), device=x_ln.device, dtype=x_ln.dtype)
 
-        # === 4. Gather mask if needed
-        if mask is not None and world_size > 1:
+            for r in range(world_size):
+                start = r * T_local
+                end = (r + 1) * T_local
+                mask[:, :, start:end, start:end] = 0  # Only allow local block attending
+
+        elif mask is not None and world_size > 1:
             mask_list = [torch.empty_like(mask) for _ in range(world_size)]
             dist.all_gather(mask_list, mask)
-            mask = torch.cat(mask_list, dim=3).contiguous()  # assume (B, H, T, T)
-
-        # if mask is not None:
-        #     if rank == 0:
-        #         print(f"[Debug Rank {rank}] mask shape after gathering: {mask.shape}")
+            mask = torch.cat(mask_list, dim=3).contiguous()
 
         if world_size > 1:
             dist.barrier()
 
-        # === 6. If mask None + causal, build causal mask
-        if mask is None and self.is_causal:
-            T = x_ln.shape[1]
-            mask = torch.full((T, T), float('-inf'), device=x_ln.device, dtype=x_ln.dtype)
-            mask = torch.triu(mask, diagonal=1)  # upper triangular
-            mask = mask.unsqueeze(0).unsqueeze(0)
-
-        # === 7. Compute queries, keys, values
+        # === 5. Compute queries, keys, values
         queries, keys, values = self.compute_local_qkv_and_rope(
             self.attn,
             q=x_ln,
@@ -265,25 +260,22 @@ class LLaMABlock(nn.Module):
             is_self=True,
         )
 
-        # if rank == 0:
-        #     print(f"[Debug Rank {rank}] queries.shape = {queries.shape}, keys.shape = {keys.shape}, values.shape = {values.shape}")
-
-        # === 8. If use_cache and past states exist
+        # === 6. Handle past key-value caching
         if use_cache and past_key_value_state is not None and past_key_value_state[0].numel() > 0:
             keys = torch.cat((past_key_value_state[0], keys), dim=2)
             values = torch.cat((past_key_value_state[1], values), dim=2)
 
-        # === Expand for GQA
+        # === 7. Expand for GQA if needed
         expansion = self.attn.nheads // self.attn.kvheads
         keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
         values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
 
-        # === Save globals
         self.kv_global = keys_e
         self.vv_global = values_e
         self.kv_total_len = keys_e.shape[2]
 
-        x_global = x_ln if world_size > 1 else x
+        # === 8. Prepare blocks
+        x_global = x_raw
         q_global = queries
         mask_global = mask
 
@@ -335,11 +327,11 @@ class LLaMABlock(nn.Module):
             end_idx = (rank + 1) * T_local
             x_out = x_out[:, start_idx:end_idx, :].contiguous()
 
-        if rank == 0:
-        #     print(f"[Debug Rank {rank}] Final output shape: {x_out.shape}")
-            print(f"[Debug Rank {rank}] Final output first few values: {x_out.flatten()[:5]}")
-
+        # if rank == 0:
+        #     print(f"[Debug Rank {rank}] Final output first few values: {x_out.flatten()[:5]}")
+        print("done")
         return (x_out, (keys, values)) if use_cache else x_out
+
 
 
 

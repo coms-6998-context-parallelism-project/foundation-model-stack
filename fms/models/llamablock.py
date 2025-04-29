@@ -141,7 +141,6 @@ class LLaMABlock(nn.Module):
     ):
         self.is_causal = is_causal_mask and mask is None
 
-        # === Distributed setup
         if dist.is_initialized():
             rank = dist.get_rank()
             world_size = dist.get_world_size()
@@ -149,56 +148,28 @@ class LLaMABlock(nn.Module):
             rank = 0
             world_size = 1
 
-        # === 1. LayerNorm
-        x_ln = self.ln(x)
+        T_local = x.shape[1]
 
-        # Save original x separately
+        # Local LayerNorm
+        x_ln = self.ln(x)
         x_raw = x
 
-        # if rank == 0:
-        #     print(f"[Debug Rank {rank}] After LayerNorm: x_ln.shape = {x_ln.shape}, mean={x_ln.mean().item():.5f}, std={x_ln.std().item():.5f}")
-
-        # === 2. Gather x_ln and x_raw across ranks if needed
-        if world_size > 1:
-            x_ln_list = [torch.empty_like(x_ln) for _ in range(world_size)]
-            dist.all_gather(x_ln_list, x_ln)
-            x_ln = torch.cat(x_ln_list, dim=1).contiguous()
-
-            x_raw_list = [torch.empty_like(x_raw) for _ in range(world_size)]
-            dist.all_gather(x_raw_list, x_raw)
-            x_raw = torch.cat(x_raw_list, dim=1).contiguous()
-
-        # === 3. Handle position_ids
+        # Local Position IDs
         if position_ids is None:
             position_ids = torch.arange(
-                0, x_ln.shape[1], dtype=torch.long, device=x_ln.device
-            ).unsqueeze(0)  # (B, T)
-        elif world_size > 1:
-            pos_list = [torch.empty_like(position_ids) for _ in range(world_size)]
-            dist.all_gather(pos_list, position_ids)
-            position_ids = torch.cat(pos_list, dim=1).contiguous()
+                rank * T_local, (rank + 1) * T_local, device=x.device
+            ).unsqueeze(0)
 
-        # === 4. Build block-diagonal mask if needed
+        # Local mask construction
         if mask is None and self.is_causal:
-            B, T_full, _ = x_ln.shape  # B=1 usually, T_full = total tokens
+            B, T_local, _ = x_ln.shape
             H = self.attn.nheads
-            T_local = T_full // world_size
-            mask = torch.full((B, H, T_full, T_full), float('-inf'), device=x_ln.device, dtype=x_ln.dtype)
+            mask = torch.full((B, H, T_local, T_local), float('-inf'), device=x.device, dtype=x_ln.dtype)
+            mask[:, :, torch.arange(T_local), torch.arange(T_local)] = 0
+        elif mask is not None:
+            mask = mask[:, :, :, rank * T_local : (rank + 1) * T_local]
 
-            for r in range(world_size):
-                start = r * T_local
-                end = (r + 1) * T_local
-                mask[:, :, start:end, start:end] = 0  # Only allow local block attending
-
-        elif mask is not None and world_size > 1:
-            mask_list = [torch.empty_like(mask) for _ in range(world_size)]
-            dist.all_gather(mask_list, mask)
-            mask = torch.cat(mask_list, dim=3).contiguous()
-
-        if world_size > 1:
-            dist.barrier()
-
-        # === 5. Compute queries, keys, values
+        # Local QKV computation
         queries, keys, values = self.compute_local_qkv_and_rope(
             self.attn,
             q=x_ln,
@@ -210,21 +181,20 @@ class LLaMABlock(nn.Module):
             is_self=True,
         )
 
-        # === 6. Handle past key-value caching
         if use_cache and past_key_value_state is not None and past_key_value_state[0].numel() > 0:
             keys = torch.cat((past_key_value_state[0], keys), dim=2)
             values = torch.cat((past_key_value_state[1], values), dim=2)
 
-        # === 7. Expand for GQA if needed
+        # GQA expansion
         expansion = self.attn.nheads // self.attn.kvheads
         keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
         values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
 
-        self.kv_global = keys_e
-        self.vv_global = values_e
+        self.kv_local = keys_e   # Fix: call it local, not global
+        self.vv_local = values_e
         self.kv_total_len = keys_e.shape[2]
 
-        # === 8. Prepare blocks
+        # Block-wise attention
         x_global = x_raw
         q_global = queries
         mask_global = mask
@@ -261,23 +231,11 @@ class LLaMABlock(nn.Module):
 
         if num_blocks == 0:
             dummy_out = torch.empty_like(x_global)
-            if world_size > 1:
-                T_local = x.shape[1]
-                start_idx = rank * T_local
-                end_idx = (rank + 1) * T_local
-                dummy_out = dummy_out[:, start_idx:end_idx, :].contiguous()
             return dummy_out
 
         ordered_results = [result_buffer[q_start] for q_start in q_starts]
         x_out = torch.cat(ordered_results, dim=1)
 
-        if world_size > 1:
-            T_local = x.shape[1]
-            start_idx = rank * T_local
-            end_idx = (rank + 1) * T_local
-            x_out = x_out[:, start_idx:end_idx, :].contiguous()
-
-        print(rank, x_out.shape)
         return (x_out, (keys, values)) if use_cache else x_out
 
 
@@ -287,57 +245,103 @@ class LLaMABlock(nn.Module):
     def block_worker(self, args: BlockData):
         initial_max_score, initial_num, initial_den = self.init_values(args.q_block)
 
-        final_max_score = self.compute_max_score(args, initial_max_score)
-        final_num, final_den = self.compute_sums(args, final_max_score, initial_num, initial_den)
+        final_max_score = self.compute_max_score_ring(args, initial_max_score)
+        final_num, final_den = self.compute_sums_ring(args, final_max_score, initial_num, initial_den)
 
         args.result_buffer[args.q_start] = self.compute_block_output(args.x_block, final_num, final_den)
 
 
-    """ compute max scores for stability (first flash pass) """
-    def compute_max_score(self, args: BlockData, initial_max_score: Tensor) -> Tensor:
+
+    def compute_max_score_ring(self, args: BlockData, initial_max_score: Tensor) -> Tensor:
         device = args.q_block.device
-        q_indices = torch.arange(args.q_start, args.q_end, device=device)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        current_k = self.kv_local
 
         max_score = initial_max_score
 
-        for block_idx in range(args.num_blocks):
-            k_start = block_idx * self.block_size
-            k_end = min(k_start + self.block_size, self.kv_total_len)
+        T_local = current_k.shape[2]
 
-            current_k = self.kv_global[:, :, k_start:k_end, :]
-            current_k_idx = torch.arange(k_start, k_end, device=device)
+        for step in range(world_size):
+            global_k_start = step * T_local
+            global_k_end = (step + 1) * T_local
 
-            mask = None
-            if args.mask_global is not None:
-                mask = args.mask_global[:, :, args.q_start:args.q_end, k_start:k_end]
+            q_indices = torch.arange(args.q_start, args.q_end, device=device)
+            k_indices = torch.arange(global_k_start, global_k_end, device=device)
 
-            max_score = self.update_max_attn(args.q_block, current_k, mask, q_indices, current_k_idx, max_score)
+            # No mask here
+            max_score = self.update_max_attn(
+                args.q_block,
+                current_k,
+                None,
+                q_indices,
+                k_indices,
+                max_score,
+            )
+
+            send_rank = (rank + 1) % world_size
+            recv_rank = (rank - 1 + world_size) % world_size
+
+            if step < world_size - 1:
+                current_k = self.ring_exchange(current_k, send_rank, recv_rank, tag=step)
 
         return max_score
 
 
-    """ sum loop """
-    def compute_sums(self, args: BlockData, final_max_score: Tensor, initial_num: Tensor, initial_den: Tensor) -> Tuple[Tensor, Tensor]:
+
+    def compute_sums_ring(self, args: BlockData, final_max_score: Tensor, initial_num: Tensor, initial_den: Tensor) -> Tuple[Tensor, Tensor]:
         device = args.q_block.device
-        q_indices = torch.arange(args.q_start, args.q_end, device=device)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        current_k = self.kv_local
+        current_v = self.vv_local
 
         num, den = initial_num, initial_den
 
-        for block_idx in range(args.num_blocks):
-            k_start = block_idx * self.block_size
-            k_end = min(k_start + self.block_size, self.kv_total_len)
+        T_local = current_k.shape[2]
 
-            current_k = self.kv_global[:, :, k_start:k_end, :]
-            current_v = self.vv_global[:, :, k_start:k_end, :]
-            current_k_idx = torch.arange(k_start, k_end, device=device)
+        for step in range(world_size):
+            global_k_start = step * T_local
+            global_k_end = (step + 1) * T_local
 
-            mask = None
-            if args.mask_global is not None:
-                mask = args.mask_global[:, :, args.q_start:args.q_end, k_start:k_end]
+            q_indices = torch.arange(args.q_start, args.q_end, device=device)
+            k_indices = torch.arange(global_k_start, global_k_end, device=device)
 
-            num, den = self.update_totals(args.q_block, current_k, current_v, mask, q_indices, current_k_idx, final_max_score, num, den)
+            num, den = self.update_totals(
+                args.q_block,
+                current_k,
+                current_v,
+                None,
+                q_indices,
+                k_indices,
+                final_max_score,
+                num,
+                den,
+            )
+
+            send_rank = (rank + 1) % world_size
+            recv_rank = (rank - 1 + world_size) % world_size
+
+            if step < world_size - 1:
+                current_k = self.ring_exchange(current_k, send_rank, recv_rank, tag=step)
+                current_v = self.ring_exchange(current_v, send_rank, recv_rank, tag=5000 + step)
 
         return num, den
+
+
+    def ring_exchange(self, tensor: Tensor, send_rank: int, recv_rank: int, tag: int) -> Tensor:
+        send_tensor = tensor.contiguous()
+        recv_tensor = torch.empty_like(send_tensor)
+
+        send_req = dist.isend(send_tensor, dst=send_rank, tag=tag)
+        dist.recv(recv_tensor, src=recv_rank, tag=tag)
+        send_req.wait()
+
+        return recv_tensor
+
+
 
 
     """ final output """
@@ -354,15 +358,22 @@ class LLaMABlock(nn.Module):
 
     """ Helper Functions """
 
-    def raw_attention(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor) -> Tensor:
+    def raw_attention(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Optional[Tensor], k_indices: Optional[Tensor]) -> Tensor:
         scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / self.scale
+
         if mask is not None:
+            # (Rare) If user supplied a global mask (non-causal)
             scores = scores + mask
-        if self.is_causal:
-            q_indices_dev = q_indices.to(k_indices.device)
-            causal_mask = (k_indices[None, :] > q_indices_dev[:, None]).unsqueeze(0).unsqueeze(0)
-            scores = scores.masked_fill(causal_mask, -torch.inf)
+
+        if self.is_causal and (q_indices is not None) and (k_indices is not None):
+            q_len = q.shape[2]
+            k_len = k.shape[2]
+            causal_mask = (k_indices.unsqueeze(0) > q_indices.unsqueeze(1)).unsqueeze(0).unsqueeze(0)  # (1,1,Q,K)
+            scores = scores.masked_fill(causal_mask, float('-inf'))
+
         return scores
+
+
 
     def init_values(self, q: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         B, H, q_len, D_head = q.shape

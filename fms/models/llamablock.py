@@ -49,7 +49,7 @@ class LLaMABlock(nn.Module):
         self.config = config
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
-        self.block_size = 32
+        self.block_size = 64
         self.scale = math.sqrt(self.config.emb_dim // self.config.nheads)
 
 
@@ -150,6 +150,11 @@ class LLaMABlock(nn.Module):
 
         T_local = x.shape[1]
 
+        # Dynamically adjust block size if necessary
+        if T_local > self.block_size:
+            self.block_size = T_local
+
+
         # Local LayerNorm
         x_ln = self.ln(x)
         x_raw = x
@@ -200,41 +205,29 @@ class LLaMABlock(nn.Module):
         mask_global = mask
 
         T_q = q_global.shape[2]
-        q_starts = list(range(0, T_q, self.block_size))
-        num_blocks = len(q_starts)
+        assert T_q <= self.block_size, "Local query size exceeds block size!"
 
-        result_buffer: Dict[int, Tensor] = {}
+        block_data = BlockData(
+            engine_instance=self,
+            block_id=0,
+            num_blocks=1,
+            q_start=0,
+            q_end=T_q,
+            mask_global=mask_global,
+            block_queues=None,
+            await_max=None,
+            await_sums=None,
+            result_buffer={},
+            q_block=q_global,
+            k_local=None,
+            v_local=None,
+            x_block=x_global,
+        )
 
-        for block_id, q_start in enumerate(q_starts):
-            q_end = min(q_start + self.block_size, T_q)
-            q_block = q_global[:, :, q_start:q_end, :]
-            x_block = x_global[:, q_start:q_end, :]
+        self.block_worker(block_data)
 
-            block_data = BlockData(
-                engine_instance=self,
-                block_id=block_id,
-                num_blocks=num_blocks,
-                q_start=q_start,
-                q_end=q_end,
-                mask_global=mask_global,
-                block_queues=None,
-                await_max=None,
-                await_sums=None,
-                result_buffer=result_buffer,
-                q_block=q_block,
-                k_local=None,
-                v_local=None,
-                x_block=x_block
-            )
+        x_out = block_data.result_buffer[0]
 
-            self.block_worker(block_data)
-
-        if num_blocks == 0:
-            dummy_out = torch.empty_like(x_global)
-            return dummy_out
-
-        ordered_results = [result_buffer[q_start] for q_start in q_starts]
-        x_out = torch.cat(ordered_results, dim=1)
 
         return (x_out, (keys, values)) if use_cache else x_out
 

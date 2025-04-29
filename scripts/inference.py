@@ -251,7 +251,7 @@ def infer(use_cache, do_sample):
     result = generate(
         model,
         ids,
-        max_new_tokens=10,
+        max_new_tokens=5,
         use_cache=use_cache,
         do_sample=do_sample,
         max_seq_len=max_seq_len,

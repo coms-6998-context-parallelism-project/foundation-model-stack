@@ -277,6 +277,7 @@ class LLaMABlock(nn.Module):
             end_idx = (rank + 1) * T_local
             x_out = x_out[:, start_idx:end_idx, :].contiguous()
 
+        print(rank, x_out.shape)
         return (x_out, (keys, values)) if use_cache else x_out
 
 

@@ -149,83 +149,78 @@ class LLaMABlock(nn.Module):
         q_global_offset=None, # Add q_global_offset argument
         global_seq_len = None, # Add global_seq_len argument (padded length)
     ):
-        # print(attn_algorithm) # Can be noisy
         # If using ring attention, handle it separately
         if attn_algorithm == "ring" and isinstance(self.distributed_strategy, RingAttentionStrategy):
             strategy = self.distributed_strategy
             rank = strategy.rank
-            # print(f"[RING DEBUG][rank{rank}] LLaMABlock.forward: Using Ring Attention path.", flush=True)
-            ring_attention_group = strategy.group # Get group from strategy - already checked if strategy is RingAttentionStrategy
-            if ring_attention_group is None: # Check if the group from the strategy is valid
+            ring_attention_group = strategy.group
+            if ring_attention_group is None:
                 raise RuntimeError("Ring Attention algorithm requested but no ring_attention_group was provided to the LLaMABlock.")
-            # Check if required arguments are provided
             if q_global_offset is None or global_seq_len is None:
                 raise ValueError("q_global_offset and global_seq_len must be provided when attn_algorithm='ring'")
-            # TODO: KV caching with Ring Attention
             if use_cache:
                 logger.warning("KV caching is not yet supported with Ring Attention.")
-                use_cache = False # Force disable cache for now
+                use_cache = False
 
-            # Use the q_global_offset passed as an argument, not recalculated here.
-            # The global_seq_len passed as an argument should be the padded length.
             x_ln = self.ln(x)
             B, T, _ = x_ln.shape # T here is the strategy_block_size
-            q_proj, k_proj, v_proj = self.attn.in_proj(q=x_ln, k=x_ln, v=x_ln) # Pass x_ln for q, k, and v
+            q_proj, k_proj, v_proj = self.attn.in_proj(q=x_ln, k=x_ln, v=x_ln)
 
-            # Reshape for RingAttentionEngine (B, H, T, D)
+            # Reshape QKV for attention (B, H, T, D)
             queries = q_proj.view(B, T, self.attn.nheads, self.attn.emb_kq_per_head).transpose(1, 2)
             keys = k_proj.view(B, T, self.attn.kvheads, self.attn.emb_kq_per_head).transpose(1, 2)
             values = v_proj.view(B, T, self.attn.kvheads, self.attn.emb_v_per_head).transpose(1, 2)
 
             # --- Apply RoPE ---
-            # For Ring Attention, RoPE needs GLOBAL position IDs corresponding to the local shard
-            # Use the q_global_offset passed in the arguments.
             if position_ids is None:
-                # Calculate global positions for the current shard
                 global_position_ids = torch.arange(q_global_offset, q_global_offset + T, device=x.device)
-                rope_position_ids = global_position_ids.unsqueeze(0).expand(B, -1) # Use this for RoPE
+                rope_position_ids = global_position_ids.unsqueeze(0).expand(B, -1)
             else:
-                # If position_ids are provided, assume they are already correct for the shard
-                # This might need adjustment depending on how position_ids are handled upstream with padding/sharding
                 rope_position_ids = position_ids
 
-            queries, keys = self.attn.position_encoder.adjusted_qk(queries, keys, rope_position_ids, use_cache=False) # Apply RoPE here
+            # Transpose q/k to shape [B, T_local, H, D] before RoPE call
+            queries_rope_in = queries.transpose(1, 2) # [B, H, T, D] -> [B, T, H, D]
+            keys_rope_in = keys.transpose(1, 2) # [B, H, T, D] -> [B, T, H, D]
 
-            # === Expand for GQA
+            # Apply RoPE (adjusted_qk expects [B, T, H, D])
+            queries_rotated, keys_rotated = self.attn.position_encoder.adjusted_qk(
+                queries_rope_in, keys_rope_in, rope_position_ids, use_cache=False
+            )
+
+            # Transpose back for RingAttentionEngine [B, T, H, D] -> [B, H, T, D]
+            queries = queries_rotated.transpose(1, 2)
+            keys = keys_rotated.transpose(1, 2)
+            # --- End RoPE Application ---
+
+            # === Expand for GQA ===
             expansion = self.attn.nheads // self.attn.kvheads
+            # Apply expansion after RoPE and transpose back
             keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
-            # Values also need expansion for the engine
             values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
 
             engine_is_causal = is_causal_mask and mask is None
 
             engine = RingAttentionEngine(
                 block_size=32, # TODO: Revisit if this internal block_size is needed/correct
-                strategy_block_size=strategy.block_size, # Get block size from the strategy object
+                strategy_block_size=strategy.block_size,
                 attn=self.attn,
                 ff=self.ff_sub_layer,
                 ff_norm=self.ff_ln,
                 is_causal=engine_is_causal,
-                group=ring_attention_group # Pass the group from strategy
+                group=ring_attention_group
              )
 
-            # print(f"[rank{rank}] LLaMABlock.forward: Before engine.forward_full", flush=True)
-            # start_time = time.time() # Removed for cleanup
-            # Pass expanded keys (keys_e) and values (values_e) to the engine
             x_out = engine.forward_full(
                 q_shard=queries, k_shard=keys_e, v_shard=values_e,
-                mask_global=mask, # Mask is still global for now, engine slices it
+                mask_global=mask,
                 x_shard=x, # Pass original input x for residual connection inside engine
                 q_global_offset=q_global_offset,
-                global_seq_len=global_seq_len # Pass the padded global length
+                global_seq_len=global_seq_len
             )
             # Ring attention engine now returns the local block, gathering happens outside
-            # end_time = time.time() # Removed for cleanup
-            # print(f"[RING TIME DEBUG][rank{rank}] engine.forward_full took {end_time - start_time:.4f} seconds", flush=True) # Removed for cleanup
-            # print(f"[rank{rank}] LLaMABlock.forward: After engine.forward_full", flush=True)
             return x_out # No cache returned for ring attention yet
         else:
-            # Fallback to the original attention mechanism
+            # Fallback to the original attention mechanism (forward_old)
             return self.forward_old(
                 x,
                 mask=mask,
@@ -234,7 +229,12 @@ class LLaMABlock(nn.Module):
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
+                # Pass None for ring-specific args, forward_old accepts them
+                q_global_offset=None,
+                global_seq_len=None,
             )
+
+
 
        # will later change this to be configurable once we decide on the final architecture
     def forward_old(
@@ -247,6 +247,8 @@ class LLaMABlock(nn.Module):
         use_cache=False,
         is_causal_mask=False,
         attn_algorithm=None,
+        q_global_offset=None, # Accept ring-specific args even if not used
+        global_seq_len=None,  # Accept ring-specific args even if not used
     ):
         # if the cache is not empty, we need to get the kv cache for self and cross attention
         self_attn_past_key_value = past_key_value_state

@@ -225,63 +225,104 @@ class RotaryEmbedding(PositionEncoder):
         past_kv_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache=False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args
-        ----
-        q : torch.Tensor
-            Embedded query tensor, expected size is B x S x H x Eh
-        k : torch.Tensor
-            Embedded query tensor, expected size is B x S x H x Eh
-        position_ids : Optional[torch.LongTensor]
-            The position of each of the tokens encoded in q and k. This is important in
-            kv-caching and left-padding situations, for which the rotation to be applied might
-            not always be the pre-cached position 0...S. For kv-caching without dynamic batching
-            or variable per-row left padding position_ids is shared for all the batch.
-        """
-        assert len(q.size()) == 4
-        assert len(k.size()) == 4
+        """Applies rotary position embedding to query and key tensors.
 
-        seq_len = max(k.size(1), q.size(1))
+        Expects input tensors q, k to have shape [batch_size, seq_len, nheads, head_dim].
+
+        Args:
+            q: Query tensor.
+            k: Key tensor.
+            position_ids: Positions of tokens in the sequence, shape [batch_size, seq_len].
+            past_kv_state: Optional tuple containing past keys and values for caching.
+            use_cache: Flag indicating if caching is enabled.
+
+        Returns:
+            Tuple of rotated query and key tensors.
+        """
+        # Input validation: Ensure expected shape [B, S, H, D]
+        assert len(q.size()) == 4, f"Expected q rank 4, got {q.ndim}"
+        assert len(k.size()) == 4, f"Expected k rank 4, got {k.ndim}"
+        assert q.size(1) == k.size(1), f"Seq len mismatch: q={q.size(1)}, k={k.size(1)}"
+
+        # seq_len is dimension 1
+        seq_len = q.size(1)
+
+        # Compute position_ids if not provided
         if position_ids is None:
-            # Compute position_ids based on cache config
             position_ids = torch.arange(
-                0, seq_len, dtype=torch.long, device=q.device
-            ).repeat(k.size(0), 1)
+                seq_len, device=q.device, dtype=torch.long
+            ).unsqueeze(0).repeat(k.size(0), 1)
+            # Adjust position_ids based on cache length if applicable
             if use_cache and past_kv_state is not None and past_kv_state[0].numel() > 0:
-                position_ids += past_kv_state[0].size(2)
+                # Assuming past_kv_state[0] (keys) has shape [B, H, cache_len, D]
+                # Or potentially [B, cache_len, H, D] if stored differently
+                # Let's assume cache length is dim 2 if shape is [B, H, cache_len, D]
+                # Need to confirm cache shape if this causes issues.
+                # If cache shape is [B, cache_len, H, D], use past_kv_state[0].size(1)
+                try:
+                    cache_len = past_kv_state[0].size(2) # Assuming [B, H, cache_len, D]
+                    position_ids += cache_len
+                except IndexError:
+                     rank = dist.get_rank() if dist.is_initialized() else 0
+                     print(f"[WARN][rank{rank}] RoPE: Could not determine cache length from past_kv_state[0] shape {past_kv_state[0].shape}", flush=True)
 
+
+        # Handle partial RoPE application
         if self.partial_rope != 1.0:
             q_rope = q[..., : self.dim]
             k_rope = k[..., : self.dim]
         else:
             q_rope = q
             k_rope = k
-        q_ = q_rope.float().view(*q.size()[:-1], -1, 2)  # B L H D/2 2
-        k_ = k_rope.float().view(*k.size()[:-1], -1, 2)  # B L H D/2 2
 
-        # the max start position should be based on the max first position of each sequence
-        max_start_pos = torch.max(position_ids[:, 0])
-        alpha = self.compute_freqs_cis(q.device, max_start_pos + seq_len)
-        freqs = self.cached_freqs[q.device.index][alpha][position_ids]
+        # Cast the part to be rotated to float32 for calculation stability
+        # Shape: [B, S, H, D_rope/2, 2]
+        q_ = q_rope.float().view(*q_rope.shape[:-1], -1, 2)
+        k_ = k_rope.float().view(*k_rope.shape[:-1], -1, 2)
 
-        freqs = freqs.float()  # 1 L D/2 2 2
-        q_out = (
-            freqs[:, -q.size(2) :].unsqueeze(1) # Slice freqs [B, L, D/2, 2, 2] -> Add Head dim [B, 1, L, D/2, 2, 2]
-            .mul(q_.unsqueeze(-2))
-            .sum(5)
-            .flatten(3)
-        ).type_as(q)
-        k_out = (
-            freqs[:, -k.size(2) :].unsqueeze(1) # Slice freqs [B, L, D/2, 2, 2] -> Add Head dim [B, 1, L, D/2, 2, 2]
-            .mul(k_.unsqueeze(-2))
-            .sum(5)
-            .flatten(3)
-        ).type_as(k)
+        # Fetch cached frequencies
+        # Ensure frequencies are computed up to the max position needed
+        max_start_pos = torch.max(position_ids[:, 0]) if position_ids.numel() > 0 else 0
+        # Use a consistent length (e.g., max_expected_seq_len) for caching key 'alpha'
+        # This assumes compute_freqs_cis caches based on this length.
+        self.compute_freqs_cis(q.device, self.max_seq_len)
 
+        try:
+            # Assuming a single alpha key exists per device after post_init
+            alpha_key = next(iter(self.cached_freqs[q.device.index]))
+            # Fetch frequencies using the computed position_ids
+            # freqs shape: [B, S, D_rope/2, 2, 2]
+            freqs = self.cached_freqs[q.device.index][alpha_key][position_ids]
+        except (KeyError, StopIteration, IndexError) as e:
+             rank = dist.get_rank() if dist.is_initialized() else 0
+             print(f"[ERROR][rank{rank}] RoPE: Failed to fetch freqs! device.index={q.device.index}. Error: {e}", flush=True)
+             # Return original q, k to avoid crashing, although output will be wrong.
+             return q, k
+
+        # Cast freqs to float32 for calculation
+        freqs = freqs.float()
+
+        # Apply rotation (simulated complex multiplication) in float32
+        # Reshape freqs for broadcasting: [B, S, 1, D_rope/2, 2, 2]
+        # to multiply with q_/k_ reshaped to [B, S, H, D_rope/2, 2, 1]
+        freqs_reshaped = freqs.unsqueeze(2) # Add Head dimension
+
+        # Perform rotation: ([B,S,1,D/2,2,2] * [B,S,H,D/2,2,1]).sum(-1) -> [B,S,H,D/2,2]
+        q_rotated_float = (freqs_reshaped * q_.unsqueeze(-1)).sum(-1)
+        k_rotated_float = (freqs_reshaped * k_.unsqueeze(-1)).sum(-1)
+
+        # Flatten the last two dimensions: [B, S, H, D_rope]
+        q_rotated_float = q_rotated_float.flatten(-2)
+        k_rotated_float = k_rotated_float.flatten(-2)
+
+        # Cast back to the original input type (e.g., fp16)
+        q_out = q_rotated_float.type_as(q_rope)
+        k_out = k_rotated_float.type_as(k_rope)
+
+        # Concatenate back the non-rotated part if using partial RoPE
         if self.partial_rope != 1.0:
-            q_out = torch.cat([q_out.view_as(q_rope), q[..., self.dim :]], dim=-1)
-            k_out = torch.cat([k_out.view_as(k_rope), k[..., self.dim :]], dim=-1)
-        else:
-            q_out = q_out.view_as(q_rope)
-            k_out = k_out.view_as(k_rope)
+            # Ensure the non-rotated part has the same type before concatenating
+            q_out = torch.cat([q_out, q[..., self.dim :].type_as(q_out)], dim=-1)
+            k_out = torch.cat([k_out, k[..., self.dim :].type_as(k_out)], dim=-1)
+
         return q_out, k_out

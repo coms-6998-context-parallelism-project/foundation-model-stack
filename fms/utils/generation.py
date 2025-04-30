@@ -265,7 +265,7 @@ def generate(
         # print(f"[rank{rank}] generate: Before model call, input_ids shape: {input_ids.shape}")
         # <<< END DEBUG >>>
 
-        output = model(input_ids, **kwargs)
+        output = model(input_ids, attn_algorithm=attn_algorithm, **kwargs) # Pass kwargs and attn_algorithm here
         if use_cache and isinstance(output, tuple): # Ensure output is a tuple when use_cache=True
             logits, past_key_value_states = output
             # TODO: this should go away when reduce-overhead issues are fixed, or

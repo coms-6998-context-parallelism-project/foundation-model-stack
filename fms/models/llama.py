@@ -201,7 +201,6 @@ class LLaMABlock(nn.Module):
             engine_is_causal = is_causal_mask and mask is None
 
             engine = RingAttentionEngine(
-                block_size=32, # TODO: Revisit if this internal block_size is needed/correct
                 strategy_block_size=strategy.block_size,
                 attn=self.attn,
                 ff=self.ff_sub_layer,

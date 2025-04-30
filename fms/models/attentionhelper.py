@@ -32,8 +32,7 @@ class BlockData:
 
 # Ring Attention computation logic
 class RingAttentionEngine:
-    def __init__(self, block_size: int, strategy_block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool, group: dist.ProcessGroup):
-        self.block_size = block_size
+    def __init__(self, strategy_block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool, group: dist.ProcessGroup):
         self.attn = attn
         self.ff = ff
         self.ff_norm = ff_norm

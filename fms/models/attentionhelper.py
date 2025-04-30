@@ -239,11 +239,17 @@ class RingAttentionEngine:
         send_tensor_c = send_tensor.contiguous() # Ensure contiguous before sending
 
         if self.rank % 2 == 0:
+            print(f"[rank{self.rank}] Sending to {self.next_rank}...", flush=True)
             dist.send(send_tensor_c, self.next_rank, group=self.group)
+            print(f"[rank{self.rank}] Sent to {self.next_rank}. Receiving from {self.prev_rank}...", flush=True)
             dist.recv(full_recv_buffer, self.prev_rank, group=self.group)
+            print(f"[rank{self.rank}] Received from {self.prev_rank}.", flush=True)
         else:
+            print(f"[rank{self.rank}] Receiving from {self.prev_rank}...", flush=True)
             dist.recv(full_recv_buffer, self.prev_rank, group=self.group)
+            print(f"[rank{self.rank}] Received from {self.prev_rank}. Sending to {self.next_rank}...", flush=True)
             dist.send(send_tensor_c, self.next_rank, group=self.group)
+            print(f"[rank{self.rank}] Sent to {self.next_rank}.", flush=True)
 
         # Return the relevant slice of the buffer
         return full_recv_buffer[:, :, :expected_recv_len, :]

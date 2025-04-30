@@ -344,9 +344,13 @@ class RingAttentionEngine:
         return torch.maximum(current_max_score, block_max)
 
     def update_totals(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, final_max_score: Tensor, current_num: Tensor, current_den: Tensor) -> Tuple[Tensor, Tensor]:
+        print(f"[rank{self.rank}] update_totals: Before raw_attention", flush=True)
         attn_scores = self.raw_attention(q, k, mask, q_indices, k_indices)
+        print(f"[rank{self.rank}] update_totals: After raw_attention. Before exp_scores", flush=True)
         stable_scores = (attn_scores - final_max_score).clamp(min=-10.0, max=10.0)
         exp_scores = torch.exp(stable_scores)
+        print(f"[rank{self.rank}] update_totals: After exp_scores. Before einsum", flush=True)
         num_update = torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
         den_update = exp_scores.sum(dim=-1, keepdim=True)
+        print(f"[rank{self.rank}] update_totals: After einsum/sum", flush=True)
         return current_num + num_update, current_den + den_update

@@ -4,8 +4,19 @@ import time
 import os
 import itertools
 import json
+import atexit
 from typing import List, Dict, Any
 
+_slurm_job_id = os.environ.get("SLURM_JOB_ID")
+_cancel_on_exit = True # Flag to prevent double cancellation
+
+def _cancel_slurm_job():
+    """Attempts to cancel the Slurm job associated with this script."""
+    global _cancel_on_exit
+    if _slurm_job_id and _cancel_on_exit:
+        print(f"Attempting to cancel Slurm job {_slurm_job_id} on exit...")
+        subprocess.run(['scancel', _slurm_job_id], check=False)
+        _cancel_on_exit = False # Prevent re-running if called from both atexit and finally
 
 def run_inference_benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -48,9 +59,9 @@ def run_inference_benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
             "--distributed_strategy", "ring",
             "--attn_algorithm", "ring"
         ])
-        # Note: Block size might need to be passed differently, e.g., via model variant/config
-        # if config.get("block_size"):
-        #    command.extend(["--ring_attn_block_size", str(config["block_size"])]) # If inference.py supported this
+        # Pass the block size if specified in the config
+        if config.get("ring_block_size"):
+           command.extend(["--ring_block_size", str(config["ring_block_size"])])
     elif attn_type == "regular":
         command.insert(1, "--nproc_per_node=1") # Assuming 1 GPU/process for regular non-dist
         # No extra flags needed for standard attention
@@ -98,6 +109,9 @@ def run_inference_benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
+    # Register the cancellation function to run on normal exit or unhandled exceptions
+    atexit.register(_cancel_slurm_job)
+
     parser = argparse.ArgumentParser(description="Benchmark Ring vs Regular Attention Inference")
     # Add arguments matching your common setup needs
     parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
@@ -110,44 +124,50 @@ if __name__ == "__main__":
     parser.add_argument("--attn_types", nargs='+', default=["ring", "regular"], help="Attention types to benchmark ('ring', 'regular')")
     parser.add_argument("--max_new_tokens", nargs='+', type=int, default=[256], help="List of max_new_tokens values to test")
     parser.add_argument("--print_response", action="store_true", help="Print the generated response captured from inference.py stdout")
+    parser.add_argument("--ring_block_size", type=int, default=4096, help="Block size for Ring Attention runs")
     # Add other parameters you want to vary, e.g., context lengths (would require prompt generation)
     # parser.add_argument("--context_lengths", nargs='+', type=int, default=[512], help="List of context lengths to test")
 
     args = parser.parse_args()
 
-    benchmark_configs = []
-    # Generate configurations to test
-    for attn_type, tokens in itertools.product(args.attn_types, args.max_new_tokens):
-        config = {
-            "architecture": args.architecture,
-            "variant": args.variant,
-            "model_path": os.path.abspath(args.model_path),
-            "model_source": "hf", # Assuming HF source, adjust if needed
-            "tokenizer": os.path.abspath(args.tokenizer),
-            "device_type": args.device_type,
-            "dtype": args.dtype,
-            "use_cache": args.use_cache,
-            "attn_type": attn_type,
-            "max_new_tokens": tokens,
-            "print_response": args.print_response, # Store the flag in the config
-            # Add other varying params here, e.g. "context_length": length
-        }
-        benchmark_configs.append(config)
+    try:
+        benchmark_configs = []
+        # Generate configurations to test
+        for attn_type, tokens in itertools.product(args.attn_types, args.max_new_tokens):
+            config = {
+                "architecture": args.architecture,
+                "variant": args.variant,
+                "model_path": os.path.abspath(args.model_path),
+                "model_source": "hf", # Assuming HF source, adjust if needed
+                "tokenizer": os.path.abspath(args.tokenizer),
+                "device_type": args.device_type,
+                "dtype": args.dtype,
+                "use_cache": args.use_cache,
+                "attn_type": attn_type,
+                "max_new_tokens": tokens,
+                "print_response": args.print_response, # Store the flag in the config
+                "ring_block_size": args.ring_block_size if attn_type == "ring" else None, # Only relevant for ring
+                # Add other varying params here, e.g. "context_length": length
+            }
+            benchmark_configs.append(config)
 
-    all_results = []
-    for config in benchmark_configs:
-        result = run_inference_benchmark(config)
-        all_results.append(result)
+        all_results = []
+        for config in benchmark_configs:
+            result = run_inference_benchmark(config)
+            all_results.append(result)
 
-    print("\n--- Benchmark Summary ---")
-    # TODO: Add more sophisticated reporting here (e.g., table, save to file)
-    for result in all_results:
-        print(f"Config: {result['config']}")
-        if result["success"]:
-            # If requested, print the captured stdout which contains the response
-            if result['config'].get('print_response'):
-                print("--- Generated Response (stdout) ---")
-                print(result.get('stdout', 'N/A').strip()) # Use strip() to remove extra whitespace
-            print(f"  Time/Token: {result.get('time_per_token_ms', 'N/A'):.2f} ms")
-        else:
-            print(f"  FAILED (Code: {result.get('return_code', 'N/A')}, Error: {result.get('error', 'See logs')})")
+        print("\n--- Benchmark Summary ---")
+        # TODO: Add more sophisticated reporting here (e.g., table, save to file)
+        for result in all_results:
+            print(f"Config: {result['config']}")
+            if result["success"]:
+                # If requested, print the captured stdout which contains the response
+                if result['config'].get('print_response'):
+                    print("--- Generated Response (stdout) ---")
+                    print(result.get('stdout', 'N/A').strip()) # Use strip() to remove extra whitespace
+                print(f"  Time/Token: {result.get('time_per_token_ms', 'N/A'):.2f} ms")
+            else:
+                print(f"  FAILED (Code: {result.get('return_code', 'N/A')}, Error: {result.get('error', 'See logs')})")
+    finally:
+        # Ensure cancellation is attempted even if atexit fails or script is killed abruptly
+        _cancel_slurm_job()

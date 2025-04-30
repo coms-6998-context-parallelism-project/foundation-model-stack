@@ -126,6 +126,12 @@ parser.add_argument(
     help="Maximum number of new tokens to generate",
 )
 
+parser.add_argument(
+    "--ring_block_size",
+    type=int,
+    default=None, # Default handled by model if None
+    help="Block size to use for Ring Attention (if applicable)",
+)
 args = parser.parse_args()
 
 local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -268,6 +274,13 @@ def infer(use_cache, do_sample):
     else:
         # without ntk scaling, extending the seq length too far gives bogus results.
         max_seq_len = model.config.max_expected_seq_len
+
+    generate_kwargs = {
+        "attn_algorithm": args.attn_algorithm, # Pass the attention algorithm
+    }
+    if args.attn_algorithm == "ring" and args.ring_block_size is not None:
+        generate_kwargs["ring_block_size"] = args.ring_block_size
+
     result = generate(
         model,
         ids,
@@ -276,7 +289,7 @@ def infer(use_cache, do_sample):
         do_sample=do_sample,
         max_seq_len=max_seq_len,
         extra_kwargs=padding_kwargs,
-        attn_algorithm=args.attn_algorithm, # Pass the attention algorithm
+        **generate_kwargs
     )
     if len(result.shape) == 1:
         result = result.unsqueeze(0)

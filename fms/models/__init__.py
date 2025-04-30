@@ -16,6 +16,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 
 from fms import distributed
 from fms.distributed.strategy import (
+    RingAttentionStrategy,
     TensorParallelStrategy,
     UniformModelParallelStrategy,
 )
@@ -408,6 +409,9 @@ def get_model(
             extra_args["distributed_strategy"] = UniformModelParallelStrategy(
                 devices, _guess_num_layers(lazy_sd)
             )
+        elif distributed_strategy == "ring":
+            print("using ring attention strategy")
+            extra_args["distributed_strategy"] = RingAttentionStrategy(group)
 
     # Create the model on meta device to allocate weights lazily
     fms_model = _get_model_instance(

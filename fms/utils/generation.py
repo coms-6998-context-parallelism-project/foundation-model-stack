@@ -213,6 +213,7 @@ def generate(
     kwargs: MutableMapping[str, Any] = dict()
     if extra_kwargs is not None:
         kwargs.update(extra_kwargs)
+    kwargs["attn_algorithm"] = attn_algorithm # Add attn_algorithm here
 
     if isinstance(input_ids, torch.Tensor):
         is_batch = len(input_ids.shape) > 1

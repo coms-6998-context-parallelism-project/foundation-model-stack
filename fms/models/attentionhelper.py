@@ -54,6 +54,7 @@ class RingAttentionEngine:
         global_seq_len is the total sequence length across all ranks.
         Returns the computed output shard for the current rank.
         """
+        print(f"[rank{self.rank}] RingAttentionEngine.forward_full: START. q_shard shape: {q_shard.shape}, k_shard shape: {k_shard.shape}, v_shard shape: {v_shard.shape}, x_shard shape: {x_shard.shape}, q_global_offset: {q_global_offset}, global_seq_len: {global_seq_len}")
         T_q_local = q_shard.shape[2]
         if T_q_local == 0: return torch.empty_like(x_shard)
 
@@ -92,6 +93,7 @@ class RingAttentionEngine:
         output_block = self.compute_block_output(x_block, final_num, final_den)
 
         # Return the locally computed block. Gathering happens outside.
+        print(f"[rank{self.rank}] RingAttentionEngine.forward_full: END. Output shape: {output_block.shape}")
         return output_block
 
     """ compute max scores for stability (first flash pass) """
@@ -113,27 +115,42 @@ class RingAttentionEngine:
         recv_shape[2] = max_shard_len
         recv_k = torch.empty(recv_shape, dtype=args.k_shard.dtype, device=device)
 
+        # Pre-calculate expected shard lengths for all ranks
+        shard_lengths = []
+        for r in range(args.world_size):
+            start = r * max_shard_len
+            length = min(max_shard_len, global_seq_len - start)
+            shard_lengths.append(length)
+        prev_rank_shard_len = shard_lengths[self.prev_rank]
+
         for i in range(args.world_size):
+            print(f"[rank{args.rank}] RingAttentionEngine.compute_max_score: Iter {i}/{args.world_size}, processing K from rank {current_k_rank}")
             # Calculate global indices and length for the *current* K shard
             current_k_len = (global_seq_len + args.world_size - 1) // args.world_size
             current_k_global_offset = current_k_rank * current_k_len
             # Adjust length for the last rank
             current_k_len = min(current_k_len, global_seq_len - current_k_global_offset)
             current_k_global_indices = torch.arange(current_k_global_offset, current_k_global_offset + current_k_len, device=device)
+            
+            # Determine the length of the tensor we expect to receive in this iteration
+            # The tensor we receive originated from the rank `(current_k_rank - 1 + world_size) % world_size`
+            # However, it's simpler to think about which rank *sent* it to us: self.prev_rank
+            # The length depends on which rank's data is currently at self.prev_rank
+            incoming_rank_origin = (self.rank - 1 - i + args.world_size) % args.world_size
+            expected_recv_len = shard_lengths[incoming_rank_origin]
 
             # Slice the received buffer if necessary (only needed if shapes differ)
-            effective_recv_k = recv_k[:, :, :current_k_len, :] if i > 0 else current_k_shard
+            # Use expected_recv_len for slicing the *received* data *after* communication
+            effective_recv_k = recv_k[:, :, :expected_recv_len, :] if i > 0 else current_k_shard
 
             # Compute attention with current K block
             # Mask needs to be sliced using global indices
             mask = args.mask_global[:, :, args.q_global_offset:args.q_global_offset+args.q_shard.shape[2], current_k_global_offset:current_k_global_offset+current_k_len] if args.mask_global is not None else None
             max_score = engine.update_max_attn(args.q_shard, effective_recv_k, mask, q_global_indices, current_k_global_indices, max_score)
-
-            # Send current_k to next rank, receive k from previous rank
-            # Use the buffer that can hold the largest possible shard
-            recv_k_slice = recv_k[:, :, :current_k_shard.shape[2], :] # Slice buffer for send_recv
-            self.send_recv_tensor(current_k_shard, recv_k_slice)
-            current_k_shard = recv_k_slice # The received tensor is now in the potentially larger buffer
+            
+            # Send current_k_shard, receive into a buffer sliced for the *expected incoming length*
+            recv_k_slice_for_irecv = recv_k[:, :, :expected_recv_len, :]
+            current_k_shard = self.send_recv_tensor(current_k_shard, recv_k_slice_for_irecv)
 
             # Update the rank origin of the K shard we now hold
             current_k_rank = (current_k_rank - 1 + args.world_size) % args.world_size
@@ -161,30 +178,41 @@ class RingAttentionEngine:
         recv_k = torch.empty(recv_k_shape, dtype=args.k_shard.dtype, device=device)
         recv_v = torch.empty(recv_v_shape, dtype=args.v_shard.dtype, device=device)
 
+        # Pre-calculate expected shard lengths for all ranks (needed for recv buffer slicing)
+        max_shard_len = (global_seq_len + args.world_size - 1) // args.world_size
+        shard_lengths = []
+        for r in range(args.world_size):
+            start = r * max_shard_len
+            length = min(max_shard_len, global_seq_len - start)
+            shard_lengths.append(length)
+
         for i in range(args.world_size):
+            print(f"[rank{args.rank}] RingAttentionEngine.compute_sums: Iter {i}/{args.world_size}, processing K/V from rank {current_kv_rank}")
             # Calculate global indices and length for the *current* K/V shards
             current_kv_len = (global_seq_len + args.world_size - 1) // args.world_size
             current_kv_global_offset = current_kv_rank * current_kv_len
             # Adjust length for the last rank
             current_kv_len = min(current_kv_len, global_seq_len - current_kv_global_offset)
             current_k_global_indices = torch.arange(current_kv_global_offset, current_kv_global_offset + current_kv_len, device=device)
+            
+            # Determine the length of the tensor we expect to receive in this iteration
+            incoming_rank_origin = (self.rank - 1 - i + args.world_size) % args.world_size
+            expected_recv_len = shard_lengths[incoming_rank_origin]
 
             # Slice the received buffers if necessary
-            effective_recv_k = recv_k[:, :, :current_kv_len, :] if i > 0 else current_k_shard
-            effective_recv_v = recv_v[:, :, :current_kv_len, :] if i > 0 else current_v_shard
+            # Use expected_recv_len for slicing the *received* data *after* communication
+            effective_recv_k = recv_k[:, :, :expected_recv_len, :] if i > 0 else current_k_shard
+            effective_recv_v = recv_v[:, :, :expected_recv_len, :] if i > 0 else current_v_shard
 
             # Compute attention with current K, V blocks
             # Mask needs to be sliced using global indices
             mask = args.mask_global[:, :, args.q_global_offset:args.q_global_offset+args.q_shard.shape[2], current_kv_global_offset:current_kv_global_offset+current_kv_len] if args.mask_global is not None else None
             num, den = engine.update_totals(args.q_shard, effective_recv_k, effective_recv_v, mask, q_global_indices, current_k_global_indices, final_max_score, num, den)
             
-            # Send current K, V to next rank, receive K, V from previous rank
-            # Use slices of the potentially larger buffers for send/recv
-            recv_k_slice = recv_k[:, :, :current_k_shard.shape[2], :]
-            recv_v_slice = recv_v[:, :, :current_v_shard.shape[2], :]
-            self.send_recv_kv(current_k_shard, current_v_shard, recv_k_slice, recv_v_slice)
-            current_k_shard = recv_k_slice
-            current_v_shard = recv_v_slice
+            # Send current K, V shards, receive into buffers sliced for the *expected incoming length*
+            recv_k_slice_for_irecv = recv_k[:, :, :expected_recv_len, :]
+            recv_v_slice_for_irecv = recv_v[:, :, :expected_recv_len, :]
+            current_k_shard, current_v_shard = self.send_recv_kv(current_k_shard, current_v_shard, recv_k_slice_for_irecv, recv_v_slice_for_irecv)
 
             # Update the rank origin of the K/V shards we now hold
             current_kv_rank = (current_kv_rank - 1 + args.world_size) % args.world_size
@@ -206,18 +234,26 @@ class RingAttentionEngine:
 
     def send_recv_tensor(self, send_tensor: Tensor, recv_buffer: Tensor) -> Tensor:
         """ Sends a tensor to the next rank and receives one from the previous rank. """
-        # Using blocking send_recv. recv_buffer might be larger than send_tensor.
-        # Assumes recv_buffer is sliced correctly before calling. #TODO: Verify this assumption
-        dist.send_recv(send_tensor, self.next_rank, recv_tensor=recv_buffer, source=self.prev_rank, group=self.group)
+        # recv_buffer MUST be correctly sized for the incoming tensor *before* calling this.
+        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_tensor: Sending shape {send_tensor.shape} to rank {self.next_rank}, receiving into shape {recv_buffer.shape} from rank {self.prev_rank}", flush=True)
+        ops = []
+        ops.append(dist.P2POp(dist.isend, send_tensor.contiguous(), self.next_rank, group=self.group)) # Ensure contiguous
+        # Pass the correctly pre-sliced recv_buffer to irecv
+        ops.append(dist.P2POp(dist.irecv, recv_buffer, self.prev_rank, group=self.group))
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs: req.wait()
         return recv_buffer
 
     def send_recv_kv(self, send_k: Tensor, send_v: Tensor, recv_k_buf: Tensor, recv_v_buf: Tensor) -> Tuple[Tensor, Tensor]:
+        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_kv: Sending K shape {send_k.shape}, V shape {send_v.shape} to rank {self.next_rank}, receiving into K shape {recv_k_buf.shape}, V shape {recv_v_buf.shape} from rank {self.prev_rank}")
+        # recv_k_buf and recv_v_buf MUST be correctly sized for the incoming tensors *before* calling this.
         """ Sends K, V to the next rank and receives K, V from the previous rank. """
         # This could be done with separate send/recv or combined ops if available/efficient.
         # Using separate send/recv for clarity now. Ensure order matches on both sides.
         ops = []
-        ops.append(dist.P2POp(dist.isend, send_k, self.next_rank, group=self.group))
-        ops.append(dist.P2POp(dist.isend, send_v, self.next_rank, group=self.group))
+        ops.append(dist.P2POp(dist.isend, send_k.contiguous(), self.next_rank, group=self.group)) # Ensure contiguous
+        ops.append(dist.P2POp(dist.isend, send_v.contiguous(), self.next_rank, group=self.group)) # Ensure contiguous
+        # Pass the correctly pre-sliced recv buffers to irecv
         ops.append(dist.P2POp(dist.irecv, recv_k_buf, self.prev_rank, group=self.group))
         ops.append(dist.P2POp(dist.irecv, recv_v_buf, self.prev_rank, group=self.group))
         reqs = dist.batch_isend_irecv(ops)
@@ -225,12 +261,40 @@ class RingAttentionEngine:
         return recv_k_buf, recv_v_buf
 
     def raw_attention(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor) -> Tensor:
+        # q: [B, H, q_len, D]
+        # k: [B, H, k_len, D]
+        # q_indices: [q_len] (global indices)
+        # k_indices: [k_len_origin] (global indices corresponding to the original shard k came from)
         scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / self.scale
-        if mask is not None: scores = scores + mask
+
+        # Create boolean masks (True means mask this position)
+        final_mask = None
+        q_len, k_len = q.shape[2], k.shape[2]
+
+        # 1. Causal mask
         if self.is_causal:
-            q_indices_dev = q_indices.to(k_indices.device)
-            causal_mask = (k_indices[None, :] > q_indices_dev[:, None]).unsqueeze(0).unsqueeze(0)
-            scores = scores.masked_fill(causal_mask, -torch.inf)
+            q_indices_dev = q_indices.to(scores.device)
+            k_indices_dev = k_indices.to(scores.device)
+            # Mask if key index is greater than query index (k > q)
+            causal_mask_bool = k_indices_dev[None, :k_len] > q_indices_dev[:, None] # Shape [q_len, k_len]
+            # Add batch and head dimensions for broadcasting
+            final_mask = causal_mask_bool.unsqueeze(0).unsqueeze(0) # Shape [1, 1, q_len, k_len]
+
+        # 2. Padding mask (additive mask converted to boolean)
+        if mask is not None:
+            # Input mask has shape [B, 1, q_len, k_len] or [B, H, q_len, k_len]
+            padding_mask_bool = mask == -torch.inf
+            if final_mask is None:
+                final_mask = padding_mask_bool
+            else:
+                # OR combines the masks, broadcasting dimensions B and H
+                final_mask = final_mask | padding_mask_bool
+
+        # 3. Apply the combined mask if it exists
+        if final_mask is not None:
+            # print(f"[rank{self.rank}] raw_attention: scores shape {scores.shape}, final_mask shape {final_mask.shape}", flush=True) # DEBUG
+            scores = scores.masked_fill(final_mask, -torch.inf)
+
         return scores
 
     def init_values(self, q: Tensor) -> Tuple[Tensor, Tensor, Tensor]:

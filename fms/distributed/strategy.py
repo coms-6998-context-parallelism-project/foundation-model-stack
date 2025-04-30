@@ -201,17 +201,22 @@ class RingAttentionStrategy(DistributedStrategy):
         if self.world_size == 1:
             return tensor
         global_len = tensor.size(dim)
+        global_shape = tensor.shape
         local_len, start_offset = self.get_local_seq_len_and_offset(global_len)
-        return tensor.narrow(dim, start_offset, local_len).contiguous()
+        local_shard = tensor.narrow(dim, start_offset, local_len).contiguous()
+        print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Global shape {global_shape}, Local shard shape {local_shard.shape} (dim={dim})")
+        return local_shard
 
     def gather_output(self, tensor: torch.Tensor, dim: int, global_len: int) -> torch.Tensor:
         """Gathers tensors from all ranks along a given dimension."""
         if self.world_size == 1:
             return tensor
+        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Local shape before gather {tensor.shape} (dim={dim})")
         # Use all_gather_into_tensor for potentially better performance, requires knowing output size
         # Output tensor needs to accommodate the full global length
         output_shape = list(tensor.shape)
         output_shape[dim] = global_len
         output_tensor = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
         dist.all_gather_into_tensor(output_tensor, tensor, group=self.group)
+        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {output_tensor.shape}")
         return output_tensor

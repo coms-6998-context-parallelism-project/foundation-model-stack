@@ -211,8 +211,10 @@ class RingAttentionEngine:
             # Compute attention with current K, V blocks
             # Mask needs to be sliced using global indices
             mask = args.mask_global[:, :, args.q_global_offset:args.q_global_offset+args.q_shard.shape[2], current_kv_global_offset:current_kv_global_offset+current_kv_len] if args.mask_global is not None else None
+            print(f"[rank{args.rank}] compute_sums: Before update_totals (Iter {i})", flush=True)
             num, den = engine.update_totals(args.q_shard, effective_recv_k, effective_recv_v, mask, q_global_indices, current_k_global_indices, final_max_score, num, den)
-            
+            print(f"[rank{args.rank}] compute_sums: After update_totals (Iter {i})", flush=True)
+
             # Send current K, V shards, receive into buffers sliced for the *expected incoming length*
             recv_k_slice_for_irecv = recv_k[:, :, :expected_recv_len, :]
             recv_v_slice_for_irecv = recv_v[:, :, :expected_recv_len, :]

@@ -190,6 +190,7 @@ class LLaMABlock(nn.Module):
                 group=self.ring_attention_group # Pass the stored group
             )
 
+            print(f"[rank{rank}] LLaMABlock.forward: Before engine.forward_full", flush=True)
             x_out = engine.forward_full(
                 q_shard=queries, k_shard=keys_e, v_shard=values, # Pass original projected values
                 mask_global=mask, # Mask is still global for now, engine slices it
@@ -198,6 +199,7 @@ class LLaMABlock(nn.Module):
                 global_seq_len=global_seq_len
             )
             # Ring attention engine now returns the local block, gathering happens outside
+            print(f"[rank{rank}] LLaMABlock.forward: After engine.forward_full", flush=True)
             return x_out # No cache returned for ring attention yet
         else:
             # Fallback to the original attention mechanism

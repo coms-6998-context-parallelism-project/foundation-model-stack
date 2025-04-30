@@ -82,12 +82,17 @@ class RingAttentionEngine:
         initial_max_score, initial_num, initial_den = self.init_values(q_shard)
 
         # 2. First pass: Compute max score across all K blocks (shards)
+        print(f"[rank{self.rank}] Before compute_max_score", flush=True)
         final_max_score = self.compute_max_score(block_data, initial_max_score, global_seq_len)
+        print(f"[rank{self.rank}] After compute_max_score. Entering barrier...", flush=True)
         dist.barrier(self.group) # Ensure all ranks have computed their max score
+        print(f"[rank{self.rank}] Exited barrier after compute_max_score.", flush=True)
 
         # 3. Second pass: Compute numerator and denominator sums
         final_num, final_den = self.compute_sums(block_data, final_max_score, initial_num, initial_den, global_seq_len)
+        print(f"[rank{self.rank}] After compute_sums. Entering barrier...", flush=True)
         dist.barrier(self.group) # Ensure all ranks have computed their sums
+        print(f"[rank{self.rank}] Exited barrier after compute_sums.", flush=True)
 
         # 4. Compute local output block
         output_block = self.compute_block_output(x_block, final_num, final_den)

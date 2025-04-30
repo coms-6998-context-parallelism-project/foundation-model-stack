@@ -251,7 +251,7 @@ def generate(
             strategy = model.distributed_strategy
             max_ring_len = strategy.world_size * strategy.block_size
             if result.shape[1] >= max_ring_len:
-                # print(f"[rank{rank}] generate: Stopping generation. Sequence length {result.shape[1]} reached Ring Attention limit {max_ring_len}.")
+                print(f"[rank{rank}] generate: Stopping generation. Sequence length {result.shape[1]} reached Ring Attention limit {max_ring_len}.") # Keep this one
                 break
         # --- End Ring Attention Length Check ---
         input_ids = next_input[:, -max_seq_len:]

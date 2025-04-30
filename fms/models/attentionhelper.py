@@ -95,7 +95,7 @@ class RingAttentionEngine:
         final_num, final_den = self.compute_sums(block_data, final_max_score, initial_num, initial_den, global_seq_len)
         # print(f"[rank{self.rank}] After compute_sums. Entering barrier...", flush=True)
         dist.barrier(self.group) # Ensure all ranks have computed their sums
-        # print(f"[RING DEBUG][rank{self.rank}] Exited barrier after compute_sums.", flush=True)
+        # print(f"[RING DEBUG][rank{self.rank}] Exited barrier after compute_sums.", flush=True) # Removed for cleanup
 
         # 4. Compute local output block
         output_block = self.compute_block_output(x_block, final_num, final_den)

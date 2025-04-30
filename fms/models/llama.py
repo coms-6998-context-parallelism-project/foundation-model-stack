@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import time # Import time for timing
+# import time # Removed for cleanup
 # reread
 from fms import models
 from fms.distributed.strategy import (
@@ -210,7 +210,7 @@ class LLaMABlock(nn.Module):
              )
 
             # print(f"[rank{rank}] LLaMABlock.forward: Before engine.forward_full", flush=True)
-            start_time = time.time()
+            # start_time = time.time() # Removed for cleanup
             # Pass expanded keys (keys_e) and values (values_e) to the engine
             x_out = engine.forward_full(
                 q_shard=queries, k_shard=keys_e, v_shard=values_e,
@@ -220,8 +220,8 @@ class LLaMABlock(nn.Module):
                 global_seq_len=global_seq_len # Pass the padded global length
             )
             # Ring attention engine now returns the local block, gathering happens outside
-            end_time = time.time()
-            # print(f"[RING TIME DEBUG][rank{rank}] engine.forward_full took {end_time - start_time:.4f} seconds", flush=True)
+            # end_time = time.time() # Removed for cleanup
+            # print(f"[RING TIME DEBUG][rank{rank}] engine.forward_full took {end_time - start_time:.4f} seconds", flush=True) # Removed for cleanup
             # print(f"[rank{rank}] LLaMABlock.forward: After engine.forward_full", flush=True)
             return x_out # No cache returned for ring attention yet
         else:
@@ -501,7 +501,7 @@ class LLaMA(nn.Module):
         is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
         if is_ring_strategy:
             # print(f"[RING DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Using RingAttentionStrategy.", flush=True) # Commented out
-            print(f"[RING LENGTH DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Original input seq len = {x_in.size(1)}", flush=True)
+            # print(f"[RING LENGTH DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Original input seq len = {x_in.size(1)}", flush=True) # Removed for cleanup
             # shard_input now handles global padding and returns the original length
             x_in, original_global_seq_len = self.distributed_strategy.shard_input(x_in)
             # The compute_global_seq_len is the padded length used by the engine

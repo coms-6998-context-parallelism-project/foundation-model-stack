@@ -147,10 +147,9 @@ class RingAttentionEngine:
             # Mask needs to be sliced using global indices
             mask = args.mask_global[:, :, args.q_global_offset:args.q_global_offset+args.q_shard.shape[2], current_k_global_offset:current_k_global_offset+current_k_len] if args.mask_global is not None else None
             max_score = engine.update_max_attn(args.q_shard, effective_recv_k, mask, q_global_indices, current_k_global_indices, max_score)
-            
-            # Send current_k_shard, receive into a buffer sliced for the *expected incoming length*
-            recv_k_slice_for_irecv = recv_k[:, :, :expected_recv_len, :]
-            current_k_shard = self.send_recv_tensor(current_k_shard, recv_k_slice_for_irecv)
+
+            # Send current_k_shard, receive into the full buffer, providing the expected length
+            current_k_shard = self.send_recv_tensor(current_k_shard, recv_k, expected_recv_len)
 
             # Update the rank origin of the K shard we now hold
             current_k_rank = (current_k_rank - 1 + args.world_size) % args.world_size

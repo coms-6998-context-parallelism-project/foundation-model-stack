@@ -412,7 +412,7 @@ def get_model(
         elif distributed_strategy == "ring":
             print("using ring attention strategy")
             # Fetch block_size from kwargs, default to 1024 if not provided
-            block_size = extra_args.get("ring_attn_block_size", 64)
+            block_size = extra_args.get("ring_attn_block_size", 32)
             extra_args["distributed_strategy"] = RingAttentionStrategy(block_size=block_size, group=group)
 
     # Create the model on meta device to allocate weights lazily

@@ -263,12 +263,26 @@ class RingAttentionStrategy(DistributedStrategy):
         # The gathered dimension will be world_size * block_size
         global_shape[self.dim] = self.world_size * self.block_size
 
-        # Allocate the full tensor on the local GPU device
-        gathered_output = torch.empty(global_shape, dtype=tensor.dtype, device=tensor.device)
+        # Check backend or device type to decide strategy
+        # Gloo backend (used for CPU and MPS) might require CPU tensors for all_gather
+        # NCCL backend (used for CUDA) works best with tensors on the device
+        backend = dist.get_backend(self.group)
+        original_device = tensor.device
 
-        # Perform all-gather directly into the tensor
-        # Ensure local_output is contiguous if required by the backend
-        dist.all_gather_into_tensor(gathered_output, tensor.contiguous(), group=self.group)
+        if backend == 'gloo' or original_device.type == 'mps':
+            # Use dist.all_gather with CPU tensors for Gloo/MPS
+            # Create a list to hold the gathered tensors from all ranks on CPU
+            output_list = [torch.empty_like(tensor, device='cpu') for _ in range(self.world_size)]
+            # Move tensor to CPU before gathering
+            dist.all_gather(output_list, tensor.contiguous().cpu(), group=self.group)
+            # Concatenate the gathered tensors along the specified dimension
+            gathered_output_cpu = torch.cat(output_list, dim=self.dim)
+            # Move the final result back to the original device
+            gathered_output = gathered_output_cpu.to(original_device)
+        else:
+            # Use dist.all_gather_into_tensor for NCCL/CUDA
+            gathered_output = torch.empty(global_shape, dtype=tensor.dtype, device=original_device)
+            dist.all_gather_into_tensor(gathered_output, tensor.contiguous(), group=self.group)
 
         # Note: gathered_output contains the data from all ranks, potentially including global padding.
         # print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {gathered_output.shape} (device: {gathered_output.device})", flush=True)

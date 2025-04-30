@@ -119,6 +119,12 @@ parser.add_argument(
     choices=["local", "ring"], # Add other algorithms as needed
     help="Attention algorithm to use (e.g., 'ring' for Ring Attention)",
 )
+parser.add_argument(
+    "--max_new_tokens",
+    type=int,
+    default=10, # Keep a default for when not run by benchmark script
+    help="Maximum number of new tokens to generate",
+)
 
 args = parser.parse_args()
 
@@ -210,7 +216,7 @@ else:
     template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{}\n\n### Response:"
 
     prompt1 = template.format(
-        "One plus two?"
+        "Write an essay about the difference between cars and trains."
     )
     prompt2 = template.format("Explain some popular greetings in Spanish.")
 
@@ -267,7 +273,7 @@ def infer(use_cache, do_sample):
     result = generate(
         model,
         ids,
-        max_new_tokens=10,
+        max_new_tokens=args.max_new_tokens, # Use the argument value here
         use_cache=use_cache,
         do_sample=do_sample,
         max_seq_len=max_seq_len,

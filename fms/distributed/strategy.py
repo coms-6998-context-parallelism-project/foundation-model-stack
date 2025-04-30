@@ -242,7 +242,8 @@ class RingAttentionStrategy(DistributedStrategy):
         # Slice the globally padded tensor
         local_shard = tensor_padded.narrow(self.dim, start_idx, self.block_size).contiguous() # Each shard is block_size
 
-        # print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Original global shape {global_shape}, Padded global shape {tensor_padded.shape}, Local shard shape {local_shard.shape} (dim={self.dim})", flush=True)
+        # Ensure this print is active to show block occupation
+        print(f"[RING BLOCK DEBUG][rank{self.rank}] RingAttentionStrategy.shard_input: Padded global shape {tensor_padded.shape}, Local shard shape (block occupation) {local_shard.shape} (dim={self.dim})", flush=True)
         # Return the shard (always size block_size) and the original global length for trimming later
         return local_shard, original_global_seq_len
 

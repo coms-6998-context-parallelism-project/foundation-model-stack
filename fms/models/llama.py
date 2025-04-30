@@ -65,10 +65,10 @@ class LLaMAConfig(ModelConfig):
 
 
 class LLaMABlock(nn.Module):
-    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding, ring_attention_group: Optional[dist.ProcessGroup] = None):
+    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding, distributed_strategy: DistributedStrategy):
         super(LLaMABlock, self).__init__()
         self.config = config
-        self.ring_attention_group = ring_attention_group # Store the group if provided
+        self.distributed_strategy = distributed_strategy # Store the strategy
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
 
@@ -151,10 +151,12 @@ class LLaMABlock(nn.Module):
     ):
         # print(attn_algorithm) # Can be noisy
         # If using ring attention, handle it separately
-        if attn_algorithm == "ring": # This is the check you asked about
-            rank = self.ring_attention_group.rank() if self.ring_attention_group else -1 # Get rank safely
+        if attn_algorithm == "ring" and isinstance(self.distributed_strategy, RingAttentionStrategy):
+            strategy = self.distributed_strategy
+            rank = strategy.rank
             print(f"[RING DEBUG][rank{rank}] LLaMABlock.forward: Using Ring Attention path.", flush=True)
-            if self.ring_attention_group is None:
+            ring_attention_group = strategy.group # Get group from strategy - already checked if strategy is RingAttentionStrategy
+            if ring_attention_group is None: # Check if the group from the strategy is valid
                 raise RuntimeError("Ring Attention algorithm requested but no ring_attention_group was provided to the LLaMABlock.")
             # Check if required arguments are provided
             if q_global_offset is None or global_seq_len is None:
@@ -199,13 +201,13 @@ class LLaMABlock(nn.Module):
 
             engine = RingAttentionEngine(
                 block_size=32, # TODO: Revisit if this internal block_size is needed/correct
-                strategy_block_size=self.config.ring_attn_block_size, # Pass the strategy's block size from config
+                strategy_block_size=strategy.block_size, # Get block size from the strategy object
                 attn=self.attn,
                 ff=self.ff_sub_layer,
                 ff_norm=self.ff_ln,
                 is_causal=engine_is_causal,
-                group=self.ring_attention_group # Pass the stored group
-            )
+                group=ring_attention_group # Pass the group from strategy
+             )
 
             # print(f"[rank{rank}] LLaMABlock.forward: Before engine.forward_full", flush=True)
             start_time = time.time()
@@ -346,12 +348,8 @@ class LLaMA(nn.Module):
 
         layers = []
         for i in range(self.config.nlayers):
-            # Pass the group to the block if using RingAttentionStrategy
-            ring_group = None
-            if isinstance(self.distributed_strategy, RingAttentionStrategy):
-                ring_group = self.distributed_strategy.group
-
-            block: nn.Module = LLaMABlock(self.config, self.rot_emb, ring_attention_group=ring_group)
+            # Pass the strategy object to the block
+            block: nn.Module = LLaMABlock(self.config, self.rot_emb, self.distributed_strategy)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
@@ -503,6 +501,7 @@ class LLaMA(nn.Module):
         is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
         if is_ring_strategy:
             print(f"[RING DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Using RingAttentionStrategy.", flush=True)
+            print(f"[RING LEN DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Original input seq len = {x_in.size(1)}", flush=True)
             # shard_input now handles global padding and returns the original length
             x_in, original_global_seq_len = self.distributed_strategy.shard_input(x_in)
             # The compute_global_seq_len is the padded length used by the engine

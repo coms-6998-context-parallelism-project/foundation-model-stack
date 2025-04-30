@@ -188,7 +188,7 @@ else:
     template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{}\n\n### Response:"
 
     prompt1 = template.format(
-        "Provide a list of instructions for preparing chicken soup."
+        "Explain the difference between a CPU and a GPU and why one might use one over the other."
     )
     prompt2 = template.format("Explain some popular greetings in Spanish.")
 

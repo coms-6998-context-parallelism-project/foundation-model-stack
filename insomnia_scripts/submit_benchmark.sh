@@ -2,7 +2,7 @@
 # Enhanced benchmark submit script with sbatch wait and retry logic
 
 REPO_DIR="/insomnia001/depts/edu/COMSE6998/sg3790/foundation-model-stack"
-SLURM_SCRIPT_PATH="$HOME/insomnia_scripts/run_benchmark.slurm"
+SLURM_SCRIPT_PATH=REPO_DIR + "/insomnia_scripts/run_benchmark.slurm"
 
 echo "[INFO] Navigating to repository: $REPO_DIR"
 cd "$REPO_DIR" || { echo "[ERROR] Failed to cd to repo"; exit 1; }

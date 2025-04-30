@@ -10,6 +10,7 @@ from fms import models
 from fms.distributed.strategy import (
     DistributedStrategy,
     NoOpStrategy,
+    RingAttentionStrategy, # Import RingAttentionStrategy if needed by LLaMARing
     TensorParallelStrategy,
 )
 from fms.modules.attention import MultiHeadAttention
@@ -420,6 +421,205 @@ class LLaMA(nn.Module):
             return preds
 
 
+# --- Ring Attention Variant ---
+# Define Config, Block, and Model classes specifically for Ring Attention LLaMA
+# This keeps the original LLaMA implementation separate and clean.
+
+@dataclass
+class LLaMARingConfig(LLaMAConfig):
+    """
+    Configuration for LLaMA model using Ring Attention.
+    Inherits from LLaMAConfig and can add ring-specific parameters if needed.
+    """
+    # Example: Add ring-specific parameters if the implementation requires them
+    # ring_attn_block_size: int = 1024
+    pass
+
+# Placeholder/Assumption: A RingAttention module exists or is configured within MHA
+# If MultiHeadAttention itself needs modification for ring, that's a different approach.
+# Assuming here that the block uses a potentially different attention call signature or module.
+
+class LLaMARingBlock(nn.Module):
+    """LLaMA Block adapted for Ring Attention"""
+    def __init__(self, config: LLaMARingConfig, rotary_emb: RotaryEmbedding):
+        super(LLaMARingBlock, self).__init__()
+        self.config = config
+        emb_kq = self.config.emb_dim // self.config.nheads
+        emb_v = self.config.emb_dim // self.config.nheads
+
+        self.ln = LayerNormParameterized(
+            self.config.emb_dim,
+            elementwise_scale=True,
+            elementwise_shift=False,
+            use_mean=False,
+            eps=self.config.norm_eps,
+            use_high_precision_pow=True,
+        )
+        self.ff_ln = LayerNormParameterized(
+            self.config.emb_dim,
+            elementwise_scale=True,
+            elementwise_shift=False,
+            use_mean=False,
+            eps=self.config.norm_eps,
+            use_high_precision_pow=True,
+        )
+
+        if self.config.kvheads == 0:
+            kvheads = self.config.nheads
+        else:
+            kvheads = self.config.kvheads
+            assert self.config.nheads % self.config.kvheads == 0
+
+        # NOTE: This assumes MultiHeadAttention can handle ring attention logic,
+        # potentially via attn_algorithm or internal checks based on strategy.
+        # If a completely separate RingAttention module is used, instantiate that here.
+        self.attn = MultiHeadAttention(
+            self.config.emb_dim,
+            emb_kq,
+            emb_v,
+            self.config.nheads,
+            kvheads,
+            p_dropout=self.config.p_dropout,
+            use_bias=self.config.attn_bias,
+            position_encoder=rotary_emb,
+            fused=self.config.fused_weights,
+            linear_config=self.config.linear_config,
+            # Add any ring-specific parameters if MHA supports them
+        )
+        self.ff_sub_layer = GatedLinearUnit(
+            self.config.emb_dim,
+            hidden_grow_factor=self.config.hidden_grow_factor,
+            multiple_of=self.config.multiple_of,
+            activation_fn=str_to_activation(self.config.activation_fn),
+            p_dropout=self.config.p_dropout,
+            use_bias=self.config.mlp_bias,
+            fused=self.config.fused_weights,
+            linear_config=self.config.linear_config,
+        )
+
+        if self.config.p_dropout != 0:
+            self.dropout = nn.Dropout(self.config.p_dropout)
+
+    def forward(
+        self,
+        x,
+        *,
+        mask=None, # Ring Attention might handle masking differently internally
+        position_ids=None,
+        past_key_value_state=None, # Ring Attention might not use KV caching
+        use_cache=False, # Ring Attention might not use KV caching
+        is_causal_mask=False, # Ring Attention implies causality differently
+        attn_algorithm=None, # Could be used to trigger ring attention?
+    ):
+        # Ring attention might modify the input/output or how attention is called
+        # This is a simplified placeholder assuming similar structure to LLaMABlock
+        residual = x
+        x = self.ln(x)
+
+        # Adapt the attention call if needed for ring attention specifics
+        # For example, ring attention might not need past_key_value_state or use_cache
+        attn_out = self.attn(
+            q=x,
+            # k=x, v=x, # Often implicit for self-attention
+            mask=mask, # Ring might handle masking internally based on rank/world_size
+            position_ids=position_ids,
+            attn_algorithm=attn_algorithm, # Potentially set to 'ring'
+            past_key_value_state=past_key_value_state, # May be ignored
+            use_cache=use_cache, # May be ignored
+            is_self=True,
+            is_causal_mask=is_causal_mask, # May be ignored
+        )
+
+        # Ring attention might not return a cache
+        cache = None
+        if use_cache and isinstance(attn_out, tuple): # Check if cache is returned
+             x, cache = attn_out
+        else:
+             x = attn_out # Assume only hidden states are returned
+
+        if self.config.p_dropout != 0:
+            x = self.dropout(x)
+        x = x + residual
+
+        residual = x
+        x = self.ff_ln(x)
+        x = self.ff_sub_layer(x)
+        if self.config.p_dropout != 0:
+            x = self.dropout(x)
+        x = x + residual
+
+        if use_cache:
+            return (x, cache)
+        else:
+            return x
+
+
+class LLaMARing(LLaMA):
+    """
+    LLaMA model variant using Ring Attention.
+    Inherits from LLaMA and overrides parts to use LLaMARingConfig and LLaMARingBlock.
+    Assumes the distributed strategy passed might be RingAttentionStrategy.
+    """
+    def __init__(
+        self,
+        config: Optional[LLaMARingConfig] = None,
+        distributed_strategy: DistributedStrategy = NoOpStrategy,
+        **kwargs,
+    ):
+        # We need to call nn.Module's init first, then set attributes.
+        # super(LLaMA, self).__init__() would skip LLaMA's __init__ if we inherit LLaMA directly.
+        # Let's re-implement the relevant parts of LLaMA.__init__ here.
+        nn.Module.__init__(self) # Call grandparent's init
+
+        if config is not None:
+            self.config = config
+        else:
+            self.config = LLaMARingConfig() # Use Ring config default
+        self.config = self.config.updated(**kwargs)
+        self.distributed_strategy = distributed_strategy
+
+        self.width = self.config.emb_dim
+        self.pad_id = self.config.pad_id
+        self.max_expected_seq_len = self.config.max_expected_seq_len
+
+        # Embedding setup (same as LLaMA, distributed according to strategy)
+        shared = WordEmbedding(...) # Same as in LLaMA
+        self.shared = self.distributed_strategy.distribute_module(shared)
+
+        # Rotary Embedding setup (same as LLaMA)
+        self.rot_emb = RotaryEmbedding(...) # Same as in LLaMA
+
+        # Layer setup using LLaMARingBlock
+        layers = []
+        for i in range(self.config.nlayers):
+            block: nn.Module = LLaMARingBlock(self.config, self.rot_emb) # Use Ring Block
+            block = self.distributed_strategy.distribute_layer(block, i)
+            layers.append(block)
+        self.layers = nn.ModuleList(layers)
+
+        # Decoder Norm setup (same as LLaMA)
+        dec_norm = LayerNormParameterized(...) # Same as in LLaMA
+        self.dec_norm = self.distributed_strategy.distribute_module(dec_norm, final_layers=True)
+
+        # Dropout setup (same as LLaMA)
+        if self.config.p_dropout:
+            self.dropout = nn.Dropout(self.config.p_dropout)
+
+    # Override methods that need to refer to LLaMARingConfig or specific ring logic
+    def get_config(self) -> LLaMARingConfig:
+        return self.config
+
+    @classmethod
+    def from_config(cls, config: LLaMARingConfig) -> "LLaMARing":
+        return cls(config)
+
+    # reset_parameters, post_init, _helper, forward might need adjustments
+    # based on the specifics of Ring Attention (e.g., caching, masking).
+    # For now, assume they can be inherited or are similar enough. If RingAttentionStrategy
+    # requires specific handling (like sharding/gathering inputs/outputs), the main
+    # forward pass might need to incorporate calls to strategy.shard_input/gather_output.
+
+
 # Register common LLaMA variants with the model registration API
 
 # a micro llama model to use with a char-level tokenizer
@@ -496,6 +696,18 @@ def _llama_factory_factory(config):
     return factory
 
 
+# Factory for Ring Attention Variants
+def _llama_ring_factory_factory(config):
+    def factory(**kwargs):
+        # If RingAttentionStrategy needs to be explicitly passed:
+        # if 'distributed_strategy' not in kwargs or isinstance(kwargs['distributed_strategy'], NoOpStrategy):
+        #    # Assuming block_size needs to be configured, e.g., from config
+        #    block_size = getattr(config, 'ring_attn_block_size', 1024)
+        #    kwargs['distributed_strategy'] = RingAttentionStrategy(block_size=block_size)
+        return LLaMARing(config, **kwargs) # Use the Ring model class
+    return factory
+
+
 models.register_model(
     _architecture_name, "micro", _llama_factory_factory(_micro_char_config)
 )
@@ -528,6 +740,13 @@ models.register_model(
     "granite.code-8b",
     _llama_factory_factory((_granite_8b_code_config)),
 )
+
+# Register Ring Variants
+_7b_ring_config = LLaMARingConfig() # Adjust params if needed
+_13b_ring_config = LLaMARingConfig(emb_dim=5120, nheads=40, nlayers=40) # Adjust params if needed
+
+models.register_model(_architecture_name, "7b_ring", _llama_ring_factory_factory(_7b_ring_config))
+models.register_model(_architecture_name, "13b_ring", _llama_ring_factory_factory(_13b_ring_config))
 
 # Create all the pieces to generate adapters for different checkpoints
 serialization.register_adapter_step(
@@ -720,3 +939,8 @@ serialization.register_adapter(
     "fms.pre0.0.6",
     ["pre0.0.6_attn_unfused_to_fused", "swiglu_unfused_to_fused", "weight_fusion"],
 )
+
+# Add ring-specific adapters if loading checkpoints requires different name mapping or steps
+# Example:
+# serialization.register_adapter_step("llama", "hf_ring_to_fms_names", _hf_ring_to_fms_names) # Define this function if needed
+# serialization.register_adapter("llama", "hf_ring", ["hf_ring_to_fms_names", "hf_to_fms_rope", "weight_fusion"])

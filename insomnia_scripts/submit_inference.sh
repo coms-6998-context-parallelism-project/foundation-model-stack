@@ -1,6 +1,6 @@
 #!/bin/bash
 REPO_DIR="/insomnia001/depts/edu/COMSE6998/sg3790/foundation-model-stack"
-SLURM_SCRIPT_PATH="$HOME/slurm/run_inference.slurm"
+SLURM_SCRIPT_PATH="$HOME/insomnia_scripts/run_inference.slurm"
 
 echo "[INFO] Pulling repo updates..."
 cd "$REPO_DIR" && git pull && cd ~

@@ -2,13 +2,15 @@
 # Enhanced benchmark submit script with sbatch wait and retry logic
 
 REPO_DIR="/insomnia001/depts/edu/COMSE6998/sg3790/foundation-model-stack"
-SLURM_SCRIPT_PATH=REPO_DIR + "/insomnia_scripts/run_benchmark.slurm"
+SLURM_SCRIPT_PATH="${REPO_DIR}/insomnia_scripts/run_benchmark.slurm"
 
 echo "[INFO] Navigating to repository: $REPO_DIR"
 cd "$REPO_DIR" || { echo "[ERROR] Failed to cd to repo"; exit 1; }
 
 echo "[INFO] Pulling latest changes..."
-git pull
+# Force pull by fetching and resetting hard to the remote branch (e.g., origin/main)
+git fetch origin
+git reset --hard origin/main # Adjust 'main' if your main branch has a different name (e.g., master)
 
 echo "[INFO] Navigating back home..."
 cd ~ || { echo "[ERROR] Failed to cd to home"; exit 1; }

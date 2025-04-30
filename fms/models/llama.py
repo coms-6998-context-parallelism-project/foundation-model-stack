@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-
+# reread
 from fms import models
 from fms.distributed.strategy import (
     DistributedStrategy,
@@ -59,6 +59,8 @@ class LLaMAConfig(ModelConfig):
     rope_theta: float = 10_000.0
     linear_config: Optional[Mapping[str, Any]] = None
     fused_weights: bool = True
+    # Add ring_attn_block_size to config
+    ring_attn_block_size: int = 64 # Default block size
 
 
 class LLaMABlock(nn.Module):
@@ -132,6 +134,7 @@ class LLaMABlock(nn.Module):
             queries, keys = attn_data.position_encoder.adjusted_qk(queries, keys, position_ids, past_key_value_state, use_cache)
 
         return queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
+
     def forward(
         self,
         x,
@@ -142,32 +145,28 @@ class LLaMABlock(nn.Module):
         use_cache=False,
         is_causal_mask=False,
         attn_algorithm=None,
-        global_seq_len = None,
+        q_global_offset=None, # Add q_global_offset argument
+        global_seq_len = None, # Add global_seq_len argument (padded length)
     ):
         print(attn_algorithm)
         # If using ring attention, handle it separately
         if attn_algorithm == "ring": # This is the check you asked about
-            print(f"[rank{self.ring_attention_group.rank() if self.ring_attention_group else 'N/A'}] LLaMABlock.forward: Using Ring Attention path.")
+            rank = self.ring_attention_group.rank() if self.ring_attention_group else -1 # Get rank safely
+            print(f"[rank{rank}] LLaMABlock.forward: Using Ring Attention path.")
             if self.ring_attention_group is None:
                 raise RuntimeError("Ring Attention algorithm requested but no ring_attention_group was provided to the LLaMABlock.")
+            # Check if required arguments are provided
+            if q_global_offset is None or global_seq_len is None:
+                raise ValueError("q_global_offset and global_seq_len must be provided when attn_algorithm='ring'")
             # TODO: KV caching with Ring Attention
             if use_cache:
-                # TODO: Implement caching for Ring Attention if needed. It's complex due to the distributed nature.
                 logger.warning("KV caching is not yet supported with Ring Attention.")
                 use_cache = False # Force disable cache for now
-            if global_seq_len is None:
-                raise ValueError("global_seq_len must be provided when attn_algorithm='ring'")
 
-            # Determine the global offset of this rank's shard
-            # This assumes the input x is already sharded by the RingAttentionStrategy
-            world_size = self.ring_attention_group.size()
-            rank = self.ring_attention_group.rank()
-            shard_len = (global_seq_len + world_size - 1) // world_size
-            q_global_offset = rank * shard_len
-
+            # Use the q_global_offset passed as an argument, not recalculated here.
+            # The global_seq_len passed as an argument should be the padded length.
             x_ln = self.ln(x)
-            # Project Q, K, V without applying RoPE here
-            B, T, _ = x_ln.shape
+            B, T, _ = x_ln.shape # T here is the strategy_block_size
             q_proj, k_proj, v_proj = self.attn.in_proj(q=x_ln, k=x_ln, v=x_ln) # Pass x_ln for q, k, and v
 
             # Reshape for RingAttentionEngine (B, H, T, D)
@@ -177,22 +176,29 @@ class LLaMABlock(nn.Module):
 
             # --- Apply RoPE ---
             # For Ring Attention, RoPE needs GLOBAL position IDs corresponding to the local shard
+            # Use the q_global_offset passed in the arguments.
             if position_ids is None:
                 # Calculate global positions for the current shard
                 global_position_ids = torch.arange(q_global_offset, q_global_offset + T, device=x.device)
-                position_ids = global_position_ids.unsqueeze(0).expand(B, -1)
-            # Else, assume the provided position_ids are already global and correctly sharded/padded
+                rope_position_ids = global_position_ids.unsqueeze(0).expand(B, -1) # Use this for RoPE
+            else:
+                # If position_ids are provided, assume they are already correct for the shard
+                # This might need adjustment depending on how position_ids are handled upstream with padding/sharding
+                rope_position_ids = position_ids
 
-            queries, keys = self.attn.position_encoder.adjusted_qk(queries, keys, position_ids, use_cache=False) # Apply RoPE here
+            queries, keys = self.attn.position_encoder.adjusted_qk(queries, keys, rope_position_ids, use_cache=False) # Apply RoPE here
 
             # === Expand for GQA
             expansion = self.attn.nheads // self.attn.kvheads
             keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
+            # Values also need expansion for the engine
+            values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
 
             engine_is_causal = is_causal_mask and mask is None
 
             engine = RingAttentionEngine(
-                block_size=32, # block_size is less relevant now, internal chunking?
+                block_size=32, # TODO: Revisit if this internal block_size is needed/correct
+                strategy_block_size=self.config.ring_attn_block_size, # Pass the strategy's block size from config
                 attn=self.attn,
                 ff=self.ff_sub_layer,
                 ff_norm=self.ff_ln,
@@ -201,12 +207,13 @@ class LLaMABlock(nn.Module):
             )
 
             print(f"[rank{rank}] LLaMABlock.forward: Before engine.forward_full", flush=True)
+            # Pass expanded keys (keys_e) and values (values_e) to the engine
             x_out = engine.forward_full(
-                q_shard=queries, k_shard=keys_e, v_shard=values, # Pass original projected values
+                q_shard=queries, k_shard=keys_e, v_shard=values_e,
                 mask_global=mask, # Mask is still global for now, engine slices it
-                x_shard=x,
+                x_shard=x, # Pass original input x for residual connection inside engine
                 q_global_offset=q_global_offset,
-                global_seq_len=global_seq_len
+                global_seq_len=global_seq_len # Pass the padded global length
             )
             # Ring attention engine now returns the local block, gathering happens outside
             print(f"[rank{rank}] LLaMABlock.forward: After engine.forward_full", flush=True)
@@ -474,9 +481,8 @@ class LLaMA(nn.Module):
         if use_cache and past_key_value_states[0] is not None:
             klen += past_key_value_states[0][0].size(-2)
         # Store original length for potential unpadding later
-        original_global_seq_len = klen
         # This will be the length used for computation (potentially padded)
-        compute_global_seq_len = original_global_seq_len
+        # compute_global_seq_len = original_global_seq_len
 
         # if mask is none, we need to specify causal mask
         if mask is None:
@@ -492,30 +498,21 @@ class LLaMA(nn.Module):
         # --- Ring Attention Strategy: Shard Input ---
         is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
         if is_ring_strategy:
-            world_size = self.distributed_strategy.world_size
-            # Pad sequence length to be divisible by world_size for fixed shards
-            padding_needed = (world_size - (original_global_seq_len % world_size)) % world_size
-            if padding_needed > 0:
-                compute_global_seq_len = original_global_seq_len + padding_needed
-                print(f"[rank{self.distributed_strategy.rank}] LLaMA._helper: Padding sequence from {original_global_seq_len} to {compute_global_seq_len} for Ring Attention.")
-                # Pad x_in (assuming dim 1 is sequence length)
-                # Use pad_id if available, otherwise 0. Be careful if 0 is a valid token.
-                pad_value = self.config.pad_id if self.config.pad_id >= 0 else 0
-                x_in = F.pad(x_in, (0, 0, 0, padding_needed), value=pad_value) # Pad last dim (seq length)
+            # shard_input now handles global padding and returns the original length
+            x_in, original_global_seq_len = self.distributed_strategy.shard_input(x_in)
+            # The compute_global_seq_len is the padded length used by the engine
+            compute_global_seq_len = self.distributed_strategy.world_size * self.distributed_strategy.block_size
+            # q_global_offset is the offset in the PADDED sequence
+            q_global_offset = self.distributed_strategy.rank * self.distributed_strategy.block_size
+            print(f"ringring", flush=True)
+            # Prepare kwargs specific to ring attention layers
+            layer_kwargs = {"q_global_offset": q_global_offset, "global_seq_len": compute_global_seq_len}
+        else:
+            # For non-ring strategy, original_global_seq_len is just klen
+            original_global_seq_len = klen
+            compute_global_seq_len = original_global_seq_len
+            layer_kwargs = {} # No extra kwargs for non-ring layers
 
-                # Adjust mask and position_ids
-                if mask is not None:
-                    # Assuming mask is [B, 1, qlen, klen] or similar, pad the klen dimension
-                    mask = F.pad(mask, (0, padding_needed), value=-torch.inf) # Pad last dim (key length)
-                    # If qlen also needs padding (e.g., mask is square), pad second-to-last dim
-                    if mask.shape[-2] == original_global_seq_len:
-                         mask = F.pad(mask, (0, 0, 0, padding_needed), value=-torch.inf) # Pad second-to-last dim (query length)
-                if position_ids is not None:
-                    # Pad position_ids like x_in
-                    position_ids = F.pad(position_ids, (0, padding_needed), value=0) # Pad last dim
-            print(f"[rank{self.distributed_strategy.rank}] LLaMA._helper: After padding. x_in={x_in.shape}, mask={mask.shape if mask is not None else 'None'}, pos_ids={position_ids.shape if position_ids is not None else 'None'}, compute_global_seq_len={compute_global_seq_len}", flush=True)
-
-            x_in = self.distributed_strategy.shard_input(x_in, dim=1)
 
         x_in = self.shared(x_in)
 
@@ -530,8 +527,8 @@ class LLaMA(nn.Module):
                 past_key_value_state=past_key_value_states[i],
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
-                attn_algorithm=attn_algorithm,
-                global_seq_len=compute_global_seq_len if is_ring_strategy else None, # Pass potentially padded length
+                attn_algorithm=attn_algorithm, # Pass layer_kwargs if ring strategy
+                **layer_kwargs, # Unpack ring-specific kwargs here
             )
 
             if use_cache:
@@ -549,12 +546,19 @@ class LLaMA(nn.Module):
         # --- Ring Attention Strategy: Gather Output ---
         if is_ring_strategy:
             # Gather along the sequence dimension
-            dec_out = self.distributed_strategy.gather_output(dec_out, dim=1, global_len=compute_global_seq_len)
-            print(f"[rank{self.distributed_strategy.rank}] LLaMA._helper: After gather. dec_out={dec_out.shape}", flush=True)
+            dec_out_gathered = self.distributed_strategy.gather_output(dec_out) # dec_out here is the local shard output
+            # Use rank for logging
+            rank = self.distributed_strategy.rank
+            print(f"[rank{rank}] LLaMA._helper: After gather. Gathered shape={dec_out_gathered.shape}", flush=True)
             # Truncate output back to original length if padding was added
-            if compute_global_seq_len != original_global_seq_len:
-                print(f"[rank{self.distributed_strategy.rank}] LLaMA._helper: Truncating output from {compute_global_seq_len} back to {original_global_seq_len}.")
-                dec_out = dec_out[:, :original_global_seq_len, :]
+            # Use original_global_seq_len obtained from shard_input
+            if dec_out_gathered.shape[self.distributed_strategy.dim] != original_global_seq_len:
+                print(f"[rank{rank}] LLaMA._helper: Truncating output from {dec_out_gathered.shape[self.distributed_strategy.dim]} back to {original_global_seq_len}.")
+                # Ensure slicing uses the correct dimension from the strategy
+                dec_out = dec_out_gathered.narrow(self.distributed_strategy.dim, 0, original_global_seq_len)
+            else:
+                dec_out = dec_out_gathered # No truncation needed if lengths match
+            print(f"[rank{rank}] LLaMA._helper: Final dec_out shape={dec_out.shape}", flush=True)
 
         return dec_out, present_key_value_states
 

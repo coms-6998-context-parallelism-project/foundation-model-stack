@@ -13,6 +13,7 @@ from fms.modules.feedforward import GatedLinearUnit
 
 logger = logging.getLogger(__name__)
 
+# reread this file
 # Note: This dataclass might become less necessary as we move away from threads,
 # but we can keep it for now to structure the arguments passed within the rank.
 @dataclass
@@ -29,9 +30,9 @@ class BlockData:
     v_shard: Tensor # The local V shard for this rank (initial)
     x_block: Tensor
 
-# fake ring attention, for now (no multi gpu setup quite yet)
+# Ring Attention computation logic
 class RingAttentionEngine:
-    def __init__(self, block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool, group: dist.ProcessGroup):
+    def __init__(self, block_size: int, strategy_block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool, group: dist.ProcessGroup):
         self.block_size = block_size
         self.attn = attn
         self.ff = ff
@@ -44,6 +45,7 @@ class RingAttentionEngine:
         self.world_size = dist.get_world_size(group)
         self.prev_rank = (self.rank - 1 + self.world_size) % self.world_size
         self.next_rank = (self.rank + 1) % self.world_size
+        self.strategy_block_size = strategy_block_size # Get the strategy's block size directly
 
     # main method
     def forward_full(self, q_shard: Tensor, k_shard: Tensor, v_shard: Tensor, mask_global: Optional[Tensor], x_shard: Tensor, q_global_offset: int, global_seq_len: int) -> Tensor:
@@ -52,7 +54,7 @@ class RingAttentionEngine:
         Assumes q_shard, k_shard, v_shard, x_shard are the *local shards* for the current rank.
         q_global_offset indicates the starting position of this shard in the global sequence.
         global_seq_len is the total sequence length across all ranks.
-        Returns the computed output shard for the current rank.
+        Returns the computed output shard for the current rank (size strategy_block_size).
         """
         print(f"[rank{self.rank}] RingAttentionEngine.forward_full: START. q_shard shape: {q_shard.shape}, k_shard shape: {k_shard.shape}, v_shard shape: {v_shard.shape}, x_shard shape: {x_shard.shape}, q_global_offset: {q_global_offset}, global_seq_len: {global_seq_len}")
         T_q_local = q_shard.shape[2]
@@ -60,7 +62,7 @@ class RingAttentionEngine:
 
         # Determine the query block this rank is responsible for
         # The entire local shard is the query block for this rank
-        q_local_start = 0
+        q_local_start = 0 # Start index within the local shard (always 0)
         q_local_end = T_q_local
 
         # k_local and v_local are just the input k_shard and v_shard initially
@@ -113,28 +115,22 @@ class RingAttentionEngine:
         current_k_shard = args.k_shard
         current_k_rank = args.rank # Rank where the current K shard originated
         
-        # Temporary buffer for receiving K
-        # Determine max shard size for buffer allocation
-        max_shard_len = (global_seq_len + args.world_size - 1) // args.world_size
+        # Temporary buffer for receiving K, size is fixed to strategy_block_size
         recv_shape = list(args.k_shard.shape)
-        recv_shape[2] = max_shard_len
+        recv_shape[2] = self.strategy_block_size
         recv_k = torch.empty(recv_shape, dtype=args.k_shard.dtype, device=device)
 
-        # Pre-calculate expected shard lengths for all ranks
-        shard_lengths = []
-        for r in range(args.world_size):
-            start = r * max_shard_len
-            length = min(max_shard_len, global_seq_len - start)
-            shard_lengths.append(length)
-        prev_rank_shard_len = shard_lengths[self.prev_rank]
+        # All shards have the same length now
+        expected_recv_len = self.strategy_block_size
 
         for i in range(args.world_size):
             print(f"[rank{args.rank}] RingAttentionEngine.compute_max_score: Iter {i}/{args.world_size}, processing K from rank {current_k_rank}")
             # Calculate global indices and length for the *current* K shard
-            current_k_len = (global_seq_len + args.world_size - 1) // args.world_size
-            current_k_global_offset = current_k_rank * current_k_len
-            # Adjust length for the last rank
-            current_k_len = min(current_k_len, global_seq_len - current_k_global_offset)
+            # Length is always strategy_block_size, offset is based on rank * strategy_block_size
+            current_k_len = self.strategy_block_size
+            current_k_global_offset = current_k_rank * self.strategy_block_size
+            # The global_seq_len passed in should be the padded length (world_size * block_size)
+            # No need to adjust length for last rank due to global padding.
             current_k_global_indices = torch.arange(current_k_global_offset, current_k_global_offset + current_k_len, device=device)
             
             # Determine the length of the tensor we expect to receive in this iteration
@@ -142,10 +138,10 @@ class RingAttentionEngine:
             # However, it's simpler to think about which rank *sent* it to us: self.prev_rank
             # The length depends on which rank's data is currently at self.prev_rank
             incoming_rank_origin = (self.rank - 1 - i + args.world_size) % args.world_size
-            expected_recv_len = shard_lengths[incoming_rank_origin]
+            # expected_recv_len is always strategy_block_size now
 
             # Slice the received buffer if necessary (only needed if shapes differ)
-            # Use expected_recv_len for slicing the *received* data *after* communication
+            # Use expected_recv_len (strategy_block_size) for slicing the *received* data *after* communication
             effective_recv_k = recv_k[:, :, :expected_recv_len, :] if i > 0 else current_k_shard
 
             # Compute attention with current K block
@@ -175,20 +171,13 @@ class RingAttentionEngine:
         current_kv_rank = args.rank # Rank where the current K/V shards originated
 
         # Temporary buffers for receiving K and V
-        # Determine max shard size for buffer allocation
-        max_shard_len = (global_seq_len + args.world_size - 1) // args.world_size
-        recv_k_shape = list(args.k_shard.shape); recv_k_shape[2] = max_shard_len
-        recv_v_shape = list(args.v_shard.shape); recv_v_shape[2] = max_shard_len
+        recv_k_shape = list(args.k_shard.shape); recv_k_shape[2] = self.strategy_block_size
+        recv_v_shape = list(args.v_shard.shape); recv_v_shape[2] = self.strategy_block_size
         recv_k = torch.empty(recv_k_shape, dtype=args.k_shard.dtype, device=device)
         recv_v = torch.empty(recv_v_shape, dtype=args.v_shard.dtype, device=device)
 
-        # Pre-calculate expected shard lengths for all ranks (needed for recv buffer slicing)
-        max_shard_len = (global_seq_len + args.world_size - 1) // args.world_size
-        shard_lengths = []
-        for r in range(args.world_size):
-            start = r * max_shard_len
-            length = min(max_shard_len, global_seq_len - start)
-            shard_lengths.append(length)
+        # All shards have the same length now
+        expected_recv_len = self.strategy_block_size
 
         for i in range(args.world_size):
             print(f"[rank{args.rank}] RingAttentionEngine.compute_sums: Iter {i}/{args.world_size}, processing K/V from rank {current_kv_rank}")
@@ -196,12 +185,13 @@ class RingAttentionEngine:
             current_kv_len = (global_seq_len + args.world_size - 1) // args.world_size
             current_kv_global_offset = current_kv_rank * current_kv_len
             # Adjust length for the last rank
-            current_kv_len = min(current_kv_len, global_seq_len - current_kv_global_offset)
+            # Length is always strategy_block_size, offset is based on rank * strategy_block_size
+            current_kv_len = self.strategy_block_size
+            current_kv_global_offset = current_kv_rank * self.strategy_block_size
             current_k_global_indices = torch.arange(current_kv_global_offset, current_kv_global_offset + current_kv_len, device=device)
             
             # Determine the length of the tensor we expect to receive in this iteration
             incoming_rank_origin = (self.rank - 1 - i + args.world_size) % args.world_size
-            expected_recv_len = shard_lengths[incoming_rank_origin]
 
             # Slice the received buffers if necessary
             # Use expected_recv_len for slicing the *received* data *after* communication
@@ -361,30 +351,36 @@ class RingAttentionEngine:
         return torch.maximum(current_max_score, block_max)
 
     def update_totals(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, final_max_score: Tensor, current_num: Tensor, current_den: Tensor) -> Tuple[Tensor, Tensor]:
+        # Store original dtype
+        orig_dtype = q.dtype
+        # Promote to fp32 for stable calculations
+        q = q.float()
+        k = k.float()
+        v = v.float()
+        final_max_score = final_max_score.float()
+        current_num = current_num.float()
+        current_den = current_den.float()
+
         print(f"[rank{self.rank}] update_totals: Before raw_attention", flush=True)
         attn_scores = self.raw_attention(q, k, mask, q_indices, k_indices)
 
         # Check for NaNs/Infs, specifically positive infinity as -inf is expected from masking
-        if torch.isnan(attn_scores).any():
-            print(f"[rank{self.rank}] WARNING: NaNs found in attn_scores!", flush=True)
-        if torch.isinf(attn_scores).any():
-            # Check if there are positive infinities
-            if (attn_scores == torch.inf).any():
-                print(f"[rank{self.rank}] WARNING: Positive Infs found in attn_scores!", flush=True)
-            # Optionally add more debugging here, e.g., print where NaNs/Infs occur
+        # It's okay if attn_scores has -inf from masking
 
         print(f"[rank{self.rank}] update_totals: After raw_attention. Before stable_scores", flush=True)
-        # Remove clamping for potentially better numerical stability with fp16
-        stable_scores = attn_scores - final_max_score # .clamp(min=-10.0, max=10.0)
+        # Subtracting max score for stability. Ensure max_score isn't -inf where attn_scores is also -inf.
+        # Replace -inf in final_max_score with a large negative number where attn_scores is also -inf to avoid inf - inf = nan
+        safe_max_score = torch.where(final_max_score == -torch.inf, torch.finfo(final_max_score.dtype).min, final_max_score)
+        stable_scores = attn_scores - safe_max_score
         # Replace potential NaN from (-inf - (-inf)) with -inf before exp
         stable_scores = torch.nan_to_num(stable_scores, nan=-torch.inf)
 
-        if torch.isnan(stable_scores).any() or torch.isinf(stable_scores).any():
-            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in stable_scores!", flush=True)
-
         exp_scores = torch.exp(stable_scores)
-        if torch.isnan(exp_scores).any() or torch.isinf(exp_scores).any():
+        # Check for NaNs/Infs after exponentiation (should ideally be only positive numbers or zero)
+        if torch.isnan(exp_scores).any():
             print(f"[rank{self.rank}] WARNING: NaNs/Infs found in exp_scores!", flush=True)
+        if (exp_scores == torch.inf).any():
+            print(f"[rank{self.rank}] WARNING: Positive Infs found in exp_scores!", flush=True)
 
         print(f"[rank{self.rank}] update_totals: After exp_scores. Before einsum", flush=True)
         num_update = torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
@@ -392,8 +388,9 @@ class RingAttentionEngine:
         print(f"[rank{self.rank}] update_totals: After einsum/sum", flush=True)
 
         # Check for NaNs/Infs in updates before adding
-        if torch.isnan(num_update).any() or torch.isinf(num_update).any():
+        if torch.isnan(num_update).any() or (num_update == torch.inf).any():
             print(f"[rank{self.rank}] WARNING: NaNs/Infs found in num_update!", flush=True)
-        if torch.isnan(den_update).any() or torch.isinf(den_update).any():
+        if torch.isnan(den_update).any() or (den_update == torch.inf).any():
             print(f"[rank{self.rank}] WARNING: NaNs/Infs found in den_update!", flush=True)
-        return current_num + num_update, current_den + den_update
+        # Cast back to original dtype before returning
+        return (current_num + num_update).to(orig_dtype), (current_den + den_update).to(orig_dtype)

@@ -275,13 +275,25 @@ class RingAttentionStrategy(DistributedStrategy):
         # The gathered dimension will be world_size * block_size
         global_shape[self.dim] = self.world_size * self.block_size
 
-        # Allocate the full tensor on the local GPU device
-        gathered_output = torch.empty(global_shape, dtype=tensor.dtype, device=tensor.device)
+        # Store original device
+        original_device = tensor.device
+
+        # --- Use dist.all_gather instead of all_gather_into_tensor ---
+        # Create a list to hold the gathered tensors from all ranks
+        # Ensure the list tensors are on CPU for Gloo backend
+        output_list = [torch.empty_like(tensor, device='cpu') for _ in range(self.world_size)]
 
         # Perform all-gather directly into the tensor
         # Ensure local_output is contiguous if required by the backend
-        dist.all_gather_into_tensor(gathered_output, tensor.contiguous(), group=self.group)
+        # Move tensor to CPU before gathering for Gloo backend
+        dist.all_gather(output_list, tensor.contiguous().cpu(), group=self.group)
 
-        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {gathered_output.shape}", flush=True)
+        # Concatenate the gathered tensors along the specified dimension
+        gathered_output_cpu = torch.cat(output_list, dim=self.dim)
+        # --- End change ---
+
+        # Move the final result back to the original device
+        gathered_output = gathered_output_cpu.to(original_device)
+        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {gathered_output.shape} (device: {gathered_output.device})", flush=True)
         # Return the gathered tensor, which includes the global padding
         return gathered_output

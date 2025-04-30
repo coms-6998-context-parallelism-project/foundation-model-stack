@@ -24,6 +24,9 @@ def run_inference_benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
         "--device_type", config["device_type"],
         "--max_new_tokens", str(config["max_new_tokens"]),
     ]
+    # Pass the flag down, even if inference.py doesn't use it yet
+    if config.get("print_response", False):
+        base_command.append("--print_response")
 
     if config["dtype"]:
         base_command.extend(["--default_dtype", config["dtype"]])
@@ -80,11 +83,12 @@ def run_inference_benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
             print(f"Success! Duration: {results['duration_sec']:.3f}s")
             print(f"Time per token: {results['time_per_token_ms']:.2f}ms")
         else:
+            # Always print stdout/stderr on failure for debugging
+            print("--- STDOUT ---")
+            print(process.stdout)
             print(f"Error! Return Code: {process.returncode}")
             print("--- STDERR ---")
             print(process.stderr)
-            print("--- STDOUT ---")
-            print(process.stdout)
 
     except Exception as e:
         print(f"Failed to run subprocess: {e}")
@@ -105,6 +109,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_cache", action="store_true", help="Enable KV caching (default: False)")
     parser.add_argument("--attn_types", nargs='+', default=["ring", "regular"], help="Attention types to benchmark ('ring', 'regular')")
     parser.add_argument("--max_new_tokens", nargs='+', type=int, default=[256], help="List of max_new_tokens values to test")
+    parser.add_argument("--print_response", action="store_true", help="Print the generated response captured from inference.py stdout")
     # Add other parameters you want to vary, e.g., context lengths (would require prompt generation)
     # parser.add_argument("--context_lengths", nargs='+', type=int, default=[512], help="List of context lengths to test")
 
@@ -124,6 +129,7 @@ if __name__ == "__main__":
             "use_cache": args.use_cache,
             "attn_type": attn_type,
             "max_new_tokens": tokens,
+            "print_response": args.print_response, # Store the flag in the config
             # Add other varying params here, e.g. "context_length": length
         }
         benchmark_configs.append(config)
@@ -138,6 +144,10 @@ if __name__ == "__main__":
     for result in all_results:
         print(f"Config: {result['config']}")
         if result["success"]:
+            # If requested, print the captured stdout which contains the response
+            if result['config'].get('print_response'):
+                print("--- Generated Response (stdout) ---")
+                print(result.get('stdout', 'N/A').strip()) # Use strip() to remove extra whitespace
             print(f"  Time/Token: {result.get('time_per_token_ms', 'N/A'):.2f} ms")
         else:
             print(f"  FAILED (Code: {result.get('return_code', 'N/A')}, Error: {result.get('error', 'See logs')})")

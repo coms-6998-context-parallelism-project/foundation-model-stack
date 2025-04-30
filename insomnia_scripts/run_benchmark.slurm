@@ -47,6 +47,7 @@ python scripts/benchmark_attn.py \
     --tokenizer "$TOKENIZER_PATH" \
     --device_type cuda \
     --dtype fp16 \
+    --print_response \
     "$@" # Pass along arguments like --max_new_tokens, --attn_types etc.
 
 echo "========================================================"

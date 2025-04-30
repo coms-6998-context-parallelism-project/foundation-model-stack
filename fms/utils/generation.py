@@ -171,6 +171,7 @@ def generate(
         ]
     ] = None,
     extra_kwargs: Optional[MutableMapping[str, Any]] = None,
+    attn_algorithm: Optional[str] = None,
 ):
     """
     A trivial generate function that can be used for validation/testing in

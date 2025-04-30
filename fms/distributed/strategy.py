@@ -1,12 +1,14 @@
 import os
 from abc import abstractmethod
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torch.distributed
+import torch.distributed as dist
 from torch import nn
 
 from fms.utils import tp_wrapping
+from fms import distributed
 
 
 if "DISTRIBUTED_STRATEGY_IGNORE_MODULES" in os.environ:
@@ -159,3 +161,57 @@ class TensorParallelStrategy(DistributedStrategy):
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
         return tp_wrapping.apply_tp(block, self.group)
+
+
+class RingAttentionStrategy(DistributedStrategy):
+    """
+    A strategy designed for Ring Attention where the sequence dimension is sharded
+    across devices in a group. Input is sharded, computation happens on shards,
+    and output is gathered.
+    Assumes simple block sharding for sequence dimension.
+    """
+    def __init__(self, group=None, from_meta=False):
+        super().__init__(from_meta)
+        assert torch.distributed.is_initialized(), "must initialize a process group"
+        self.group = group if group is not None else torch.distributed.GroupMember.WORLD
+        self.rank = dist.get_rank(self.group)
+        self.world_size = dist.get_world_size(self.group)
+
+    def _distribute_module(
+        self, module: nn.Module, final_layers: bool = False
+    ) -> nn.Module:
+        # Ring Attention typically doesn't require specific module sharding like TP.
+        # Modules are replicated, and data is sharded.
+        return module
+
+    def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
+        # Layers run on their local rank with sharded data. No specific layer distribution needed here.
+        return block
+
+    def get_local_seq_len_and_offset(self, global_seq_len: int) -> Tuple[int, int]:
+        """Calculates the length and starting offset for the local shard."""
+        shard_len = (global_seq_len + self.world_size - 1) // self.world_size
+        start = self.rank * shard_len
+        end = min((self.rank + 1) * shard_len, global_seq_len)
+        local_len = max(0, end - start)
+        return local_len, start
+
+    def shard_input(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
+        """Shards the input tensor along a given dimension."""
+        if self.world_size == 1:
+            return tensor
+        global_len = tensor.size(dim)
+        local_len, start_offset = self.get_local_seq_len_and_offset(global_len)
+        return tensor.narrow(dim, start_offset, local_len).contiguous()
+
+    def gather_output(self, tensor: torch.Tensor, dim: int, global_len: int) -> torch.Tensor:
+        """Gathers tensors from all ranks along a given dimension."""
+        if self.world_size == 1:
+            return tensor
+        # Use all_gather_into_tensor for potentially better performance, requires knowing output size
+        # Output tensor needs to accommodate the full global length
+        output_shape = list(tensor.shape)
+        output_shape[dim] = global_len
+        output_tensor = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
+        dist.all_gather_into_tensor(output_tensor, tensor, group=self.group)
+        return output_tensor

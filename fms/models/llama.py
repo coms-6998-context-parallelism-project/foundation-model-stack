@@ -5,11 +5,13 @@ from typing import Any, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
 from fms import models
 from fms.distributed.strategy import (
     DistributedStrategy,
     NoOpStrategy,
+    RingAttentionStrategy,
     TensorParallelStrategy,
 )
 
@@ -58,9 +60,10 @@ class LLaMAConfig(ModelConfig):
 
 
 class LLaMABlock(nn.Module):
-    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
+    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding, ring_attention_group: Optional[dist.ProcessGroup] = None):
         super(LLaMABlock, self).__init__()
         self.config = config
+        self.ring_attention_group = ring_attention_group # Store the group if provided
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
 
@@ -127,7 +130,6 @@ class LLaMABlock(nn.Module):
             queries, keys = attn_data.position_encoder.adjusted_qk(queries, keys, position_ids, past_key_value_state, use_cache)
 
         return queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
-    
     def forward(
         self,
         x,
@@ -138,51 +140,77 @@ class LLaMABlock(nn.Module):
         use_cache=False,
         is_causal_mask=False,
         attn_algorithm=None,
+        global_seq_len = None,
     ):
-        x_ln = self.ln(x)
+        # If using ring attention, handle it separately
+        if attn_algorithm == "ring": # This is the check you asked about
+            if self.ring_attention_group is None:
+                raise RuntimeError("Ring Attention algorithm requested but no ring_attention_group was provided to the LLaMABlock.")
+            # TODO: KV caching with Ring Attention
+            if use_cache:
+                # TODO: Implement caching for Ring Attention if needed. It's complex due to the distributed nature.
+                logger.warning("KV caching is not yet supported with Ring Attention.")
+                use_cache = False # Force disable cache for now
+            if global_seq_len is None:
+                raise ValueError("global_seq_len must be provided when attn_algorithm='ring'")
 
-        queries, keys, values = self.compute_local_qkv_and_rope(
-            self.attn,
-            q=x_ln,
-            k=x_ln,
-            v=x_ln,
-            position_ids=position_ids,
-            use_cache=use_cache,
-            past_key_value_state=past_key_value_state,
-            is_self=True,
-        )
+            # Determine the global offset of this rank's shard
+            # This assumes the input x is already sharded by the RingAttentionStrategy
+            world_size = self.ring_attention_group.size()
+            rank = self.ring_attention_group.rank()
+            shard_len = (global_seq_len + world_size - 1) // world_size
+            q_global_offset = rank * shard_len
 
-        # === Cache handling
-        if use_cache and past_key_value_state is not None and past_key_value_state[0].numel() > 0:
-            keys = torch.cat((past_key_value_state[0], keys), dim=2)
-            values = torch.cat((past_key_value_state[1], values), dim=2)
+            x_ln = self.ln(x)
+            queries, keys, values = self.compute_local_qkv_and_rope(
+                self.attn,
+                q=x_ln,
+                k=x_ln,
+                v=x_ln,
+                position_ids=position_ids,
+                use_cache=use_cache,
+                past_key_value_state=past_key_value_state,
+                is_self=True,
+            )
 
-        # === Expand for GQA
-        expansion = self.attn.nheads // self.attn.kvheads
-        keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
-        values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
+            # === Expand for GQA
+            expansion = self.attn.nheads // self.attn.kvheads
+            keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
+            values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
 
-        engine_is_causal = is_causal_mask and mask is None
+            engine_is_causal = is_causal_mask and mask is None
 
-        engine = RingAttentionEngine(
-            block_size=32,
-            attn=self.attn,
-            ff=self.ff_sub_layer,
-            ff_norm=self.ff_ln,
-            is_causal=engine_is_causal 
-        )
+            engine = RingAttentionEngine(
+                block_size=32, # block_size is less relevant now, internal chunking?
+                attn=self.attn,
+                ff=self.ff_sub_layer,
+                ff_norm=self.ff_ln,
+                is_causal=engine_is_causal,
+                group=self.ring_attention_group # Pass the stored group
+            )
 
-        x_out = engine.forward_full(
-            q_global=queries,
-            k_global=keys_e,
-            v_global=values_e,
-            mask_global=mask, 
-            x_global=x   
-        )
+            x_out = engine.forward_full(
+                q_shard=queries, k_shard=keys_e, v_shard=values_e,
+                mask_global=mask, # Mask is still global for now, engine slices it
+                x_shard=x,
+                q_global_offset=q_global_offset,
+                global_seq_len=global_seq_len
+            )
+            # Ring attention engine now returns the local block, gathering happens outside
+            return x_out # No cache returned for ring attention yet
+        else:
+            # Fallback to the original attention mechanism
+            return self.forward_old(
+                x,
+                mask=mask,
+                position_ids=position_ids,
+                past_key_value_state=past_key_value_state,
+                use_cache=use_cache,
+                is_causal_mask=is_causal_mask,
+                attn_algorithm=attn_algorithm,
+            )
 
-        return (x_out, (keys, values)) if use_cache else x_out
-
-    # will later change this to be configurable once we decide on the final architecture
+       # will later change this to be configurable once we decide on the final architecture
     def forward_old(
         self,
         x,
@@ -294,10 +322,16 @@ class LLaMA(nn.Module):
 
         layers = []
         for i in range(self.config.nlayers):
-            block: nn.Module = LLaMABlock(self.config, self.rot_emb)
+            # Pass the group to the block if using RingAttentionStrategy
+            ring_group = None
+            if isinstance(self.distributed_strategy, RingAttentionStrategy):
+                ring_group = self.distributed_strategy.group
+
+            block: nn.Module = LLaMABlock(self.config, self.rot_emb, ring_attention_group=ring_group)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
+
 
         dec_norm = LayerNormParameterized(
             self.config.emb_dim,
@@ -426,6 +460,7 @@ class LLaMA(nn.Module):
         # if we are using the cache, the key length needs to be extended with the past keys length
         if use_cache and past_key_value_states[0] is not None:
             klen += past_key_value_states[0][0].size(-2)
+        global_seq_len = klen # Store global sequence length (potentially including cache)
 
         # if mask is none, we need to specify causal mask
         if mask is None:
@@ -437,6 +472,12 @@ class LLaMA(nn.Module):
                 is_causal_mask = True
         else:
             is_causal_mask = False
+
+        # --- Ring Attention Strategy: Shard Input ---
+        is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
+        if is_ring_strategy:
+            # Note: Sharding happens *after* cache length calculation, so global_seq_len is correct.
+            x_in = self.distributed_strategy.shard_input(x_in, dim=1)
 
         x_in = self.shared(x_in)
 
@@ -452,6 +493,7 @@ class LLaMA(nn.Module):
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
+                global_seq_len=global_seq_len if is_ring_strategy else None, # Pass global length if using ring
             )
 
             if use_cache:
@@ -466,7 +508,13 @@ class LLaMA(nn.Module):
         if self.config.p_dropout:
             dec_out = self.dropout(dec_out)
 
+        # --- Ring Attention Strategy: Gather Output ---
+        if is_ring_strategy:
+            # Gather along the sequence dimension
+            dec_out = self.distributed_strategy.gather_output(dec_out, dim=1, global_len=global_seq_len)
+
         return dec_out, present_key_value_states
+
 
     def forward(
         self,

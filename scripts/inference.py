@@ -8,9 +8,11 @@ import torch
 import torch._inductor.config
 from torch import distributed as dist
 
+from fms.distributed.strategy import RingAttentionStrategy
 from fms.models import get_model
 from fms.utils import generation, tokenizers
 from fms.utils.generation import generate, pad_input_ids
+from typing import Tuple
 
 
 # This example script validates the LLaMA implementation by running inference on a couple of prompts.
@@ -92,6 +94,13 @@ parser.add_argument(
     help="This is a distributed job (multiple instances run with RANK+WORLD_SIZE)",
 )
 parser.add_argument(
+    "--distributed_strategy",
+    type=str,
+    default=None,
+    choices=["tp", "mp", "ring"],
+    help="Distributed strategy to use (defaults to tp if --distributed is set, mp if >1 GPU and not distributed, otherwise None)",
+)
+parser.add_argument(
     "--batch_input",
     action="store_true",
     help="use a batch of prompts as input",
@@ -103,6 +112,13 @@ parser.add_argument(
     default=0,
 )
 parser.add_argument("--context_file", type=str, default=None, help="File to summarize")
+parser.add_argument(
+    "--attn_algorithm",
+    type=str,
+    default=None,
+    choices=["local", "ring"], # Add other algorithms as needed
+    help="Attention algorithm to use (e.g., 'ring' for Ring Attention)",
+)
 
 args = parser.parse_args()
 
@@ -135,13 +151,19 @@ if args.distributed:
     dist.init_process_group()
 
 print("loading model")
-if args.distributed:
-    distr_param = "tp"
-else:
-    if torch.cuda.device_count() > 1 and world_size == 1:
+
+# Determine distributed strategy
+distr_param = args.distributed_strategy
+if distr_param is None:
+    if args.distributed:
+        distr_param = "tp"
+    elif torch.cuda.device_count() > 1 and world_size == 1:
         distr_param = "mp"
     else:
         distr_param = None
+
+if distr_param == "ring" and not args.distributed:
+    raise ValueError("RingAttentionStrategy requires a distributed environment (--distributed)")
 
 model = get_model(
     args.architecture,
@@ -150,7 +172,7 @@ model = get_model(
     device_type=args.device_type,
     source=args.model_source,
     distributed_strategy=distr_param,
-    group=dist.group.WORLD,
+    group=dist.group.WORLD if args.distributed else None,
     fused_weights=not args.unfuse_weights,
 )
 
@@ -250,6 +272,7 @@ def infer(use_cache, do_sample):
         do_sample=do_sample,
         max_seq_len=max_seq_len,
         extra_kwargs=padding_kwargs,
+        attn_algorithm=args.attn_algorithm, # Pass the attention algorithm
     )
     if len(result.shape) == 1:
         result = result.unsqueeze(0)

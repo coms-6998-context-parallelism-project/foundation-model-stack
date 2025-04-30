@@ -1,6 +1,6 @@
 import os
 from abc import abstractmethod
-from typing import List, Tuple
+from typing import List, Tuple, Any # Import Any here
 
 import torch
 import torch.distributed
@@ -87,29 +87,53 @@ NoOpStrategy = NotDistributed()
 
 
 class DeviceMover(nn.Module):
-    def __init__(self, module: nn.Module, device):
+    def __init__(self, module: nn.Module, device: torch.device):
         super().__init__()
-        self.device = device
-        # make this wrapper module behave as if it was the wrapped module.
-        attr = module.__dict__
-        attr["module"] = module.to(device)
-        attr["device"] = device
-        self.__dict__ = attr
+        # Check if the module is currently on the meta device.
+        # We only need to check one parameter or buffer.
+        is_meta = False
+        try:
+            p = next(module.parameters())
+            if p.device.type == 'meta':
+                is_meta = True
+        except StopIteration:
+            # No parameters, check buffers
+            try:
+                b = next(module.buffers())
+                if b.device.type == 'meta':
+                    is_meta = True
+            except StopIteration:
+                # No parameters or buffers, assume not meta or empty module
+                pass
 
-    def forward(self, *args, **kwargs):
-        device = self.device
-        args = [
-            arg.to(device) if isinstance(arg, torch.Tensor) else arg for arg in args
-        ]
-        kwargs = {
-            k: (
-                kwargs[k].to(device)
-                if isinstance(kwargs[k], torch.Tensor)
-                else kwargs[k]
-            )
-            for k in kwargs
-        }
-        return self.module(*args, **kwargs)
+        # Use setattr to ensure that module is not treated as a submodule
+        # Use to_empty if moving from meta, otherwise use standard to()
+        moved_module = module.to_empty(device=device) if is_meta else module.to(device)
+        attr = {"module": moved_module}
+        object.__setattr__(self, "_device_mover_attributes", attr)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self._device_mover_attributes["module"](*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        if "_device_mover_attributes" not in self.__dict__:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+        _device_mover_attributes = self.__dict__["_device_mover_attributes"]
+        if name in _device_mover_attributes:
+            return _device_mover_attributes[name]
+        return getattr(_device_mover_attributes["module"], name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if "_device_mover_attributes" not in self.__dict__:
+            super().__setattr__(name, value)
+            return
+
+        _device_mover_attributes = self.__dict__["_device_mover_attributes"]
+        if name in _device_mover_attributes:
+            _device_mover_attributes[name] = value
+        else:
+            setattr(_device_mover_attributes["module"], name, value)
 
 
 class UniformModelParallelStrategy(DistributedStrategy):

@@ -263,24 +263,21 @@ class RingAttentionStrategy(DistributedStrategy):
         # The gathered dimension will be world_size * block_size
         global_shape[self.dim] = self.world_size * self.block_size
 
-        # Check backend or device type to decide strategy
-        # Gloo backend (used for CPU and MPS) might require CPU tensors for all_gather
-        # NCCL backend (used for CUDA) works best with tensors on the device
-        backend = dist.get_backend(self.group)
         original_device = tensor.device
 
-        if backend == 'gloo' or original_device.type == 'mps':
-            # Use dist.all_gather with CPU tensors for Gloo/MPS
+        # Use CPU workaround for non-CUDA devices (like CPU, MPS) due to Gloo backend limitations
+        if original_device.type != 'cuda':
             # Create a list to hold the gathered tensors from all ranks on CPU
             output_list = [torch.empty_like(tensor, device='cpu') for _ in range(self.world_size)]
             # Move tensor to CPU before gathering
             dist.all_gather(output_list, tensor.contiguous().cpu(), group=self.group)
             # Concatenate the gathered tensors along the specified dimension
             gathered_output_cpu = torch.cat(output_list, dim=self.dim)
-            # Move the final result back to the original device
+            # Move the final result back to the original MPS device
             gathered_output = gathered_output_cpu.to(original_device)
         else:
-            # Use dist.all_gather_into_tensor for NCCL/CUDA
+            # Use dist.all_gather_into_tensor for other backends (e.g., NCCL/CUDA)
+            # This keeps the data on the GPU throughout the operation.
             gathered_output = torch.empty(global_shape, dtype=tensor.dtype, device=original_device)
             dist.all_gather_into_tensor(gathered_output, tensor.contiguous(), group=self.group)
 

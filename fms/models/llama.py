@@ -175,6 +175,16 @@ class LLaMABlock(nn.Module):
             keys = k_proj.view(B, T, self.attn.kvheads, self.attn.emb_kq_per_head).transpose(1, 2)
             values = v_proj.view(B, T, self.attn.kvheads, self.attn.emb_v_per_head).transpose(1, 2)
 
+            # --- Apply RoPE ---
+            # For Ring Attention, RoPE needs GLOBAL position IDs corresponding to the local shard
+            if position_ids is None:
+                # Calculate global positions for the current shard
+                global_position_ids = torch.arange(q_global_offset, q_global_offset + T, device=x.device)
+                position_ids = global_position_ids.unsqueeze(0).expand(B, -1)
+            # Else, assume the provided position_ids are already global and correctly sharded/padded
+
+            queries, keys = self.attn.position_encoder.adjusted_qk(queries, keys, position_ids, use_cache=False) # Apply RoPE here
+
             # === Expand for GQA
             expansion = self.attn.nheads // self.attn.kvheads
             keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
@@ -503,6 +513,7 @@ class LLaMA(nn.Module):
                 if position_ids is not None:
                     # Pad position_ids like x_in
                     position_ids = F.pad(position_ids, (0, padding_needed), value=0) # Pad last dim
+            print(f"[rank{self.distributed_strategy.rank}] LLaMA._helper: After padding. x_in={x_in.shape}, mask={mask.shape if mask is not None else 'None'}, pos_ids={position_ids.shape if position_ids is not None else 'None'}, compute_global_seq_len={compute_global_seq_len}", flush=True)
 
             x_in = self.distributed_strategy.shard_input(x_in, dim=1)
 
@@ -539,6 +550,7 @@ class LLaMA(nn.Module):
         if is_ring_strategy:
             # Gather along the sequence dimension
             dec_out = self.distributed_strategy.gather_output(dec_out, dim=1, global_len=compute_global_seq_len)
+            print(f"[rank{self.distributed_strategy.rank}] LLaMA._helper: After gather. dec_out={dec_out.shape}", flush=True)
             # Truncate output back to original length if padding was added
             if compute_global_seq_len != original_global_seq_len:
                 print(f"[rank{self.distributed_strategy.rank}] LLaMA._helper: Truncating output from {compute_global_seq_len} back to {original_global_seq_len}.")

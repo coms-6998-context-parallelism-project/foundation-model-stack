@@ -85,7 +85,7 @@ class RingAttentionEngine:
         print(f"[rank{self.rank}] Before compute_max_score", flush=True)
         final_max_score = self.compute_max_score(block_data, initial_max_score, global_seq_len)
         print(f"[rank{self.rank}] After compute_max_score. Entering barrier...", flush=True)
-        # dist.barrier(self.group) # DEBUG: Temporarily comment out to check if barrier is the issue
+        dist.barrier(self.group) # Re-enable barrier
         print(f"[rank{self.rank}] Exited barrier after compute_max_score.", flush=True)
 
         # 3. Second pass: Compute numerator and denominator sums
@@ -211,6 +211,20 @@ class RingAttentionEngine:
             # Compute attention with current K, V blocks
             # Mask needs to be sliced using global indices
             mask = args.mask_global[:, :, args.q_global_offset:args.q_global_offset+args.q_shard.shape[2], current_kv_global_offset:current_kv_global_offset+current_kv_len] if args.mask_global is not None else None
+
+            # --- DETAILED DEBUGGING FOR RANK 0 HANG ---
+            if args.rank == 0 and i == 0:
+                print(f"[rank0] compute_sums (Iter 0): BEFORE update_totals call.", flush=True)
+                print(f"[rank0]   q_shard: {args.q_shard.shape}, {args.q_shard.device}, {args.q_shard.dtype}", flush=True)
+                print(f"[rank0]   eff_k: {effective_recv_k.shape}, {effective_recv_k.device}, {effective_recv_k.dtype}", flush=True)
+                print(f"[rank0]   eff_v: {effective_recv_v.shape}, {effective_recv_v.device}, {effective_recv_v.dtype}", flush=True)
+                print(f"[rank0]   mask: {mask.shape if mask is not None else 'None'}", flush=True)
+                print(f"[rank0]   q_indices: {q_global_indices.shape}", flush=True)
+                print(f"[rank0]   k_indices: {current_k_global_indices.shape}", flush=True)
+                print(f"[rank0]   final_max_score: {final_max_score.shape}, {final_max_score.device}, {final_max_score.dtype}, isnan={torch.isnan(final_max_score).any()}, isinf={torch.isinf(final_max_score).any()}", flush=True)
+                print(f"[rank0]   num: {num.shape}, {num.device}, {num.dtype}, isnan={torch.isnan(num).any()}, isinf={torch.isinf(num).any()}", flush=True)
+                print(f"[rank0]   den: {den.shape}, {den.device}, {den.dtype}, isnan={torch.isnan(den).any()}, isinf={torch.isinf(den).any()}", flush=True)
+            # --- END DETAILED DEBUGGING ---
             print(f"[rank{args.rank}] compute_sums: Before update_totals (Iter {i})", flush=True)
             num, den = engine.update_totals(args.q_shard, effective_recv_k, effective_recv_v, mask, q_global_indices, current_k_global_indices, final_max_score, num, den)
             print(f"[rank{args.rank}] compute_sums: After update_totals (Iter {i})", flush=True)
@@ -346,9 +360,20 @@ class RingAttentionEngine:
     def update_totals(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, final_max_score: Tensor, current_num: Tensor, current_den: Tensor) -> Tuple[Tensor, Tensor]:
         print(f"[rank{self.rank}] update_totals: Before raw_attention", flush=True)
         attn_scores = self.raw_attention(q, k, mask, q_indices, k_indices)
+        if torch.isnan(attn_scores).any() or torch.isinf(attn_scores).any():
+            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in attn_scores!", flush=True)
+            # Optionally add more debugging here, e.g., print where NaNs/Infs occur
+
         print(f"[rank{self.rank}] update_totals: After raw_attention. Before exp_scores", flush=True)
-        stable_scores = (attn_scores - final_max_score).clamp(min=-10.0, max=10.0)
+        # Remove clamping for potentially better numerical stability with fp16
+        stable_scores = attn_scores - final_max_score # .clamp(min=-10.0, max=10.0)
+        if torch.isnan(stable_scores).any() or torch.isinf(stable_scores).any():
+            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in stable_scores!", flush=True)
+
         exp_scores = torch.exp(stable_scores)
+        if torch.isnan(exp_scores).any() or torch.isinf(exp_scores).any():
+            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in exp_scores!", flush=True)
+
         print(f"[rank{self.rank}] update_totals: After exp_scores. Before einsum", flush=True)
         num_update = torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
         den_update = exp_scores.sum(dim=-1, keepdim=True)

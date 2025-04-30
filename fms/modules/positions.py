@@ -266,13 +266,13 @@ class RotaryEmbedding(PositionEncoder):
 
         freqs = freqs.float()  # 1 L D/2 2 2
         q_out = (
-            freqs[:, -q.size(1) :, None, :, :, :]
+            freqs[:, -q.size(2) :].unsqueeze(1) # Slice freqs [B, L, D/2, 2, 2] -> Add Head dim [B, 1, L, D/2, 2, 2]
             .mul(q_.unsqueeze(-2))
             .sum(5)
             .flatten(3)
         ).type_as(q)
         k_out = (
-            freqs[:, -k.size(1) :, None, :, :, :]
+            freqs[:, -k.size(2) :].unsqueeze(1) # Slice freqs [B, L, D/2, 2, 2] -> Add Head dim [B, 1, L, D/2, 2, 2]
             .mul(k_.unsqueeze(-2))
             .sum(5)
             .flatten(3)

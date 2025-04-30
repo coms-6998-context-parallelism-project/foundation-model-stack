@@ -22,14 +22,14 @@ echo ""
 echo "====================================="
 echo "Running Regular Attention (Non-Distributed)..."
 echo "====================================="
-PYTORCH_ENABLE_MPS_FALLBACK=1 torchrun --nproc_per_node=1 \
+PYTORCH_ENABLE_MPS_FALLBACK=1 python \
   scripts/inference.py \
   --architecture llama \
   --variant 7b \
   --model_path ./llama-hf \
   --model_source hf \
   --tokenizer ./llama-hf \
-  --device_type cpu \
+  --device_type mps \
   --default_dtype fp16 \
   --no_use_cache
 

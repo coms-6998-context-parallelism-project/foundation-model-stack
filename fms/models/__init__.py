@@ -16,6 +16,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 
 from fms import distributed
 from fms.distributed.strategy import (
+    RingAttentionStrategy, # Import RingAttentionStrategy
     TensorParallelStrategy,
     UniformModelParallelStrategy,
 )
@@ -408,6 +409,10 @@ def get_model(
             extra_args["distributed_strategy"] = UniformModelParallelStrategy(
                 devices, _guess_num_layers(lazy_sd)
             )
+        elif distributed_strategy == "ring": # Add ring strategy handling
+            print("using ring attention strategy")
+            block_size = extra_args.get("ring_block_size", 1024) # Default block size if not provided
+            extra_args["distributed_strategy"] = RingAttentionStrategy(block_size=block_size, group=group)
 
     # Create the model on meta device to allocate weights lazily
     fms_model = _get_model_instance(
@@ -489,6 +494,10 @@ def get_model(
 
 
 from fms.models import bamba, gpt_bigcode, granite, llama, mixtral, roberta  # noqa: E402
+# Import the ring attention model modules to trigger their registration
+# Add all relevant _ring modules here
+from fms.models import llama_ring # Add others like mixtral_ring as needed # noqa: E402
 
 
-__all__ = ["bamba", "gpt_bigcode", "granite", "llama", "mixtral", "roberta"]
+# Optionally update __all__ if these modules should be accessible via wildcard import
+__all__ = ["bamba", "gpt_bigcode", "granite", "llama", "mixtral", "roberta", "llama_ring"] # Add others as needed

@@ -10,7 +10,7 @@ cd "$REPO_DIR" || { echo "[ERROR] Failed to cd to repo"; exit 1; }
 echo "[INFO] Pulling latest changes..."
 # Force pull by fetching and resetting hard to the remote branch (e.g., origin/main)
 git fetch origin
-git reset --hard origin/speedy # Adjust 'main' if your main branch has a different name (e.g., master)
+git reset --hard origin/ring_from_scratch # Adjust 'main' if your main branch has a different name (e.g., master)
 
 echo "[INFO] Navigating back home..."
 cd ~ || { echo "[ERROR] Failed to cd to home"; exit 1; }

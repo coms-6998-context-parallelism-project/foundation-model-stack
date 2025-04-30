@@ -5,6 +5,10 @@ from typing import Any, Callable, Iterable, List, MutableMapping, Optional, Tupl
 import torch
 import torch.nn.functional as F
 
+# Import RingAttentionStrategy and distributed utils
+from fms.distributed.strategy import RingAttentionStrategy
+from fms import distributed
+
 from fms.modules.ssm import SSMCacheUnit
 
 
@@ -183,6 +187,8 @@ def generate(
         ]
     ] = None,
     extra_kwargs: Optional[MutableMapping[str, Any]] = None,
+    attn_algorithm: Optional[str] = None, # Add attn_algorithm parameter
+    **kwargs, # Keep accepting other kwargs
 ):
     """
     A trivial generate function that can be used for validation/testing in
@@ -221,13 +227,16 @@ def generate(
         extra_kwargs: an optional mapping of additional kwargs to pass to the model.
             For example: if extra_kwargs contains position_ids and mask keys, these
             model parameters will be updated as-appropriate for each token generated.
+        attn_algorithm: Optional string specifying the attention algorithm to use (e.g., 'ring').
+        **kwargs: Additional keyword arguments to pass to the model's forward function.
     """
     if num_beams != 1:
         raise NotImplementedError("generate() does yet not support beam search")
 
-    kwargs: MutableMapping[str, Any] = dict()
+    # Rename kwargs to model_kwargs to avoid conflict with function kwargs
+    model_kwargs: MutableMapping[str, Any] = dict()
     if extra_kwargs is not None:
-        kwargs.update(extra_kwargs)
+        model_kwargs.update(extra_kwargs)
 
     if isinstance(input_ids, torch.Tensor):
         is_batch = len(input_ids.shape) > 1
@@ -243,8 +252,8 @@ def generate(
 
     result = input_ids
     next_input = input_ids
-    kwargs["past_key_value_states"] = None
-    kwargs["use_cache"] = use_cache
+    model_kwargs["past_key_value_states"] = None
+    model_kwargs["use_cache"] = use_cache
 
     prompt_length = input_ids.shape[1]
 
@@ -253,34 +262,56 @@ def generate(
         start_time = time.time()
 
     for i in range(max_new_tokens):
+        # --- Ring Attention Length Check ---
+        # Check if the next token would exceed the max length allowed by Ring Attention's fixed blocks
+        strategy = getattr(model, "distributed_strategy", None)
+        if isinstance(strategy, RingAttentionStrategy):
+            max_ring_len = strategy.world_size * strategy.block_size
+            if result.shape[1] >= max_ring_len:
+                rank, _ = distributed.rank_and_world(strategy.group)
+                print(f"[rank{rank}] generate: Stopping generation. Sequence length {result.shape[1]} reached Ring Attention limit {max_ring_len}.")
+                break
+        # --- End Ring Attention Length Check ---
+
         input_ids = next_input[:, -max_seq_len:]
 
         # prepare any padding keyword arguments
         # iteration 0 is the prefill step (cache has not been filled yet), so no need to extend the mask/position_ids
         if i > 0:
-            kwargs = __update_padding_kwargs(use_cache, kwargs)
+            model_kwargs = __update_padding_kwargs(use_cache, model_kwargs)
 
         if prepare_model_inputs_hook is not None:
-            input_ids, kwargs = prepare_model_inputs_hook(i, input_ids, kwargs)
+            input_ids, model_kwargs = prepare_model_inputs_hook(i, input_ids, model_kwargs)
 
-        output = model(input_ids, **kwargs)
+        # Pass attn_algorithm and other model_kwargs to the model call
+        output = model(input_ids, attn_algorithm=attn_algorithm, **model_kwargs)
+
         if use_cache:
             logits, past_key_value_states = output
             # TODO: this should go away when reduce-overhead issues are fixed, or
             # maybe could be moved into model code to be more portable.
-            kwargs["past_key_value_states"] = past_key_value_states
+            model_kwargs["past_key_value_states"] = past_key_value_states
             if contiguous_cache:
-                kwargs["past_key_value_states"] = _make_cache_contiguous(
-                    kwargs["past_key_value_states"]
+                model_kwargs["past_key_value_states"] = _make_cache_contiguous(
+                    model_kwargs["past_key_value_states"]
                 )
             if torch._dynamo.config.dynamic_shapes:
-                kwargs["past_key_value_states"] = _make_cache_dynamic(
-                    kwargs["past_key_value_states"]
+                model_kwargs["past_key_value_states"] = _make_cache_dynamic(
+                    model_kwargs["past_key_value_states"]
                 )
         else:
             logits = output
 
-        if "only_last_token" not in kwargs:
+        # <<< WORKAROUND for Ring Attention returning global batch size >>>
+        local_batch_size = result.shape[0] # The expected batch size for this rank
+        if logits.shape[0] > local_batch_size and isinstance(strategy, RingAttentionStrategy):
+            rank, _ = distributed.rank_and_world(strategy.group)
+            start_idx = rank * local_batch_size
+            end_idx = start_idx + local_batch_size
+            logits = logits[start_idx:end_idx, :, :]
+        # <<< END WORKAROUND >>>
+
+        if "only_last_token" not in model_kwargs:
             logits = logits[:, -1, :]
 
         if do_sample:
@@ -296,8 +327,8 @@ def generate(
             next_val = torch.argmax(logits, dim=-1).unsqueeze(0).t()
 
         if post_iteration_hook is not None:
-            next_val, kwargs = post_iteration_hook(
-                i + prompt_length, logits, next_val, kwargs
+            next_val, model_kwargs = post_iteration_hook(
+                i + prompt_length, logits, next_val, model_kwargs
             )
 
         result = torch.cat((result, next_val), dim=-1)
@@ -376,3 +407,4 @@ def trim_prefix(result: torch.Tensor, pad_token_id: int = 0) -> torch.Tensor:
     bos_index = first_real_token_idx[0][0]
     result = result[bos_index + 1 :]
     return result
+

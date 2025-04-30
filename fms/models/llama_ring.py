@@ -668,49 +668,11 @@ def _llama_factory_factory(config):
     return factory
 
 
-models.register_model(
-    _architecture_name, "micro", _llama_factory_factory(_micro_char_config)
-)
-# Backwards compat
-models.register_model(_architecture_name, "7b", _llama_factory_factory(_7b_config))
-models.register_model(_architecture_name, "13b", _llama_factory_factory(_13b_config))
-models.register_model(_architecture_name, "70b", _llama_factory_factory(_70b_config))
+# --- Ring Variant Registration ---
+# Only register the ring variants here. Standard variants are registered in llama.py.
 
-# LLama 2 family
-models.register_model(_architecture_name, "2-7b", _llama_factory_factory(_7b_config))
-models.register_model(_architecture_name, "2-13b", _llama_factory_factory(_13b_config))
-models.register_model(_architecture_name, "2-70b", _llama_factory_factory(_70b_config))
-
-# LLama 3 family
-models.register_model(
-    _architecture_name, "3-8b", _llama_factory_factory((_8b_llama3_config))
-)
-
-# Granite family
-models.register_model(
-    _architecture_name, "granite-7b", _llama_factory_factory((_granite_7b_config))
-)
-models.register_model(
-    _architecture_name,
-    "granite.code-3b",
-    _llama_factory_factory((_granite_3b_code_config)),
-)
-models.register_model(
-    _architecture_name,
-    "granite.code-8b",
-    _llama_factory_factory((_granite_8b_code_config)),
-)
-
-# Create all the pieces to generate adapters for different checkpoints
-serialization.register_adapter_step(
-    "llama", "pre0.0.6_attn_unfused_to_fused", serialization._pre006_attn_adapter_step
-)
-
-serialization.register_adapter_step(
-    "llama",
-    "swiglu_unfused_to_fused",
-    serialization._mlp_glu_unfused_to_fused_adapter_step,
-)
+# --- Adapter Registration ---
+# Only register adapters specific to the ring variant here, if needed.
 
 
 def _weight_fusion(
@@ -729,7 +691,7 @@ def _weight_fusion(
     return new_sd
 
 
-serialization.register_adapter_step("llama", "weight_fusion", _weight_fusion)
+# serialization.register_adapter_step("llama", "weight_fusion", _weight_fusion) # Keep commented/removed unless ring needs a different fusion
 
 
 def _hf_gptq_llama_check(
@@ -751,9 +713,7 @@ def _hf_gptq_llama_check(
     return input_sd
 
 
-serialization.register_adapter_step(
-    "llama", "hf_gptq_fusion_check", _hf_gptq_llama_check
-)
+# serialization.register_adapter_step("llama", "hf_gptq_fusion_check", _hf_gptq_llama_check) # Keep commented/removed unless ring needs different check
 
 
 def _meta_to_fms_names(input_sd: Mapping[str, Any], **kwargs) -> Mapping[str, Any]:
@@ -783,7 +743,7 @@ def _meta_to_fms_names(input_sd: Mapping[str, Any], **kwargs) -> Mapping[str, An
     return new_sd
 
 
-serialization.register_adapter_step("llama", "meta_to_fms_names", _meta_to_fms_names)
+# serialization.register_adapter_step("llama", "meta_to_fms_names", _meta_to_fms_names) # Keep commented/removed unless ring needs different mapping
 
 
 def _hf_to_fms_names(input_sd: Mapping[str, Any], **kwargs) -> Mapping[str, Any]:
@@ -811,7 +771,7 @@ def _hf_to_fms_names(input_sd: Mapping[str, Any], **kwargs) -> Mapping[str, Any]
     return new_sd
 
 
-serialization.register_adapter_step("llama", "hf_to_fms_names", _hf_to_fms_names)
+# serialization.register_adapter_step("llama", "hf_to_fms_names", _hf_to_fms_names) # Keep commented/removed unless ring needs different mapping
 
 
 def _get_rope_params(linear_type: str) -> list[str]:
@@ -878,17 +838,9 @@ def _hf_to_fms_rope(
     return new_sd
 
 
-serialization.register_adapter_step("llama", "hf_to_fms_rope", _hf_to_fms_rope)
+# serialization.register_adapter_step("llama", "hf_to_fms_rope", _hf_to_fms_rope) # Keep commented/removed unless ring needs different RoPE handling
 
 
-serialization.register_adapter("llama", "meta", ["meta_to_fms_names", "weight_fusion"])
-serialization.register_adapter(
-    "llama",
-    "hf",
-    ["hf_to_fms_names", "hf_to_fms_rope", "hf_gptq_fusion_check", "weight_fusion"],
-)
-serialization.register_adapter(
-    "llama",
-    "fms.pre0.0.6",
-    ["pre0.0.6_attn_unfused_to_fused", "swiglu_unfused_to_fused", "weight_fusion"],
-)
+# serialization.register_adapter("llama", "meta", ["meta_to_fms_names", "weight_fusion"]) # Keep commented/removed
+# serialization.register_adapter("llama", "hf", ["hf_to_fms_names", "hf_to_fms_rope", "hf_gptq_fusion_check", "weight_fusion"]) # Keep commented/removed
+# serialization.register_adapter("llama", "fms.pre0.0.6", ["pre0.0.6_attn_unfused_to_fused", "swiglu_unfused_to_fused", "weight_fusion"]) # Keep commented/removed

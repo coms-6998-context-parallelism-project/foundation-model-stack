@@ -1,0 +1,313 @@
+import argparse
+import itertools
+import os
+import random
+
+import numpy as np
+import torch
+import torch._inductor.config
+from torch import distributed as dist
+
+from fms.distributed.strategy import RingAttentionStrategy
+from fms.models import get_model
+from fms.utils import generation, tokenizers
+from fms.utils.generation import generate, pad_input_ids
+from typing import Tuple
+
+
+# This example script validates the LLaMA implementation by running inference on a couple of prompts.
+#
+# Example usage with single-GPU 7B model on slurm, with torch.compile and determinstic behavior:
+# CUBLAS_WORKSPACE_CONFIG=:4096:8 srun -N 1 --gres=gpu:1 python scripts/inference.py --model_path=~/models/7B-F/ --tokenizer=~/models/tokenizer.model --compile --deterministic
+# Example usage of 13B model on 2 GPUs with Tensor Parallel:
+# srun -N 1 --gres=gpu:2 torchrun --nproc_per_node=2 scripts/inference.py --model_path=~/models/13B-F --tokenizer=~/models/tokenizer.model --distributed
+
+parser = argparse.ArgumentParser(
+    description="Script to run inference on a causal model"
+)
+parser.add_argument("--device_type", type=str, default="cuda")
+parser.add_argument(
+    "--architecture",
+    type=str,
+    default="llama",
+    help="The model architecture to benchmark",
+)
+parser.add_argument(
+    "--variant",
+    type=str,
+    default=None,
+    help="The model variant (configuration) to benchmark. E.g. 7b, 13b, 70b.",
+)
+parser.add_argument(
+    "--model_path",
+    type=str,
+    help="Path to the directory containing LLaMa weights (.pth files sharded by tensor parallel rank, not HF weights)",
+)
+parser.add_argument(
+    "--model_source",
+    type=str,
+    help="Source of the checkpoint. E.g. 'meta', 'hf', None",
+)
+parser.add_argument(
+    "--tokenizer",
+    type=str,
+    required=True,
+    help="Path to the tokenizer (e.g. ~/tokenizer.model)",
+)
+parser.add_argument(
+    "--no_use_cache",
+    action="store_false",
+    help="Disable the kv-cache (on by default)",
+)
+parser.add_argument(
+    "--unfuse_weights",
+    action="store_true",
+    help="If set to True, this will unfuse any fused weight modules that support the unfuse_weights method",
+)
+parser.add_argument(
+    "--default_dtype",
+    type=str,
+    default=None,
+    choices=["bf16", "fp16", "fp32"],
+    help="If set to one of the choices, overrides the model checkpoint weight format by setting the default pytorch format",
+)
+parser.add_argument(
+    "--compile",
+    action="store_true",
+    help="Use torch.compile (slow for first inference pass)",
+)
+parser.add_argument(
+    "--compile_mode",
+    type=str,
+    help="Mode for compilation",
+    default="default",
+    choices=["default", "reduce-overhead"],
+)
+parser.add_argument(
+    "--deterministic",
+    action="store_true",
+    help="Set torch.use_deterministic_algorithms? Requires env variable `CUBLAS_WORKSPACE_CONFIG=:4096:8`",
+)
+parser.add_argument(
+    "--distributed",
+    action="store_true",
+    help="This is a distributed job (multiple instances run with RANK+WORLD_SIZE)",
+)
+parser.add_argument(
+    "--distributed_strategy",
+    type=str,
+    default=None,
+    choices=["tp", "mp", "ring"],
+    help="Distributed strategy to use (defaults to tp if --distributed is set, mp if >1 GPU and not distributed, otherwise None)",
+)
+parser.add_argument(
+    "--batch_input",
+    action="store_true",
+    help="use a batch of prompts as input",
+)
+parser.add_argument(
+    "--min_pad_length",
+    type=int,
+    help="Pad inputs to a minimum specified length. If any prompt is larger than the specified length, padding will be determined by the largest prompt",
+    default=0,
+)
+parser.add_argument("--context_file", type=str, default=None, help="File to summarize")
+parser.add_argument(
+    "--attn_algorithm",
+    type=str,
+    default=None,
+    choices=["local", "ring"], # Add other algorithms as needed
+    help="Attention algorithm to use (e.g., 'ring' for Ring Attention)",
+)
+parser.add_argument(
+    "--max_new_tokens",
+    type=int,
+    default=10, # Keep a default for when not run by benchmark script
+    help="Maximum number of new tokens to generate",
+)
+
+parser.add_argument(
+    "--ring_block_size",
+    type=int,
+    default=None, # Default handled by model if None
+    help="Block size to use for Ring Attention (if applicable)",
+)
+parser.add_argument(
+    "--print_response",
+    action="store_true",
+    help="Flag passed down from benchmark script (inference.py already prints on rank 0)",
+)
+
+args = parser.parse_args()
+
+local_rank = int(os.getenv("LOCAL_RANK", 0))
+world_size = int(os.getenv("WORLD_SIZE", 1))
+if args.device_type == "cuda":
+    device = torch.device(args.device_type, local_rank)
+    torch.cuda.set_device(device)
+else:
+    device = torch.device(args.device_type)
+
+default_dtype = None
+dtypes_map = {
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+}
+if args.default_dtype is not None:
+    default_dtype = dtypes_map[args.default_dtype]
+
+# requires setting environment variable: `CUBLAS_WORKSPACE_CONFIG=:4096:8`
+if args.deterministic:
+    SEED = 42
+    random.seed(SEED)
+    torch.manual_seed(SEED)  # pytorch random seed
+    np.random.seed(SEED)  # numpy random seed
+    torch.use_deterministic_algorithms(True)
+
+if args.distributed:
+    dist.init_process_group()
+
+print("loading model")
+
+# Determine distributed strategy
+distr_param = args.distributed_strategy
+
+# If world_size is 1, explicitly set strategy to None unless 'ring' was requested.
+# This prevents accidental 'mp' selection when torchrun is used with nproc=1,
+# ensuring the model stays on a single device.
+if world_size == 1 and distr_param != "ring":
+    distr_param = None
+elif distr_param is None and args.distributed: # Default for multi-gpu distributed is 'tp'
+    distr_param = "tp"
+
+model = get_model(
+    args.architecture,
+    args.variant,
+    model_path=args.model_path,
+    device_type=args.device_type,
+    source=args.model_source,
+    distributed_strategy=distr_param,
+    group=dist.group.WORLD if args.distributed else None,
+    fused_weights=not args.unfuse_weights,
+)
+
+tokenizer = tokenizers.get_tokenizer(args.tokenizer)
+model.eval()
+torch.set_grad_enabled(False)
+print("loading complete on rank", local_rank)
+
+if args.compile:
+    print("compiling model")
+    # compiling can make first inference pass slow
+    model.compile(mode=args.compile_mode)
+
+
+def ids_for_prompt(prompt):
+    tokens = tokenizer.tokenize(prompt)
+    ids = tokenizer.convert_tokens_to_ids(tokens)
+    ids = [tokenizer.bos_token_id] + ids
+    ids = torch.tensor(ids, dtype=torch.long, device=device)
+    return ids
+
+
+if args.context_file is not None:
+    # during testing, the context_file used was a copy/paste of the text of:
+    # https://arxiv.org/pdf/2306.15595.pdf
+    with open(args.context_file) as file:
+        long_prompt = file.read()
+        prompt1 = (
+            long_prompt
+            + "\nPlease give me a brief summary of this research paper in a few bullet points."
+        )
+        # prompt1 = long_prompt + "\nDescribe work that was done concurrently with the research in this paper."
+        prompt2 = long_prompt + "\nPlease write me the abstract for this paper."
+else:
+    template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{}\n\n### Response:"
+
+    prompt1 = template.format(
+        "Write an essay about the difference between cars and trains."
+    )
+    prompt2 = template.format("Explain some popular greetings in Spanish.")
+
+prompt1 = ids_for_prompt(prompt1)
+prompt2 = ids_for_prompt(prompt2)
+max_len = max([len(prompt) for prompt in [prompt1, prompt2]])
+
+
+if args.batch_input:
+    ids = [prompt1, prompt2]
+    ids, padding_kwargs = pad_input_ids(ids, min_pad_length=args.min_pad_length)
+else:
+    ids = prompt1
+    if args.min_pad_length != 0:
+        ids, padding_kwargs = pad_input_ids([ids], min_pad_length=args.min_pad_length)
+    else:
+        padding_kwargs = None
+
+
+def print_result(result):
+    if local_rank != 0:
+        return
+    if padding_kwargs is not None:
+        result = generation.trim_prefix(result)
+
+    result = generation.trim_prefix(result, tokenizer.bos_token_id)
+
+    # stop at EOS token if present and remove padding
+    result = generation.truncate_after_eos(result, tokenizer.eos_token_id)
+
+    output_str = tokenizer.convert_tokens_to_string(
+        tokenizer.convert_ids_to_tokens(result)
+    )
+
+    print(output_str)
+    print()
+
+
+def infer(use_cache, do_sample):
+    # With greedy generation (do_sample=False) we _should_ always get the same results.
+    # There is currently a bug in start_pos for batched rotary embeddings that can lead
+    # varying results for the same prompt.
+    if local_rank == 0:
+        print("use_cache", use_cache, ";; do_sample", do_sample)
+        print("==================")
+    if (
+        getattr(model.config, "ntk_scaling", None) is not None
+        and model.config.ntk_scaling
+    ):
+        max_seq_len = max(max_len, model.config.max_expected_seq_len)
+    else:
+        # without ntk scaling, extending the seq length too far gives bogus results.
+        max_seq_len = model.config.max_expected_seq_len
+
+    generate_kwargs = {
+        "attn_algorithm": args.attn_algorithm, # Pass the attention algorithm
+    }
+    if args.attn_algorithm == "ring" and args.ring_block_size is not None:
+        generate_kwargs["ring_block_size"] = args.ring_block_size
+
+    result = generate(
+        model,
+        ids,
+        max_new_tokens=args.max_new_tokens, # Use the argument value here
+        use_cache=use_cache,
+        do_sample=do_sample,
+        max_seq_len=max_seq_len,
+        extra_kwargs=padding_kwargs,
+        **generate_kwargs
+    )
+    if len(result.shape) == 1:
+        result = result.unsqueeze(0)
+
+    for i in range(result.shape[0]):
+        print_result(result[i])
+
+
+print("generating output", local_rank)
+do_sample = [False]
+use_cache = [
+    args.no_use_cache
+]  # True/False are identical with greedy iff `torch.use_deterministic_algorithms(True)`
+for sample, cache in itertools.product(do_sample, use_cache):
+    infer(cache, sample)

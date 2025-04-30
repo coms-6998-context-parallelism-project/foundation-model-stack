@@ -409,11 +409,12 @@ def get_model(
             extra_args["distributed_strategy"] = UniformModelParallelStrategy(
                 devices, _guess_num_layers(lazy_sd)
             )
-        elif distributed_strategy == "ring":
-            print("using ring attention strategy")
-            # Fetch block_size from kwargs, default to 1024 if not provided
-            block_size = extra_args.get("ring_attn_block_size", 32)
-            extra_args["distributed_strategy"] = RingAttentionStrategy(block_size=block_size, group=group)
+    elif distributed_strategy == "ring": # Use the ring_block_size from kwargs here
+        print("using ring attention strategy")
+        block_size = extra_args.get("ring_block_size", 32) # Default to 32 if not provided
+        # Fetch block_size from kwargs, default to 1024 if not provided
+        block_size = extra_args.get("ring_attn_block_size", 32)
+        extra_args["distributed_strategy"] = RingAttentionStrategy(block_size=block_size, group=group)
 
     # Create the model on meta device to allocate weights lazily
     fms_model = _get_model_instance(

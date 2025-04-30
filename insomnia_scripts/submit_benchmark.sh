@@ -38,15 +38,17 @@ if [[ -z "$job_id" ]]; then
 fi
 
 echo "[INFO] Waiting for job output..."
-for i in {1..10}; do
-  latest_out=$(ls -t benchmark_*.out 2>/dev/null | head -1)
-  if [[ -n "$latest_out" ]]; then
-    echo "[INFO] Found output file: $latest_out"
-    tail -f "$latest_out"
+output_file="benchmark_${job_id}.out"
+max_wait_loops=60 # 60 loops * 5 seconds = 300 seconds (5 minutes)
+
+for i in $(seq 1 $max_wait_loops); do
+  if [[ -f "$output_file" ]]; then
+    echo "[INFO] Found output file: $output_file"
+    tail -f "$output_file"
     exit 0
   fi
   echo "[INFO] Waiting for Slurm to write output... ($i)"
-  sleep 2
+  sleep 5
 done
 
 echo "[ERROR] Output file not found. Check with: squeue -u $USER"

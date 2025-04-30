@@ -271,6 +271,16 @@ def generate(
         else:
             logits = output
 
+        # <<< WORKAROUND for Ring Attention returning global batch size >>>
+        # Check if the returned logits batch size is larger than the original input batch size
+        local_batch_size = result.shape[0] # The expected batch size for this rank
+        if logits.shape[0] > local_batch_size:
+            # Assume the output batch dimension is concatenated in rank order
+            start_idx = rank * local_batch_size
+            end_idx = start_idx + local_batch_size
+            logits = logits[start_idx:end_idx, :, :]
+        # <<< END WORKAROUND >>>
+
         # <<< DEBUG >>>
         print(f"[rank{rank}] generate: After model call, logits shape: {logits.shape}")
         # <<< END DEBUG >>>

@@ -85,7 +85,7 @@ class RingAttentionEngine:
         print(f"[rank{self.rank}] Before compute_max_score", flush=True)
         final_max_score = self.compute_max_score(block_data, initial_max_score, global_seq_len)
         print(f"[rank{self.rank}] After compute_max_score. Entering barrier...", flush=True)
-        dist.barrier(self.group) # Ensure all ranks have computed their max score
+        # dist.barrier(self.group) # DEBUG: Temporarily comment out to check if barrier is the issue
         print(f"[rank{self.rank}] Exited barrier after compute_max_score.", flush=True)
 
         # 3. Second pass: Compute numerator and denominator sums

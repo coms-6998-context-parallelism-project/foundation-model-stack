@@ -243,7 +243,14 @@ class RingAttentionStrategy(DistributedStrategy):
         local_shard = tensor_padded.narrow(self.dim, start_idx, self.block_size).contiguous() # Each shard is block_size
 
         # Ensure this print is active to show block occupation
-        print(f"[RING BLOCK DEBUG][rank{self.rank}] RingAttentionStrategy.shard_input: Padded global shape {tensor_padded.shape}, Local shard shape (block occupation) {local_shard.shape} (dim={self.dim})", flush=True)
+        # Add some stats assuming the input is token IDs
+        has_elements = local_shard.numel() > 0
+        shard_mean = local_shard.float().mean().item() if has_elements else float('nan')
+        shard_std = local_shard.float().std().item() if has_elements else float('nan')
+        shard_min = local_shard.min().item() if has_elements else float('nan')
+        shard_max = local_shard.max().item() if has_elements else float('nan')
+        shard_unique = torch.unique(local_shard).numel() if has_elements else 0
+        print(f"[RING BLOCK DEBUG][rank{self.rank}] Local shard shape: {local_shard.shape}, Mean ID: {shard_mean:.2f}, Std: {shard_std:.2f}, Min: {shard_min}, Max: {shard_max}, Unique: {shard_unique}", flush=True)
         # Return the shard (always size block_size) and the original global length for trimming later
         return local_shard, original_global_seq_len
 

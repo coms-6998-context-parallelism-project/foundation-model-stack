@@ -154,7 +154,7 @@ class LLaMABlock(nn.Module):
         if attn_algorithm == "ring" and isinstance(self.distributed_strategy, RingAttentionStrategy):
             strategy = self.distributed_strategy
             rank = strategy.rank
-            print(f"[RING DEBUG][rank{rank}] LLaMABlock.forward: Using Ring Attention path.", flush=True)
+            # print(f"[RING DEBUG][rank{rank}] LLaMABlock.forward: Using Ring Attention path.", flush=True)
             ring_attention_group = strategy.group # Get group from strategy - already checked if strategy is RingAttentionStrategy
             if ring_attention_group is None: # Check if the group from the strategy is valid
                 raise RuntimeError("Ring Attention algorithm requested but no ring_attention_group was provided to the LLaMABlock.")
@@ -221,7 +221,7 @@ class LLaMABlock(nn.Module):
             )
             # Ring attention engine now returns the local block, gathering happens outside
             end_time = time.time()
-            print(f"[RING TIME DEBUG][rank{rank}] engine.forward_full took {end_time - start_time:.4f} seconds", flush=True)
+            # print(f"[RING TIME DEBUG][rank{rank}] engine.forward_full took {end_time - start_time:.4f} seconds", flush=True)
             # print(f"[rank{rank}] LLaMABlock.forward: After engine.forward_full", flush=True)
             return x_out # No cache returned for ring attention yet
         else:
@@ -500,7 +500,7 @@ class LLaMA(nn.Module):
         # --- Ring Attention Strategy: Shard Input ---
         is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
         if is_ring_strategy:
-            print(f"[RING DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Using RingAttentionStrategy.", flush=True)
+            # print(f"[RING DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Using RingAttentionStrategy.", flush=True)
             print(f"[RING LEN DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Original input seq len = {x_in.size(1)}", flush=True)
             # shard_input now handles global padding and returns the original length
             x_in, original_global_seq_len = self.distributed_strategy.shard_input(x_in)

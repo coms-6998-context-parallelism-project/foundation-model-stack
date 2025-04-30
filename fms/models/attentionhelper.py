@@ -56,7 +56,7 @@ class RingAttentionEngine:
         global_seq_len is the total sequence length across all ranks.
         Returns the computed output shard for the current rank (size strategy_block_size).
         """
-        print(f"[RING DEBUG][rank{self.rank}] RingAttentionEngine.forward_full: ENTERED.", flush=True)
+        # print(f"[RING DEBUG][rank{self.rank}] RingAttentionEngine.forward_full: ENTERED.", flush=True)
         # print(f"[rank{self.rank}] RingAttentionEngine.forward_full: START. q_shard shape: {q_shard.shape}, k_shard shape: {k_shard.shape}, v_shard shape: {v_shard.shape}, x_shard shape: {x_shard.shape}, q_global_offset: {q_global_offset}, global_seq_len: {global_seq_len}")
         T_q_local = q_shard.shape[2]
         if T_q_local == 0: return torch.empty_like(x_shard)
@@ -95,7 +95,7 @@ class RingAttentionEngine:
         final_num, final_den = self.compute_sums(block_data, final_max_score, initial_num, initial_den, global_seq_len)
         # print(f"[rank{self.rank}] After compute_sums. Entering barrier...", flush=True)
         dist.barrier(self.group) # Ensure all ranks have computed their sums
-        print(f"[RING DEBUG][rank{self.rank}] Exited barrier after compute_sums.", flush=True) # Re-enable this one
+        # print(f"[RING DEBUG][rank{self.rank}] Exited barrier after compute_sums.", flush=True)
 
         # 4. Compute local output block
         output_block = self.compute_block_output(x_block, final_num, final_den)
@@ -125,7 +125,7 @@ class RingAttentionEngine:
         expected_recv_len = self.strategy_block_size
 
         for i in range(args.world_size):
-            print(f"[RING DEBUG][rank{args.rank}] compute_max_score: Iter {i}/{args.world_size}, processing K from rank {current_k_rank}", flush=True) # Re-enable
+            # print(f"[RING DEBUG][rank{args.rank}] compute_max_score: Iter {i}/{args.world_size}, processing K from rank {current_k_rank}", flush=True)
             # Calculate global indices and length for the *current* K shard
             # Length is always strategy_block_size, offset is based on rank * strategy_block_size
             current_k_len = self.strategy_block_size
@@ -152,10 +152,10 @@ class RingAttentionEngine:
             max_score = engine.update_max_attn(args.q_shard, effective_recv_k, mask, q_global_indices, current_k_global_indices, max_score)
             # print(f"[RING DEBUG][rank{args.rank}] compute_max_score: After update_max_attn (Iter {i})", flush=True) # Add this
 
-            # Send current_k_shard, receive into the full buffer, providing the expected length
-            print(f"[RING DEBUG][rank{args.rank}] compute_max_score: Before send_recv_tensor (Iter {i})", flush=True) # Re-enable this
+            # Send current_k_shard, receive into the full buffer
+            # print(f"[RING DEBUG][rank{args.rank}] compute_max_score: Before send_recv_tensor (Iter {i})", flush=True)
             current_k_shard = self.send_recv_tensor(current_k_shard, recv_k, expected_recv_len)
-            print(f"[RING DEBUG][rank{args.rank}] compute_max_score: After send_recv_tensor (Iter {i})", flush=True) # Re-enable this
+            # print(f"[RING DEBUG][rank{args.rank}] compute_max_score: After send_recv_tensor (Iter {i})", flush=True)
             # Update the rank origin of the K shard we now hold
             current_k_rank = (current_k_rank - 1 + args.world_size) % args.world_size
 
@@ -184,7 +184,7 @@ class RingAttentionEngine:
         expected_recv_len = self.strategy_block_size
 
         for i in range(args.world_size):
-            print(f"[RING DEBUG][rank{args.rank}] compute_sums: Iter {i}/{args.world_size}, processing K/V from rank {current_kv_rank}", flush=True) # Re-enable
+            # print(f"[RING DEBUG][rank{args.rank}] compute_sums: Iter {i}/{args.world_size}, processing K/V from rank {current_kv_rank}", flush=True)
             # Calculate global indices and length for the *current* K/V shards
             current_kv_len = (global_seq_len + args.world_size - 1) // args.world_size
             current_kv_global_offset = current_kv_rank * current_kv_len
@@ -219,16 +219,16 @@ class RingAttentionEngine:
             #     print(f"[rank0]   num: {num.shape}, {num.device}, {num.dtype}, isnan={torch.isnan(num).any()}, isinf={torch.isinf(num).any()}", flush=True)
             #     print(f"[rank0]   den: {den.shape}, {den.device}, {den.dtype}, isnan={torch.isnan(den).any()}, isinf={torch.isinf(den).any()}", flush=True)
             # --- END DETAILED DEBUGGING ---
-            # print(f"[RING DEBUG][rank{args.rank}] compute_sums: Before update_totals (Iter {i})", flush=True) # Re-enable
+            # print(f"[RING DEBUG][rank{args.rank}] compute_sums: Before update_totals (Iter {i})", flush=True)
             num, den = engine.update_totals(args.q_shard, effective_recv_k, effective_recv_v, mask, q_global_indices, current_k_global_indices, final_max_score, num, den)
-            # print(f"[RING DEBUG][rank{args.rank}] compute_sums: After update_totals (Iter {i})", flush=True) # Re-enable
+            # print(f"[RING DEBUG][rank{args.rank}] compute_sums: After update_totals (Iter {i})", flush=True)
 
             # Send current K, V shards, receive into buffers sliced for the *expected incoming length*
             recv_k_slice_for_irecv = recv_k[:, :, :expected_recv_len, :]
             recv_v_slice_for_irecv = recv_v[:, :, :expected_recv_len, :]
-            print(f"[RING DEBUG][rank{args.rank}] compute_sums: Before send_recv_kv (Iter {i})", flush=True) # Re-enable this
+            # print(f"[RING DEBUG][rank{args.rank}] compute_sums: Before send_recv_kv (Iter {i})", flush=True)
             current_k_shard, current_v_shard = self.send_recv_kv(current_k_shard, current_v_shard, recv_k_slice_for_irecv, recv_v_slice_for_irecv)
-            print(f"[RING DEBUG][rank{args.rank}] compute_sums: After send_recv_kv (Iter {i})", flush=True) # Re-enable this
+            # print(f"[RING DEBUG][rank{args.rank}] compute_sums: After send_recv_kv (Iter {i})", flush=True)
 
             # Update the rank origin of the K/V shards we now hold
             current_kv_rank = (current_kv_rank - 1 + args.world_size) % args.world_size
@@ -251,8 +251,8 @@ class RingAttentionEngine:
     def send_recv_tensor(self, send_tensor: Tensor, full_recv_buffer: Tensor, expected_recv_len: int) -> Tensor: # Definition expects 4 args (self + 3)
         """ Sends a tensor to the next rank and receives one from the previous rank. """
         # Use explicit blocking send/recv with different orders for even/odd ranks
-        recv_buffer_slice = full_recv_buffer[:, :, :expected_recv_len, :].contiguous() # Ensure contiguous for recv # TODO: Check if contiguous is needed here
-        print(f"[RING COMM DEBUG][rank{self.rank}] Sending shape {send_tensor.shape} to rank {self.next_rank}, Receiving shape {recv_buffer_slice.shape} from rank {self.prev_rank}", flush=True)
+        recv_buffer_slice = full_recv_buffer[:, :, :expected_recv_len, :].contiguous() # Ensure contiguous for recv
+        # print(f"[RING COMM DEBUG][rank{self.rank}] Sending shape {send_tensor.shape} to rank {self.next_rank}, Receiving shape {recv_buffer_slice.shape} from rank {self.prev_rank}", flush=True)
         # print(f"[rank{self.rank}] RingAttentionEngine.send_recv_tensor: Sending shape {send_tensor.shape} to rank {self.next_rank}, receiving into buffer slice shape {recv_buffer_slice.shape} (expecting len {expected_recv_len}) from rank {self.prev_rank}", flush=True)
 
         send_tensor_c = send_tensor.contiguous() # Ensure contiguous before sending

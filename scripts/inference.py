@@ -160,16 +160,14 @@ print("loading model")
 
 # Determine distributed strategy
 distr_param = args.distributed_strategy
-if distr_param is None:
-    if args.distributed:
-        distr_param = "tp"
-    elif torch.cuda.device_count() > 1 and world_size == 1:
-        distr_param = "mp"
-    else:
-        distr_param = None
 
-if distr_param == "ring" and not args.distributed:
-    raise ValueError("RingAttentionStrategy requires a distributed environment (--distributed)")
+# If world_size is 1, explicitly set strategy to None unless 'ring' was requested.
+# This prevents accidental 'mp' selection when torchrun is used with nproc=1,
+# ensuring the model stays on a single device.
+if world_size == 1 and distr_param != "ring":
+    distr_param = None
+elif distr_param is None and args.distributed: # Default for multi-gpu distributed is 'tp'
+    distr_param = "tp"
 
 model = get_model(
     args.architecture,

@@ -5,6 +5,7 @@ from typing import List, Tuple
 import torch
 import torch.distributed
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 
 from fms.utils import tp_wrapping
@@ -215,8 +216,25 @@ class RingAttentionStrategy(DistributedStrategy):
         # Use all_gather_into_tensor for potentially better performance, requires knowing output size
         # Output tensor needs to accommodate the full global length
         output_shape = list(tensor.shape)
-        output_shape[dim] = global_len
+        output_shape[dim] = global_len # Use the provided global_len which should be padded
         output_tensor = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
-        dist.all_gather_into_tensor(output_tensor, tensor, group=self.group)
+
+        # Pad the local tensor if it's smaller than the largest shard size before gathering
+        # all_gather_into_tensor requires all input tensors to have the same size.
+        max_shard_len = (global_len + self.world_size - 1) // self.world_size # Size of the largest shard
+        local_len = tensor.shape[dim]
+        padding_needed = max_shard_len - local_len
+
+        if padding_needed > 0:
+            pad_dims = [0] * (tensor.dim() * 2)
+            # Target the specific dimension for padding (F.pad works from last dim backwards)
+            pad_idx = tensor.dim() - 1 - dim
+            pad_dims[2 * pad_idx + 1] = padding_needed # Pad at the end of the target dimension
+            padded_tensor = F.pad(tensor, pad_dims, value=0) # Pad with 0
+            tensor_to_gather = padded_tensor
+        else:
+            tensor_to_gather = tensor
+
+        dist.all_gather_into_tensor(output_tensor, tensor_to_gather, group=self.group)
         print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {output_tensor.shape}")
         return output_tensor

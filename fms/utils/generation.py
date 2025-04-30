@@ -173,6 +173,7 @@ def generate(
     ] = None,
     extra_kwargs: Optional[MutableMapping[str, Any]] = None,
     attn_algorithm: Optional[str] = None,
+    **kwargs,
 ):
     """
     A trivial generate function that can be used for validation/testing in
@@ -207,6 +208,7 @@ def generate(
         extra_kwargs: an optional mapping of additional kwargs to pass to the model.
             For example: if extra_kwargs contains position_ids and mask keys, these
             model parameters will be updated as-appropriate for each token generated.
+        **kwargs: Additional keyword arguments to pass to the model's forward function.
     """
     if num_beams != 1:
         raise NotImplementedError("generate() does yet not support beam search")
@@ -214,7 +216,6 @@ def generate(
     kwargs: MutableMapping[str, Any] = dict()
     if extra_kwargs is not None:
         kwargs.update(extra_kwargs)
-    kwargs["attn_algorithm"] = attn_algorithm # Add attn_algorithm here
 
     if isinstance(input_ids, torch.Tensor):
         is_batch = len(input_ids.shape) > 1
@@ -265,7 +266,7 @@ def generate(
         # <<< END DEBUG >>>
 
         output = model(input_ids, **kwargs)
-        if use_cache:
+        if use_cache and isinstance(output, tuple): # Ensure output is a tuple when use_cache=True
             logits, past_key_value_states = output
             # TODO: this should go away when reduce-overhead issues are fixed, or
             # maybe could be moved into model code to be more portable.
@@ -278,7 +279,7 @@ def generate(
                 kwargs["past_key_value_states"] = _make_cache_dynamic(
                     kwargs["past_key_value_states"]
                 )
-        else:
+        elif not use_cache:
             logits = output
 
         # <<< WORKAROUND for Ring Attention returning global batch size >>>

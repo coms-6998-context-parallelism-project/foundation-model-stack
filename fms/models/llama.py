@@ -162,21 +162,18 @@ class LLaMABlock(nn.Module):
             q_global_offset = rank * shard_len
 
             x_ln = self.ln(x)
-            queries, keys, values = self.compute_local_qkv_and_rope(
-                self.attn,
-                q=x_ln,
-                k=x_ln,
-                v=x_ln,
-                position_ids=position_ids,
-                use_cache=use_cache,
-                past_key_value_state=past_key_value_state,
-                is_self=True,
-            )
+            # Project Q, K, V without applying RoPE here
+            B, T, _ = x_ln.shape
+            q_proj, k_proj, v_proj = self.attn.in_proj(x_ln)
+
+            # Reshape for RingAttentionEngine (B, H, T, D)
+            queries = q_proj.view(B, T, self.attn.nheads, self.attn.emb_kq_per_head).transpose(1, 2)
+            keys = k_proj.view(B, T, self.attn.kvheads, self.attn.emb_kq_per_head).transpose(1, 2)
+            values = v_proj.view(B, T, self.attn.kvheads, self.attn.emb_v_per_head).transpose(1, 2)
 
             # === Expand for GQA
             expansion = self.attn.nheads // self.attn.kvheads
             keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
-            values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
 
             engine_is_causal = is_causal_mask and mask is None
 
@@ -190,7 +187,7 @@ class LLaMABlock(nn.Module):
             )
 
             x_out = engine.forward_full(
-                q_shard=queries, k_shard=keys_e, v_shard=values_e,
+                q_shard=queries, k_shard=keys_e, v_shard=values, # Pass original projected values
                 mask_global=mask, # Mask is still global for now, engine slices it
                 x_shard=x,
                 q_global_offset=q_global_offset,

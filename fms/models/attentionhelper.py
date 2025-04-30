@@ -149,8 +149,8 @@ class RingAttentionEngine:
             max_score = engine.update_max_attn(args.q_shard, effective_recv_k, mask, q_global_indices, current_k_global_indices, max_score)
 
             # Send current_k_shard, receive into the full buffer, providing the expected length
+            # Pass the full buffer `recv_k` and the expected length
             current_k_shard = self.send_recv_tensor(current_k_shard, recv_k, expected_recv_len)
-
             # Update the rank origin of the K shard we now hold
             current_k_rank = (current_k_rank - 1 + args.world_size) % args.world_size
 
@@ -231,17 +231,23 @@ class RingAttentionEngine:
     
     """ Helper Functions"""
 
-    def send_recv_tensor(self, send_tensor: Tensor, recv_buffer: Tensor) -> Tensor:
+    def send_recv_tensor(self, send_tensor: Tensor, full_recv_buffer: Tensor, expected_recv_len: int) -> Tensor: # Definition expects 4 args (self + 3)
         """ Sends a tensor to the next rank and receives one from the previous rank. """
-        # recv_buffer MUST be correctly sized for the incoming tensor *before* calling this.
-        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_tensor: Sending shape {send_tensor.shape} to rank {self.next_rank}, receiving into shape {recv_buffer.shape} from rank {self.prev_rank}", flush=True)
-        ops = []
-        ops.append(dist.P2POp(dist.isend, send_tensor.contiguous(), self.next_rank, group=self.group)) # Ensure contiguous
-        # Pass the correctly pre-sliced recv_buffer to irecv
-        ops.append(dist.P2POp(dist.irecv, recv_buffer, self.prev_rank, group=self.group))
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs: req.wait()
-        return recv_buffer
+        # Use explicit blocking send/recv with different orders for even/odd ranks
+        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_tensor: Sending shape {send_tensor.shape} to rank {self.next_rank}, receiving into buffer shape {full_recv_buffer.shape} (expecting len {expected_recv_len}) from rank {self.prev_rank}", flush=True)
+
+        send_tensor_c = send_tensor.contiguous() # Ensure contiguous before sending
+
+        if self.rank % 2 == 0:
+            dist.send(send_tensor_c, self.next_rank, group=self.group)
+            dist.recv(full_recv_buffer, self.prev_rank, group=self.group)
+        else:
+            dist.recv(full_recv_buffer, self.prev_rank, group=self.group)
+            dist.send(send_tensor_c, self.next_rank, group=self.group)
+
+        # Return the relevant slice of the buffer
+        return full_recv_buffer[:, :, :expected_recv_len, :]
+
 
     def send_recv_kv(self, send_k: Tensor, send_v: Tensor, recv_k_buf: Tensor, recv_v_buf: Tensor) -> Tuple[Tensor, Tensor]:
         print(f"[rank{self.rank}] RingAttentionEngine.send_recv_kv: Sending K shape {send_k.shape}, V shape {send_v.shape} to rank {self.next_rank}, receiving into K shape {recv_k_buf.shape}, V shape {recv_v_buf.shape} from rank {self.prev_rank}")

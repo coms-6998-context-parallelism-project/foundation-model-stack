@@ -132,6 +132,12 @@ parser.add_argument(
     default=None, # Default handled by model if None
     help="Block size to use for Ring Attention (if applicable)",
 )
+parser.add_argument(
+    "--print_response",
+    action="store_true",
+    help="Flag passed down from benchmark script (inference.py already prints on rank 0)",
+)
+
 args = parser.parse_args()
 
 local_rank = int(os.getenv("LOCAL_RANK", 0))

@@ -260,19 +260,22 @@ class RotaryEmbedding(PositionEncoder):
         k_ = k_rope.float().view(*k.size()[:-1], -1, 2)  # B L H D/2 2
 
         # the max start position should be based on the max first position of each sequence
+        # position_ids has shape [B, S_or_T_local]
         max_start_pos = torch.max(position_ids[:, 0])
         alpha = self.compute_freqs_cis(q.device, max_start_pos + seq_len)
         freqs = self.cached_freqs[q.device.index][alpha][position_ids]
+        # freqs has shape [B, S_or_T_local, D/2, 2, 2]
+        current_seq_len = position_ids.size(1) # Get the actual sequence length being processed
 
         freqs = freqs.float()  # 1 L D/2 2 2
         q_out = (
-            freqs[:, -q.size(2) :].unsqueeze(1) # Slice freqs [B, L, D/2, 2, 2] -> Add Head dim [B, 1, L, D/2, 2, 2]
+            freqs[:, -current_seq_len:, None, :, :, :] # Slice based on actual seq len
             .mul(q_.unsqueeze(-2))
             .sum(5)
             .flatten(3)
         ).type_as(q)
         k_out = (
-            freqs[:, -k.size(2) :].unsqueeze(1) # Slice freqs [B, L, D/2, 2, 2] -> Add Head dim [B, 1, L, D/2, 2, 2]
+            freqs[:, -current_seq_len:, None, :, :, :] # Slice based on actual seq len
             .mul(k_.unsqueeze(-2))
             .sum(5)
             .flatten(3)

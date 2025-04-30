@@ -10,6 +10,7 @@ from torch import nn
 
 from fms.utils import tp_wrapping
 from fms import distributed
+import math # Make sure math is imported
 
 
 if "DISTRIBUTED_STRATEGY_IGNORE_MODULES" in os.environ:
@@ -164,19 +165,6 @@ class TensorParallelStrategy(DistributedStrategy):
         return tp_wrapping.apply_tp(block, self.group)
 
 
-import math
-from typing import Tuple, Optional
-
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-from torch import nn
-
-# ... (keep existing imports like abc, os, List, tp_wrapping, distributed)
-
-# ... (keep existing DistributedStrategy, NotDistributed, NoOpStrategy, DeviceMover, UniformModelParallelStrategy, TensorParallelStrategy classes)
-
-
 class RingAttentionStrategy(DistributedStrategy):
     """
     A strategy designed for Ring Attention where the sequence dimension is sharded
@@ -254,7 +242,7 @@ class RingAttentionStrategy(DistributedStrategy):
         # Slice the globally padded tensor
         local_shard = tensor_padded.narrow(self.dim, start_idx, self.block_size).contiguous() # Each shard is block_size
 
-        print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Original global shape {global_shape}, Padded global shape {tensor_padded.shape}, Local shard shape {local_shard.shape} (dim={self.dim})", flush=True)
+        # print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Original global shape {global_shape}, Padded global shape {tensor_padded.shape}, Local shard shape {local_shard.shape} (dim={self.dim})", flush=True)
         # Return the shard (always size block_size) and the original global length for trimming later
         return local_shard, original_global_seq_len
 
@@ -275,27 +263,14 @@ class RingAttentionStrategy(DistributedStrategy):
         # The gathered dimension will be world_size * block_size
         global_shape[self.dim] = self.world_size * self.block_size
 
-        # Store original device
-        original_device = tensor.device
-
-        # --- Use dist.all_gather instead of all_gather_into_tensor ---
-        # Create a list to hold the gathered tensors from all ranks
-        # Ensure the list tensors are on CPU for Gloo backend
-        output_list = [torch.empty_like(tensor, device='cpu') for _ in range(self.world_size)]
+        # Allocate the full tensor on the local GPU device
+        gathered_output = torch.empty(global_shape, dtype=tensor.dtype, device=tensor.device)
 
         # Perform all-gather directly into the tensor
         # Ensure local_output is contiguous if required by the backend
-        # Move tensor to CPU before gathering for Gloo backend
-        dist.all_gather(output_list, tensor.contiguous().cpu(), group=self.group)
+        dist.all_gather_into_tensor(gathered_output, tensor.contiguous(), group=self.group)
 
-        # Concatenate the gathered tensors along the specified dimension
-        gathered_output_cpu = torch.cat(output_list, dim=self.dim)
-        # --- End change ---
-
-        # Move the final result back to the original device
-        gathered_output = gathered_output_cpu.to(original_device)
+        # Note: gathered_output contains the data from all ranks, potentially including global padding.
         # print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {gathered_output.shape} (device: {gathered_output.device})", flush=True)
         # Return the gathered tensor, which includes the global padding
         return gathered_output
-
-# at all

@@ -261,19 +261,32 @@ class RingAttentionEngine:
 
 
     def send_recv_kv(self, send_k: Tensor, send_v: Tensor, recv_k_buf: Tensor, recv_v_buf: Tensor) -> Tuple[Tensor, Tensor]:
-        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_kv: Sending K shape {send_k.shape}, V shape {send_v.shape} to rank {self.next_rank}, receiving into K shape {recv_k_buf.shape}, V shape {recv_v_buf.shape} from rank {self.prev_rank}")
+        # Note: recv_k_buf and recv_v_buf are assumed to be pre-sliced correctly based on expected_recv_len in compute_sums
+        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_kv: Sending K shape {send_k.shape}, V shape {send_v.shape} to rank {self.next_rank}, receiving into K shape {recv_k_buf.shape}, V shape {recv_v_buf.shape} from rank {self.prev_rank}", flush=True)
         # recv_k_buf and recv_v_buf MUST be correctly sized for the incoming tensors *before* calling this.
         """ Sends K, V to the next rank and receives K, V from the previous rank. """
-        # This could be done with separate send/recv or combined ops if available/efficient.
-        # Using separate send/recv for clarity now. Ensure order matches on both sides.
-        ops = []
-        ops.append(dist.P2POp(dist.isend, send_k.contiguous(), self.next_rank, group=self.group)) # Ensure contiguous
-        ops.append(dist.P2POp(dist.isend, send_v.contiguous(), self.next_rank, group=self.group)) # Ensure contiguous
-        # Pass the correctly pre-sliced recv buffers to irecv
-        ops.append(dist.P2POp(dist.irecv, recv_k_buf, self.prev_rank, group=self.group))
-        ops.append(dist.P2POp(dist.irecv, recv_v_buf, self.prev_rank, group=self.group))
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs: req.wait()
+        # Using explicit blocking send/recv with ordering like send_recv_tensor
+
+        send_k_c = send_k.contiguous()
+        send_v_c = send_v.contiguous()
+
+        if self.rank % 2 == 0:
+            print(f"[rank{self.rank}] Sending K/V to {self.next_rank}...", flush=True)
+            dist.send(send_k_c, self.next_rank, group=self.group)
+            dist.send(send_v_c, self.next_rank, group=self.group)
+            print(f"[rank{self.rank}] Sent K/V to {self.next_rank}. Receiving K/V from {self.prev_rank}...", flush=True)
+            dist.recv(recv_k_buf, self.prev_rank, group=self.group)
+            dist.recv(recv_v_buf, self.prev_rank, group=self.group)
+            print(f"[rank{self.rank}] Received K/V from {self.prev_rank}.", flush=True)
+        else:
+            print(f"[rank{self.rank}] Receiving K/V from {self.prev_rank}...", flush=True)
+            dist.recv(recv_k_buf, self.prev_rank, group=self.group)
+            dist.recv(recv_v_buf, self.prev_rank, group=self.group)
+            print(f"[rank{self.rank}] Received K/V from {self.prev_rank}. Sending K/V to {self.next_rank}...", flush=True)
+            dist.send(send_k_c, self.next_rank, group=self.group)
+            dist.send(send_v_c, self.next_rank, group=self.group)
+            print(f"[rank{self.rank}] Sent K/V to {self.next_rank}.", flush=True)
+
         return recv_k_buf, recv_v_buf
 
     def raw_attention(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor) -> Tensor:

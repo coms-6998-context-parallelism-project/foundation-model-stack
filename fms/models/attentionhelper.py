@@ -101,7 +101,7 @@ class RingAttentionEngine:
         output_block = self.compute_block_output(x_block, final_num, final_den)
 
         # Return the locally computed block. Gathering happens outside.
-        print(f"[rank{self.rank}] RingAttentionEngine.forward_full: END. Output shape: {output_block.shape}")
+        # print(f"[rank{self.rank}] RingAttentionEngine.forward_full: END. Output shape: {output_block.shape}")
         return output_block
 
     """ compute max scores for stability (first flash pass) """

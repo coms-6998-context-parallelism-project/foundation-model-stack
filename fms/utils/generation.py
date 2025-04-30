@@ -233,6 +233,11 @@ def generate(
     kwargs["use_cache"] = use_cache
 
     prompt_length = input_ids.shape[1]
+    # <<< DEBUG >>>
+    import os
+    rank = int(os.environ.get("RANK", 0))
+    print(f"[rank{rank}] generate: Initial result shape: {result.shape}")
+    # <<< END DEBUG >>>
 
     if timing != "":
         times: List[float] = []
@@ -245,6 +250,10 @@ def generate(
         # iteration 0 is the prefill step (cache has not been filled yet), so no need to extend the mask/position_ids
         if i > 0:
             kwargs = __update_padding_kwargs(use_cache, kwargs)
+        # <<< DEBUG >>>
+        print(f"[rank{rank}] generate: Before model call, input_ids shape: {input_ids.shape}")
+        # <<< END DEBUG >>>
+
         output = model(input_ids, **kwargs)
         if use_cache:
             logits, past_key_value_states = output
@@ -262,6 +271,10 @@ def generate(
         else:
             logits = output
 
+        # <<< DEBUG >>>
+        print(f"[rank{rank}] generate: After model call, logits shape: {logits.shape}")
+        # <<< END DEBUG >>>
+
         if "only_last_token" not in kwargs:
             logits = logits[:, -1, :]
 
@@ -277,10 +290,18 @@ def generate(
         else:
             next_val = torch.argmax(logits, dim=-1).unsqueeze(0).t()
 
+        # <<< DEBUG >>>
+        print(f"[rank{rank}] generate: Before cat, result shape: {result.shape}, next_val shape: {next_val.shape}")
+        # <<< END DEBUG >>>
+
         if post_iteration_hook is not None:
             next_val, kwargs = post_iteration_hook(
                 i + prompt_length, logits, next_val, kwargs
             )
+            # <<< DEBUG >>>
+            print(f"[rank{rank}] generate: After hook, result shape: {result.shape}, next_val shape: {next_val.shape}")
+            # <<< END DEBUG >>>
+
 
         result = torch.cat((result, next_val), dim=-1)
 

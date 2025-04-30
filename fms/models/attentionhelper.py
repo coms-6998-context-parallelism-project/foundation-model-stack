@@ -255,7 +255,8 @@ class RingAttentionEngine:
     def send_recv_tensor(self, send_tensor: Tensor, full_recv_buffer: Tensor, expected_recv_len: int) -> Tensor: # Definition expects 4 args (self + 3)
         """ Sends a tensor to the next rank and receives one from the previous rank. """
         # Use explicit blocking send/recv with different orders for even/odd ranks
-        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_tensor: Sending shape {send_tensor.shape} to rank {self.next_rank}, receiving into buffer shape {full_recv_buffer.shape} (expecting len {expected_recv_len}) from rank {self.prev_rank}", flush=True)
+        recv_buffer_slice = full_recv_buffer[:, :, :expected_recv_len, :]
+        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_tensor: Sending shape {send_tensor.shape} to rank {self.next_rank}, receiving into buffer slice shape {recv_buffer_slice.shape} (expecting len {expected_recv_len}) from rank {self.prev_rank}", flush=True)
 
         send_tensor_c = send_tensor.contiguous() # Ensure contiguous before sending
 
@@ -263,17 +264,19 @@ class RingAttentionEngine:
             print(f"[rank{self.rank}] Sending to {self.next_rank}...", flush=True)
             dist.send(send_tensor_c, self.next_rank, group=self.group)
             print(f"[rank{self.rank}] Sent to {self.next_rank}. Receiving from {self.prev_rank}...", flush=True)
-            dist.recv(full_recv_buffer, self.prev_rank, group=self.group)
+            # Receive into the correctly sized slice
+            dist.recv(recv_buffer_slice, self.prev_rank, group=self.group)
             print(f"[rank{self.rank}] Received from {self.prev_rank}.", flush=True)
         else:
             print(f"[rank{self.rank}] Receiving from {self.prev_rank}...", flush=True)
-            dist.recv(full_recv_buffer, self.prev_rank, group=self.group)
+            # Receive into the correctly sized slice
+            dist.recv(recv_buffer_slice, self.prev_rank, group=self.group)
             print(f"[rank{self.rank}] Received from {self.prev_rank}. Sending to {self.next_rank}...", flush=True)
             dist.send(send_tensor_c, self.next_rank, group=self.group)
             print(f"[rank{self.rank}] Sent to {self.next_rank}.", flush=True)
 
         # Return the relevant slice of the buffer
-        return full_recv_buffer[:, :, :expected_recv_len, :]
+        return recv_buffer_slice
 
 
     def send_recv_kv(self, send_k: Tensor, send_v: Tensor, recv_k_buf: Tensor, recv_v_buf: Tensor) -> Tuple[Tensor, Tensor]:
@@ -281,7 +284,7 @@ class RingAttentionEngine:
         print(f"[rank{self.rank}] RingAttentionEngine.send_recv_kv: Sending K shape {send_k.shape}, V shape {send_v.shape} to rank {self.next_rank}, receiving into K shape {recv_k_buf.shape}, V shape {recv_v_buf.shape} from rank {self.prev_rank}", flush=True)
         # recv_k_buf and recv_v_buf MUST be correctly sized for the incoming tensors *before* calling this.
         """ Sends K, V to the next rank and receives K, V from the previous rank. """
-        # Using explicit blocking send/recv with ordering like send_recv_tensor
+        # Using explicit blocking send/recv with ordering like send_recv_tensor. recv_*_buf are assumed pre-sliced.
 
         send_k_c = send_k.contiguous()
         send_v_c = send_v.contiguous()

@@ -116,7 +116,7 @@ def __update_padding_kwargs(
 
 
 def _make_cache_contiguous(
-    past_key_value_states: list[Iterable[torch.Tensor] | SSMCacheUnit],
+    past_key_value_states: list[Union[Iterable[torch.Tensor], SSMCacheUnit]],
 ) -> list[Union[Iterable[torch.Tensor], SSMCacheUnit]]:
     # kv updates are required for torch.compile with
     # mode='reduce-overhead'
@@ -407,4 +407,3 @@ def trim_prefix(result: torch.Tensor, pad_token_id: int = 0) -> torch.Tensor:
     bos_index = first_real_token_idx[0][0]
     result = result[bos_index + 1 :]
     return result
-

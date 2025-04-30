@@ -6,6 +6,7 @@ import random
 import numpy as np
 import torch
 import torch._inductor.config
+from typing import Tuple # Added for type hinting
 from torch import distributed as dist
 
 from fms.models import get_model
@@ -92,6 +93,13 @@ parser.add_argument(
     help="This is a distributed job (multiple instances run with RANK+WORLD_SIZE)",
 )
 parser.add_argument(
+    "--distributed_strategy",
+    type=str,
+    default=None,
+    choices=["tp", "mp", "ring"],
+    help="Distributed strategy to use (defaults to tp if --distributed is set, mp if >1 GPU and not distributed, otherwise None)",
+)
+parser.add_argument(
     "--batch_input",
     action="store_true",
     help="use a batch of prompts as input",
@@ -103,6 +111,26 @@ parser.add_argument(
     default=0,
 )
 parser.add_argument("--context_file", type=str, default=None, help="File to summarize")
+parser.add_argument(
+    "--attn_algorithm",
+    type=str,
+    default=None,
+    choices=["local", "ring"], # Add other algorithms as needed
+    help="Attention algorithm to use (e.g., 'ring' for Ring Attention)",
+)
+parser.add_argument(
+    "--max_new_tokens",
+    type=int,
+    default=128, # Keep a default consistent with original inference.py
+    help="Maximum number of new tokens to generate",
+)
+parser.add_argument(
+    "--ring_block_size",
+    type=int,
+    default=None, # Default handled by model if None
+    help="Block size to use for Ring Attention (if applicable)",
+)
+
 
 args = parser.parse_args()
 
@@ -135,13 +163,23 @@ if args.distributed:
     dist.init_process_group()
 
 print("loading model")
-if args.distributed:
+
+# Determine distributed strategy
+distr_param = args.distributed_strategy
+
+# If world_size is 1, explicitly set strategy to None unless 'ring' was requested.
+# This prevents accidental 'mp' selection when torchrun is used with nproc=1,
+# ensuring the model stays on a single device.
+if world_size == 1 and distr_param != "ring":
+    distr_param = None
+elif distr_param is None and args.distributed: # Default for multi-gpu distributed is 'tp'
     distr_param = "tp"
-else:
-    if torch.cuda.device_count() > 1 and world_size == 1:
-        distr_param = "mp"
-    else:
-        distr_param = None
+elif distr_param is None and torch.cuda.device_count() > 1 and world_size == 1: # Default for single-node multi-gpu is 'mp'
+    distr_param = "mp"
+
+get_model_kwargs = {}
+if distr_param == "ring" and args.ring_block_size is not None:
+    get_model_kwargs["ring_block_size"] = args.ring_block_size
 
 model = get_model(
     args.architecture,
@@ -150,8 +188,9 @@ model = get_model(
     device_type=args.device_type,
     source=args.model_source,
     distributed_strategy=distr_param,
-    group=dist.group.WORLD,
+    group=dist.group.WORLD if args.distributed else None,
     fused_weights=not args.unfuse_weights,
+    **get_model_kwargs, # Pass ring_block_size if needed
 )
 
 tokenizer = tokenizers.get_tokenizer(args.tokenizer)
@@ -242,10 +281,16 @@ def infer(use_cache, do_sample):
     else:
         # without ntk scaling, extending the seq length too far gives bogus results.
         max_seq_len = model.config.max_expected_seq_len
+
+    generate_kwargs = {
+        "attn_algorithm": args.attn_algorithm, # Pass the attention algorithm
+    }
+    if args.attn_algorithm == "ring" and args.ring_block_size is not None:
+        generate_kwargs["ring_block_size"] = args.ring_block_size
     result = generate(
         model,
         ids,
-        max_new_tokens=128,
+        max_new_tokens=args.max_new_tokens, # Use the argument value here
         use_cache=use_cache,
         do_sample=do_sample,
         max_seq_len=max_seq_len,

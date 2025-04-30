@@ -164,19 +164,35 @@ class TensorParallelStrategy(DistributedStrategy):
         return tp_wrapping.apply_tp(block, self.group)
 
 
+import math
+from typing import Tuple, Optional
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
+
+# ... (keep existing imports like abc, os, List, tp_wrapping, distributed)
+
+# ... (keep existing DistributedStrategy, NotDistributed, NoOpStrategy, DeviceMover, UniformModelParallelStrategy, TensorParallelStrategy classes)
+
+
 class RingAttentionStrategy(DistributedStrategy):
     """
     A strategy designed for Ring Attention where the sequence dimension is sharded
-    across devices in a group. Input is sharded, computation happens on shards,
-    and output is gathered.
-    Assumes simple block sharding for sequence dimension.
+    across devices in a group using a fixed block size. Input is globally padded,
+    sharded into fixed blocks, computation happens on shards, and output is gathered.
     """
-    def __init__(self, group=None, from_meta=False):
+    def __init__(self, block_size: int, group=None, from_meta=False):
         super().__init__(from_meta)
         assert torch.distributed.is_initialized(), "must initialize a process group"
         self.group = group if group is not None else torch.distributed.GroupMember.WORLD
         self.rank = dist.get_rank(self.group)
         self.world_size = dist.get_world_size(self.group)
+        if block_size <= 0:
+            raise ValueError("block_size must be a positive integer")
+        self.block_size = block_size
+        self.dim = 1 # Assume sequence dimension is 1 for [batch, seq, hidden]
 
     def _distribute_module(
         self, module: nn.Module, final_layers: bool = False
@@ -189,52 +205,83 @@ class RingAttentionStrategy(DistributedStrategy):
         # Layers run on their local rank with sharded data. No specific layer distribution needed here.
         return block
 
-    def get_local_seq_len_and_offset(self, global_seq_len: int) -> Tuple[int, int]:
-        """Calculates the length and starting offset for the local shard."""
-        shard_len = (global_seq_len + self.world_size - 1) // self.world_size
-        start = self.rank * shard_len
-        end = min((self.rank + 1) * shard_len, global_seq_len)
-        local_len = max(0, end - start)
-        return local_len, start
-
-    def shard_input(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
-        """Shards the input tensor along a given dimension."""
+    def shard_input(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """
+        Validates sequence length, pads globally to world_size * block_size,
+        and shards the input tensor along the sequence dimension into fixed blocks.
+        Returns the local shard and the original global sequence length.
+        """
         if self.world_size == 1:
-            return tensor
-        global_len = tensor.size(dim)
+            # No sharding or padding needed for single GPU case
+            return tensor, tensor.size(self.dim)
+
+        original_global_seq_len = tensor.size(self.dim)
         global_shape = tensor.shape
-        local_len, start_offset = self.get_local_seq_len_and_offset(global_len)
-        local_shard = tensor.narrow(dim, start_offset, local_len).contiguous()
-        print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Global shape {global_shape}, Local shard shape {local_shard.shape} (dim={dim})")
-        return local_shard
 
-    def gather_output(self, tensor: torch.Tensor, dim: int, global_len: int) -> torch.Tensor:
-        """Gathers tensors from all ranks along a given dimension."""
+        # 1. Validation: Check if the sequence fits within world_size * block_size
+        required_gpus = math.ceil(original_global_seq_len / self.block_size)
+        if required_gpus > self.world_size:
+            raise ValueError(
+                f"Sequence length {original_global_seq_len} requires {required_gpus} blocks/GPUs "
+                f"with block_size {self.block_size}, but only {self.world_size} GPUs are available."
+            )
+
+        # 2. Global Padding: Pad the input tensor so its total length is world_size * block_size
+        padded_global_len = self.world_size * self.block_size
+        global_pad_len = padded_global_len - original_global_seq_len
+
+        if global_pad_len < 0:
+             # This should ideally not happen if validation passes, but as a safeguard.
+             raise ValueError(f"Negative padding calculated ({global_pad_len}). Padded length {padded_global_len} < Original length {original_global_seq_len}")
+
+        if global_pad_len > 0:
+            # Calculate padding tuple based on self.dim
+            # Example: dim=1 in 3D tensor [B, S, H] -> pad=(0, 0, 0, global_pad_len)
+            padding_dims = [0] * (tensor.dim() * 2)
+            # Index for padding at the end of the target dimension (self.dim)
+            # F.pad pads from the last dim backwards, so index is -(2*dim_index_from_end + 1)
+            dim_index_from_end = tensor.dim() - 1 - self.dim
+            padding_dims[2 * dim_index_from_end + 1] = global_pad_len
+            # Use 0 for padding value, assuming it's appropriate (e.g., for input_ids if 0 is pad_token_id)
+            tensor_padded = F.pad(tensor, tuple(padding_dims), "constant", 0)
+            print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Globally padded input from seq len {original_global_seq_len} to {padded_global_len}", flush=True)
+        else:
+            tensor_padded = tensor
+            print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: No global padding needed for seq len {original_global_seq_len}", flush=True)
+
+        # 3. Sharding: Each rank gets exactly one block of size block_size
+        start_idx = self.rank * self.block_size
+        # Slice the globally padded tensor
+        local_shard = tensor_padded.narrow(self.dim, start_idx, self.block_size).contiguous()
+
+        print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Original global shape {global_shape}, Padded global shape {tensor_padded.shape}, Local shard shape {local_shard.shape} (dim={self.dim})", flush=True)
+        # Return the shard (always size block_size) and the original global length for trimming later
+        return local_shard, original_global_seq_len
+
+    def gather_output(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gathers tensors (expected to be fixed block_size) from all ranks along the sequence dimension."""
         if self.world_size == 1:
             return tensor
-        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Local shape before gather {tensor.shape} (dim={dim})")
-        # Use all_gather_into_tensor for potentially better performance, requires knowing output size
-        # Output tensor needs to accommodate the full global length
-        output_shape = list(tensor.shape)
-        output_shape[dim] = global_len # Use the provided global_len which should be padded
-        output_tensor = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
 
-        # Pad the local tensor if it's smaller than the largest shard size before gathering
-        # all_gather_into_tensor requires all input tensors to have the same size.
-        max_shard_len = (global_len + self.world_size - 1) // self.world_size # Size of the largest shard
-        local_len = tensor.shape[dim]
-        padding_needed = max_shard_len - local_len
+        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Local shape before gather {tensor.shape} (dim={self.dim})", flush=True)
 
-        if padding_needed > 0:
-            pad_dims = [0] * (tensor.dim() * 2)
-            # Target the specific dimension for padding (F.pad works from last dim backwards)
-            pad_idx = tensor.dim() - 1 - dim
-            pad_dims[2 * pad_idx + 1] = padding_needed # Pad at the end of the target dimension
-            padded_tensor = F.pad(tensor, pad_dims, value=0) # Pad with 0
-            tensor_to_gather = padded_tensor
-        else:
-            tensor_to_gather = tensor
+        # Ensure the local tensor has the expected block size dimension
+        if tensor.shape[self.dim] != self.block_size:
+             # This might happen if the model's forward pass changes the sequence length unexpectedly
+             raise RuntimeError(f"[rank{self.rank}] Expected local output shard size {self.block_size} along dim {self.dim}, but got {tensor.shape[self.dim]}.")
 
-        dist.all_gather_into_tensor(output_tensor, tensor_to_gather, group=self.group)
-        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {output_tensor.shape}")
-        return output_tensor
+        # Determine the shape of the fully gathered tensor (padded) on each GPU
+        global_shape = list(tensor.shape)
+        # The gathered dimension will be world_size * block_size
+        global_shape[self.dim] = self.world_size * self.block_size
+
+        # Allocate the full tensor on the local GPU device
+        gathered_output = torch.empty(global_shape, dtype=tensor.dtype, device=tensor.device)
+
+        # Perform all-gather directly into the tensor
+        # Ensure local_output is contiguous if required by the backend
+        dist.all_gather_into_tensor(gathered_output, tensor.contiguous(), group=self.group)
+
+        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {gathered_output.shape}", flush=True)
+        # Return the gathered tensor, which includes the global padding
+        return gathered_output

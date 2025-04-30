@@ -243,16 +243,16 @@ class RingAttentionStrategy(DistributedStrategy):
             dim_index_from_end = tensor.dim() - 1 - self.dim
             padding_dims[2 * dim_index_from_end + 1] = global_pad_len
             # Use 0 for padding value, assuming it's appropriate (e.g., for input_ids if 0 is pad_token_id)
-            tensor_padded = F.pad(tensor, tuple(padding_dims), "constant", 0)
-            print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Globally padded input from seq len {original_global_seq_len} to {padded_global_len}", flush=True)
+            tensor_padded = F.pad(tensor, tuple(padding_dims), "constant", 0) # Pad with 0
+            # print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Globally padded input from seq len {original_global_seq_len} to {padded_global_len}", flush=True)
         else:
             tensor_padded = tensor
-            print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: No global padding needed for seq len {original_global_seq_len}", flush=True)
+            # print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: No global padding needed for seq len {original_global_seq_len}", flush=True)
 
         # 3. Sharding: Each rank gets exactly one block of size block_size
         start_idx = self.rank * self.block_size
         # Slice the globally padded tensor
-        local_shard = tensor_padded.narrow(self.dim, start_idx, self.block_size).contiguous()
+        local_shard = tensor_padded.narrow(self.dim, start_idx, self.block_size).contiguous() # Each shard is block_size
 
         print(f"[rank{self.rank}] RingAttentionStrategy.shard_input: Original global shape {global_shape}, Padded global shape {tensor_padded.shape}, Local shard shape {local_shard.shape} (dim={self.dim})", flush=True)
         # Return the shard (always size block_size) and the original global length for trimming later
@@ -263,7 +263,7 @@ class RingAttentionStrategy(DistributedStrategy):
         if self.world_size == 1:
             return tensor
 
-        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Local shape before gather {tensor.shape} (dim={self.dim})", flush=True)
+        # print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Local shape before gather {tensor.shape} (dim={self.dim})", flush=True)
 
         # Ensure the local tensor has the expected block size dimension
         if tensor.shape[self.dim] != self.block_size:
@@ -294,6 +294,8 @@ class RingAttentionStrategy(DistributedStrategy):
 
         # Move the final result back to the original device
         gathered_output = gathered_output_cpu.to(original_device)
-        print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {gathered_output.shape} (device: {gathered_output.device})", flush=True)
+        # print(f"[rank{self.rank}] RingAttentionStrategy.gather_output: Global shape after gather {gathered_output.shape} (device: {gathered_output.device})", flush=True)
         # Return the gathered tensor, which includes the global padding
         return gathered_output
+
+# at all

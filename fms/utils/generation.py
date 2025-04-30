@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 
+from fms.distributed.strategy import RingAttentionStrategy # Import RingAttentionStrategy
 logger = logging.getLogger(__name__)
 
 
@@ -244,6 +245,15 @@ def generate(
         start_time = time.time()
 
     for i in range(max_new_tokens):
+        # --- Ring Attention Length Check ---
+        # Check if the next token would exceed the max length allowed by Ring Attention's fixed blocks
+        if isinstance(getattr(model, "distributed_strategy", None), RingAttentionStrategy):
+            strategy = model.distributed_strategy
+            max_ring_len = strategy.world_size * strategy.block_size
+            if result.shape[1] >= max_ring_len:
+                # print(f"[rank{rank}] generate: Stopping generation. Sequence length {result.shape[1]} reached Ring Attention limit {max_ring_len}.")
+                break
+        # --- End Ring Attention Length Check ---
         input_ids = next_input[:, -max_seq_len:]
 
         # prepare any padding keyword arguments
@@ -251,7 +261,7 @@ def generate(
         if i > 0:
             kwargs = __update_padding_kwargs(use_cache, kwargs)
         # <<< DEBUG >>>
-        print(f"[rank{rank}] generate: Before model call, input_ids shape: {input_ids.shape}")
+        # print(f"[rank{rank}] generate: Before model call, input_ids shape: {input_ids.shape}")
         # <<< END DEBUG >>>
 
         output = model(input_ids, **kwargs)
@@ -282,7 +292,7 @@ def generate(
         # <<< END WORKAROUND >>>
 
         # <<< DEBUG >>>
-        print(f"[rank{rank}] generate: After model call, logits shape: {logits.shape}")
+        # print(f"[rank{rank}] generate: After model call, logits shape: {logits.shape}")
         # <<< END DEBUG >>>
 
         if "only_last_token" not in kwargs:
@@ -301,7 +311,7 @@ def generate(
             next_val = torch.argmax(logits, dim=-1).unsqueeze(0).t()
 
         # <<< DEBUG >>>
-        print(f"[rank{rank}] generate: Before cat, result shape: {result.shape}, next_val shape: {next_val.shape}")
+        # print(f"[rank{rank}] generate: Before cat, result shape: {result.shape}, next_val shape: {next_val.shape}")
         # <<< END DEBUG >>>
 
         if post_iteration_hook is not None:
@@ -309,7 +319,7 @@ def generate(
                 i + prompt_length, logits, next_val, kwargs
             )
             # <<< DEBUG >>>
-            print(f"[rank{rank}] generate: After hook, result shape: {result.shape}, next_val shape: {next_val.shape}")
+            # print(f"[rank{rank}] generate: After hook, result shape: {result.shape}, next_val shape: {next_val.shape}")
             # <<< END DEBUG >>>
 
 

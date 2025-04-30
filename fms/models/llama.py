@@ -148,11 +148,11 @@ class LLaMABlock(nn.Module):
         q_global_offset=None, # Add q_global_offset argument
         global_seq_len = None, # Add global_seq_len argument (padded length)
     ):
-        print(attn_algorithm)
+        # print(attn_algorithm) # Can be noisy
         # If using ring attention, handle it separately
         if attn_algorithm == "ring": # This is the check you asked about
             rank = self.ring_attention_group.rank() if self.ring_attention_group else -1 # Get rank safely
-            print(f"[rank{rank}] LLaMABlock.forward: Using Ring Attention path.")
+            # print(f"[rank{rank}] LLaMABlock.forward: Using Ring Attention path.")
             if self.ring_attention_group is None:
                 raise RuntimeError("Ring Attention algorithm requested but no ring_attention_group was provided to the LLaMABlock.")
             # Check if required arguments are provided
@@ -206,7 +206,7 @@ class LLaMABlock(nn.Module):
                 group=self.ring_attention_group # Pass the stored group
             )
 
-            print(f"[rank{rank}] LLaMABlock.forward: Before engine.forward_full", flush=True)
+            # print(f"[rank{rank}] LLaMABlock.forward: Before engine.forward_full", flush=True)
             # Pass expanded keys (keys_e) and values (values_e) to the engine
             x_out = engine.forward_full(
                 q_shard=queries, k_shard=keys_e, v_shard=values_e,
@@ -216,7 +216,7 @@ class LLaMABlock(nn.Module):
                 global_seq_len=global_seq_len # Pass the padded global length
             )
             # Ring attention engine now returns the local block, gathering happens outside
-            print(f"[rank{rank}] LLaMABlock.forward: After engine.forward_full", flush=True)
+            # print(f"[rank{rank}] LLaMABlock.forward: After engine.forward_full", flush=True)
             return x_out # No cache returned for ring attention yet
         else:
             # Fallback to the original attention mechanism
@@ -504,7 +504,7 @@ class LLaMA(nn.Module):
             compute_global_seq_len = self.distributed_strategy.world_size * self.distributed_strategy.block_size
             # q_global_offset is the offset in the PADDED sequence
             q_global_offset = self.distributed_strategy.rank * self.distributed_strategy.block_size
-            print(f"ringring", flush=True)
+            # print(f"ringring", flush=True) # Removed noisy print
             # Prepare kwargs specific to ring attention layers
             layer_kwargs = {"q_global_offset": q_global_offset, "global_seq_len": compute_global_seq_len}
         else:
@@ -549,16 +549,16 @@ class LLaMA(nn.Module):
             dec_out_gathered = self.distributed_strategy.gather_output(dec_out) # dec_out here is the local shard output
             # Use rank for logging
             rank = self.distributed_strategy.rank
-            print(f"[rank{rank}] LLaMA._helper: After gather. Gathered shape={dec_out_gathered.shape}", flush=True)
+            # print(f"[rank{rank}] LLaMA._helper: After gather. Gathered shape={dec_out_gathered.shape}", flush=True)
             # Truncate output back to original length if padding was added
             # Use original_global_seq_len obtained from shard_input
             if dec_out_gathered.shape[self.distributed_strategy.dim] != original_global_seq_len:
-                print(f"[rank{rank}] LLaMA._helper: Truncating output from {dec_out_gathered.shape[self.distributed_strategy.dim]} back to {original_global_seq_len}.")
+                # print(f"[rank{rank}] LLaMA._helper: Truncating output from {dec_out_gathered.shape[self.distributed_strategy.dim]} back to {original_global_seq_len}.")
                 # Ensure slicing uses the correct dimension from the strategy
                 dec_out = dec_out_gathered.narrow(self.distributed_strategy.dim, 0, original_global_seq_len)
             else:
                 dec_out = dec_out_gathered # No truncation needed if lengths match
-            print(f"[rank{rank}] LLaMA._helper: Final dec_out shape={dec_out.shape}", flush=True)
+            # print(f"[rank{rank}] LLaMA._helper: Final dec_out shape={dec_out.shape}", flush=True)
 
         return dec_out, present_key_value_states
 

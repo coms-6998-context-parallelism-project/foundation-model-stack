@@ -56,7 +56,7 @@ class RingAttentionEngine:
         global_seq_len is the total sequence length across all ranks.
         Returns the computed output shard for the current rank (size strategy_block_size).
         """
-        print(f"[rank{self.rank}] RingAttentionEngine.forward_full: START. q_shard shape: {q_shard.shape}, k_shard shape: {k_shard.shape}, v_shard shape: {v_shard.shape}, x_shard shape: {x_shard.shape}, q_global_offset: {q_global_offset}, global_seq_len: {global_seq_len}")
+        # print(f"[rank{self.rank}] RingAttentionEngine.forward_full: START. q_shard shape: {q_shard.shape}, k_shard shape: {k_shard.shape}, v_shard shape: {v_shard.shape}, x_shard shape: {x_shard.shape}, q_global_offset: {q_global_offset}, global_seq_len: {global_seq_len}")
         T_q_local = q_shard.shape[2]
         if T_q_local == 0: return torch.empty_like(x_shard)
 
@@ -84,17 +84,17 @@ class RingAttentionEngine:
         initial_max_score, initial_num, initial_den = self.init_values(q_shard)
 
         # 2. First pass: Compute max score across all K blocks (shards)
-        print(f"[rank{self.rank}] Before compute_max_score", flush=True)
+        # print(f"[rank{self.rank}] Before compute_max_score", flush=True)
         final_max_score = self.compute_max_score(block_data, initial_max_score, global_seq_len)
-        print(f"[rank{self.rank}] After compute_max_score. Entering barrier...", flush=True)
-        dist.barrier(self.group) # Re-enable barrier
-        print(f"[rank{self.rank}] Exited barrier after compute_max_score.", flush=True)
+        # print(f"[rank{self.rank}] After compute_max_score. Entering barrier...", flush=True)
+        dist.barrier(self.group)
+        # print(f"[rank{self.rank}] Exited barrier after compute_max_score.", flush=True)
 
         # 3. Second pass: Compute numerator and denominator sums
         final_num, final_den = self.compute_sums(block_data, final_max_score, initial_num, initial_den, global_seq_len)
-        print(f"[rank{self.rank}] After compute_sums. Entering barrier...", flush=True)
+        # print(f"[rank{self.rank}] After compute_sums. Entering barrier...", flush=True)
         dist.barrier(self.group) # Ensure all ranks have computed their sums
-        print(f"[rank{self.rank}] Exited barrier after compute_sums.", flush=True)
+        # print(f"[rank{self.rank}] Exited barrier after compute_sums.", flush=True)
 
         # 4. Compute local output block
         output_block = self.compute_block_output(x_block, final_num, final_den)
@@ -124,7 +124,7 @@ class RingAttentionEngine:
         expected_recv_len = self.strategy_block_size
 
         for i in range(args.world_size):
-            print(f"[rank{args.rank}] RingAttentionEngine.compute_max_score: Iter {i}/{args.world_size}, processing K from rank {current_k_rank}")
+            # print(f"[rank{args.rank}] RingAttentionEngine.compute_max_score: Iter {i}/{args.world_size}, processing K from rank {current_k_rank}")
             # Calculate global indices and length for the *current* K shard
             # Length is always strategy_block_size, offset is based on rank * strategy_block_size
             current_k_len = self.strategy_block_size
@@ -180,7 +180,7 @@ class RingAttentionEngine:
         expected_recv_len = self.strategy_block_size
 
         for i in range(args.world_size):
-            print(f"[rank{args.rank}] RingAttentionEngine.compute_sums: Iter {i}/{args.world_size}, processing K/V from rank {current_kv_rank}")
+            # print(f"[rank{args.rank}] RingAttentionEngine.compute_sums: Iter {i}/{args.world_size}, processing K/V from rank {current_kv_rank}")
             # Calculate global indices and length for the *current* K/V shards
             current_kv_len = (global_seq_len + args.world_size - 1) // args.world_size
             current_kv_global_offset = current_kv_rank * current_kv_len
@@ -203,21 +203,21 @@ class RingAttentionEngine:
             mask = args.mask_global[:, :, args.q_global_offset:args.q_global_offset+args.q_shard.shape[2], current_kv_global_offset:current_kv_global_offset+current_kv_len] if args.mask_global is not None else None
 
             # --- DETAILED DEBUGGING FOR RANK 0 HANG ---
-            if args.rank == 0 and i == 0:
-                print(f"[rank0] compute_sums (Iter 0): BEFORE update_totals call.", flush=True)
-                print(f"[rank0]   q_shard: {args.q_shard.shape}, {args.q_shard.device}, {args.q_shard.dtype}", flush=True)
-                print(f"[rank0]   eff_k: {effective_recv_k.shape}, {effective_recv_k.device}, {effective_recv_k.dtype}", flush=True)
-                print(f"[rank0]   eff_v: {effective_recv_v.shape}, {effective_recv_v.device}, {effective_recv_v.dtype}", flush=True)
-                print(f"[rank0]   mask: {mask.shape if mask is not None else 'None'}", flush=True)
-                print(f"[rank0]   q_indices: {q_global_indices.shape}", flush=True)
-                print(f"[rank0]   k_indices: {current_k_global_indices.shape}", flush=True)
-                print(f"[rank0]   final_max_score: {final_max_score.shape}, {final_max_score.device}, {final_max_score.dtype}, isnan={torch.isnan(final_max_score).any()}, isinf={torch.isinf(final_max_score).any()}", flush=True)
-                print(f"[rank0]   num: {num.shape}, {num.device}, {num.dtype}, isnan={torch.isnan(num).any()}, isinf={torch.isinf(num).any()}", flush=True)
-                print(f"[rank0]   den: {den.shape}, {den.device}, {den.dtype}, isnan={torch.isnan(den).any()}, isinf={torch.isinf(den).any()}", flush=True)
+            # if args.rank == 0 and i == 0:
+            #     print(f"[rank0] compute_sums (Iter 0): BEFORE update_totals call.", flush=True)
+            #     print(f"[rank0]   q_shard: {args.q_shard.shape}, {args.q_shard.device}, {args.q_shard.dtype}", flush=True)
+            #     print(f"[rank0]   eff_k: {effective_recv_k.shape}, {effective_recv_k.device}, {effective_recv_k.dtype}", flush=True)
+            #     print(f"[rank0]   eff_v: {effective_recv_v.shape}, {effective_recv_v.device}, {effective_recv_v.dtype}", flush=True)
+            #     print(f"[rank0]   mask: {mask.shape if mask is not None else 'None'}", flush=True)
+            #     print(f"[rank0]   q_indices: {q_global_indices.shape}", flush=True)
+            #     print(f"[rank0]   k_indices: {current_k_global_indices.shape}", flush=True)
+            #     print(f"[rank0]   final_max_score: {final_max_score.shape}, {final_max_score.device}, {final_max_score.dtype}, isnan={torch.isnan(final_max_score).any()}, isinf={torch.isinf(final_max_score).any()}", flush=True)
+            #     print(f"[rank0]   num: {num.shape}, {num.device}, {num.dtype}, isnan={torch.isnan(num).any()}, isinf={torch.isinf(num).any()}", flush=True)
+            #     print(f"[rank0]   den: {den.shape}, {den.device}, {den.dtype}, isnan={torch.isnan(den).any()}, isinf={torch.isinf(den).any()}", flush=True)
             # --- END DETAILED DEBUGGING ---
-            print(f"[rank{args.rank}] compute_sums: Before update_totals (Iter {i})", flush=True)
+            # print(f"[rank{args.rank}] compute_sums: Before update_totals (Iter {i})", flush=True)
             num, den = engine.update_totals(args.q_shard, effective_recv_k, effective_recv_v, mask, q_global_indices, current_k_global_indices, final_max_score, num, den)
-            print(f"[rank{args.rank}] compute_sums: After update_totals (Iter {i})", flush=True)
+            # print(f"[rank{args.rank}] compute_sums: After update_totals (Iter {i})", flush=True)
 
             # Send current K, V shards, receive into buffers sliced for the *expected incoming length*
             recv_k_slice_for_irecv = recv_k[:, :, :expected_recv_len, :]
@@ -245,25 +245,25 @@ class RingAttentionEngine:
     def send_recv_tensor(self, send_tensor: Tensor, full_recv_buffer: Tensor, expected_recv_len: int) -> Tensor: # Definition expects 4 args (self + 3)
         """ Sends a tensor to the next rank and receives one from the previous rank. """
         # Use explicit blocking send/recv with different orders for even/odd ranks
-        recv_buffer_slice = full_recv_buffer[:, :, :expected_recv_len, :]
-        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_tensor: Sending shape {send_tensor.shape} to rank {self.next_rank}, receiving into buffer slice shape {recv_buffer_slice.shape} (expecting len {expected_recv_len}) from rank {self.prev_rank}", flush=True)
+        recv_buffer_slice = full_recv_buffer[:, :, :expected_recv_len, :].contiguous() # Ensure contiguous for recv
+        # print(f"[rank{self.rank}] RingAttentionEngine.send_recv_tensor: Sending shape {send_tensor.shape} to rank {self.next_rank}, receiving into buffer slice shape {recv_buffer_slice.shape} (expecting len {expected_recv_len}) from rank {self.prev_rank}", flush=True)
 
         send_tensor_c = send_tensor.contiguous() # Ensure contiguous before sending
 
         if self.rank % 2 == 0:
-            print(f"[rank{self.rank}] Sending to {self.next_rank}...", flush=True)
+            # print(f"[rank{self.rank}] Sending to {self.next_rank}...", flush=True)
             dist.send(send_tensor_c, self.next_rank, group=self.group)
-            print(f"[rank{self.rank}] Sent to {self.next_rank}. Receiving from {self.prev_rank}...", flush=True)
+            # print(f"[rank{self.rank}] Sent to {self.next_rank}. Receiving from {self.prev_rank}...", flush=True)
             # Receive into the correctly sized slice
             dist.recv(recv_buffer_slice, self.prev_rank, group=self.group)
-            print(f"[rank{self.rank}] Received from {self.prev_rank}.", flush=True)
+            # print(f"[rank{self.rank}] Received from {self.prev_rank}.", flush=True)
         else:
-            print(f"[rank{self.rank}] Receiving from {self.prev_rank}...", flush=True)
+            # print(f"[rank{self.rank}] Receiving from {self.prev_rank}...", flush=True)
             # Receive into the correctly sized slice
             dist.recv(recv_buffer_slice, self.prev_rank, group=self.group)
-            print(f"[rank{self.rank}] Received from {self.prev_rank}. Sending to {self.next_rank}...", flush=True)
+            # print(f"[rank{self.rank}] Received from {self.prev_rank}. Sending to {self.next_rank}...", flush=True)
             dist.send(send_tensor_c, self.next_rank, group=self.group)
-            print(f"[rank{self.rank}] Sent to {self.next_rank}.", flush=True)
+            # print(f"[rank{self.rank}] Sent to {self.next_rank}.", flush=True)
 
         # Return the relevant slice of the buffer
         return recv_buffer_slice
@@ -271,30 +271,32 @@ class RingAttentionEngine:
 
     def send_recv_kv(self, send_k: Tensor, send_v: Tensor, recv_k_buf: Tensor, recv_v_buf: Tensor) -> Tuple[Tensor, Tensor]:
         # Note: recv_k_buf and recv_v_buf are assumed to be pre-sliced correctly based on expected_recv_len in compute_sums
-        print(f"[rank{self.rank}] RingAttentionEngine.send_recv_kv: Sending K shape {send_k.shape}, V shape {send_v.shape} to rank {self.next_rank}, receiving into K shape {recv_k_buf.shape}, V shape {recv_v_buf.shape} from rank {self.prev_rank}", flush=True)
+        # print(f"[rank{self.rank}] RingAttentionEngine.send_recv_kv: Sending K shape {send_k.shape}, V shape {send_v.shape} to rank {self.next_rank}, receiving into K shape {recv_k_buf.shape}, V shape {recv_v_buf.shape} from rank {self.prev_rank}", flush=True)
         # recv_k_buf and recv_v_buf MUST be correctly sized for the incoming tensors *before* calling this.
         """ Sends K, V to the next rank and receives K, V from the previous rank. """
         # Using explicit blocking send/recv with ordering like send_recv_tensor. recv_*_buf are assumed pre-sliced.
 
         send_k_c = send_k.contiguous()
         send_v_c = send_v.contiguous()
+        recv_k_buf_c = recv_k_buf.contiguous() # Ensure contiguous for recv
+        recv_v_buf_c = recv_v_buf.contiguous() # Ensure contiguous for recv
 
         if self.rank % 2 == 0:
-            print(f"[rank{self.rank}] Sending K/V to {self.next_rank}...", flush=True)
+            # print(f"[rank{self.rank}] Sending K/V to {self.next_rank}...", flush=True)
             dist.send(send_k_c, self.next_rank, group=self.group)
             dist.send(send_v_c, self.next_rank, group=self.group)
-            print(f"[rank{self.rank}] Sent K/V to {self.next_rank}. Receiving K/V from {self.prev_rank}...", flush=True)
-            dist.recv(recv_k_buf, self.prev_rank, group=self.group)
-            dist.recv(recv_v_buf, self.prev_rank, group=self.group)
-            print(f"[rank{self.rank}] Received K/V from {self.prev_rank}.", flush=True)
+            # print(f"[rank{self.rank}] Sent K/V to {self.next_rank}. Receiving K/V from {self.prev_rank}...", flush=True)
+            dist.recv(recv_k_buf_c, self.prev_rank, group=self.group)
+            dist.recv(recv_v_buf_c, self.prev_rank, group=self.group)
+            # print(f"[rank{self.rank}] Received K/V from {self.prev_rank}.", flush=True)
         else:
-            print(f"[rank{self.rank}] Receiving K/V from {self.prev_rank}...", flush=True)
-            dist.recv(recv_k_buf, self.prev_rank, group=self.group)
-            dist.recv(recv_v_buf, self.prev_rank, group=self.group)
-            print(f"[rank{self.rank}] Received K/V from {self.prev_rank}. Sending K/V to {self.next_rank}...", flush=True)
+            # print(f"[rank{self.rank}] Receiving K/V from {self.prev_rank}...", flush=True)
+            dist.recv(recv_k_buf_c, self.prev_rank, group=self.group)
+            dist.recv(recv_v_buf_c, self.prev_rank, group=self.group)
+            # print(f"[rank{self.rank}] Received K/V from {self.prev_rank}. Sending K/V to {self.next_rank}...", flush=True)
             dist.send(send_k_c, self.next_rank, group=self.group)
             dist.send(send_v_c, self.next_rank, group=self.group)
-            print(f"[rank{self.rank}] Sent K/V to {self.next_rank}.", flush=True)
+            # print(f"[rank{self.rank}] Sent K/V to {self.next_rank}.", flush=True)
 
         return recv_k_buf, recv_v_buf
 
@@ -361,19 +363,21 @@ class RingAttentionEngine:
         current_num = current_num.float()
         current_den = current_den.float()
 
-        print(f"[rank{self.rank}] update_totals: Before raw_attention", flush=True)
+        # print(f"[rank{self.rank}] update_totals: Before raw_attention", flush=True)
         attn_scores = self.raw_attention(q, k, mask, q_indices, k_indices)
 
         # Check for NaNs/Infs, specifically positive infinity as -inf is expected from masking
         # It's okay if attn_scores has -inf from masking
 
-        print(f"[rank{self.rank}] update_totals: After raw_attention. Before stable_scores", flush=True)
+        # print(f"[rank{self.rank}] update_totals: After raw_attention. Before stable_scores", flush=True)
         # Subtracting max score for stability. Ensure max_score isn't -inf where attn_scores is also -inf.
         # Replace -inf in final_max_score with a large negative number where attn_scores is also -inf to avoid inf - inf = nan
         safe_max_score = torch.where(final_max_score == -torch.inf, torch.finfo(final_max_score.dtype).min, final_max_score)
         stable_scores = attn_scores - safe_max_score
         # Replace potential NaN from (-inf - (-inf)) with -inf before exp
         stable_scores = torch.nan_to_num(stable_scores, nan=-torch.inf)
+
+        stable_scores = torch.clamp(stable_scores, max=80.0, min = -80.0)
 
         exp_scores = torch.exp(stable_scores)
         # Check for NaNs/Infs after exponentiation (should ideally be only positive numbers or zero)
@@ -382,10 +386,10 @@ class RingAttentionEngine:
         if (exp_scores == torch.inf).any():
             print(f"[rank{self.rank}] WARNING: Positive Infs found in exp_scores!", flush=True)
 
-        print(f"[rank{self.rank}] update_totals: After exp_scores. Before einsum", flush=True)
+        # print(f"[rank{self.rank}] update_totals: After exp_scores. Before einsum", flush=True)
         num_update = torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
         den_update = exp_scores.sum(dim=-1, keepdim=True)
-        print(f"[rank{self.rank}] update_totals: After einsum/sum", flush=True)
+        # print(f"[rank{self.rank}] update_totals: After einsum/sum", flush=True)
 
         # Check for NaNs/Infs in updates before adding
         if torch.isnan(num_update).any() or (num_update == torch.inf).any():
@@ -394,3 +398,6 @@ class RingAttentionEngine:
             print(f"[rank{self.rank}] WARNING: NaNs/Infs found in den_update!", flush=True)
         # Cast back to original dtype before returning
         return (current_num + num_update).to(orig_dtype), (current_den + den_update).to(orig_dtype)
+    
+
+    # can you see me

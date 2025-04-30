@@ -500,8 +500,8 @@ class LLaMA(nn.Module):
         # --- Ring Attention Strategy: Shard Input ---
         is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
         if is_ring_strategy:
-            # print(f"[RING DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Using RingAttentionStrategy.", flush=True)
-            print(f"[RING LEN DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Original input seq len = {x_in.size(1)}", flush=True)
+            # print(f"[RING DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Using RingAttentionStrategy.", flush=True) # Commented out
+            print(f"[RING LENGTH DEBUG][rank{self.distributed_strategy.rank}] LLaMA._helper: Original input seq len = {x_in.size(1)}", flush=True)
             # shard_input now handles global padding and returns the original length
             x_in, original_global_seq_len = self.distributed_strategy.shard_input(x_in)
             # The compute_global_seq_len is the padded length used by the engine

@@ -360,13 +360,22 @@ class RingAttentionEngine:
     def update_totals(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, final_max_score: Tensor, current_num: Tensor, current_den: Tensor) -> Tuple[Tensor, Tensor]:
         print(f"[rank{self.rank}] update_totals: Before raw_attention", flush=True)
         attn_scores = self.raw_attention(q, k, mask, q_indices, k_indices)
-        if torch.isnan(attn_scores).any() or torch.isinf(attn_scores).any():
-            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in attn_scores!", flush=True)
+
+        # Check for NaNs/Infs, specifically positive infinity as -inf is expected from masking
+        if torch.isnan(attn_scores).any():
+            print(f"[rank{self.rank}] WARNING: NaNs found in attn_scores!", flush=True)
+        if torch.isinf(attn_scores).any():
+            # Check if there are positive infinities
+            if (attn_scores == torch.inf).any():
+                print(f"[rank{self.rank}] WARNING: Positive Infs found in attn_scores!", flush=True)
             # Optionally add more debugging here, e.g., print where NaNs/Infs occur
 
-        print(f"[rank{self.rank}] update_totals: After raw_attention. Before exp_scores", flush=True)
+        print(f"[rank{self.rank}] update_totals: After raw_attention. Before stable_scores", flush=True)
         # Remove clamping for potentially better numerical stability with fp16
         stable_scores = attn_scores - final_max_score # .clamp(min=-10.0, max=10.0)
+        # Replace potential NaN from (-inf - (-inf)) with -inf before exp
+        stable_scores = torch.nan_to_num(stable_scores, nan=-torch.inf)
+
         if torch.isnan(stable_scores).any() or torch.isinf(stable_scores).any():
             print(f"[rank{self.rank}] WARNING: NaNs/Infs found in stable_scores!", flush=True)
 
@@ -378,4 +387,10 @@ class RingAttentionEngine:
         num_update = torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
         den_update = exp_scores.sum(dim=-1, keepdim=True)
         print(f"[rank{self.rank}] update_totals: After einsum/sum", flush=True)
+
+        # Check for NaNs/Infs in updates before adding
+        if torch.isnan(num_update).any() or torch.isinf(num_update).any():
+            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in num_update!", flush=True)
+        if torch.isnan(den_update).any() or torch.isinf(den_update).any():
+            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in den_update!", flush=True)
         return current_num + num_update, current_den + den_update

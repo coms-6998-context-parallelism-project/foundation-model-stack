@@ -199,9 +199,10 @@ class LLaMABlock(nn.Module):
                 if 'ring' in debug_info and 'engine' in debug_info:
                     diffs = self._diff_debug_dicts(debug_info['ring'], debug_info['engine'])
                     rank = dist.get_rank() if dist.is_initialized() else 0
-                    print(f"\n--- [Rank {rank}] Debug Info Diffs in LLaMABlock {self.layer_index} (Ring vs Engine) ---")
-                    # You might want to pretty-print or filter the diffs
-                    print(diffs)
+                    print(f"\n--- [Rank {rank}] Debug Info Diffs in LLaMABlock {self.layer_index} (Gathered Ring vs Engine) ---")
+                    # Iterate and print each formatted string value to respect newlines
+                    for key, formatted_string in diffs.items(): # Ensure this loop is active
+                        print(formatted_string)
                     print(f"--- Exiting after printing debug diffs on Rank {rank}, Layer {self.layer_index} ---")
                     # Ensure all ranks exit if rank 0 finds a mismatch
                     if dist.is_initialized():
@@ -241,59 +242,82 @@ class LLaMABlock(nn.Module):
     def _diff_debug_dicts(self, d1, d2):
         diffs = {}
         for key in d1.keys() & d2.keys():
+            diff_lines = [f"--- Key: {key} ---",
+                          f"          {'Shape':<25} {'Dtype':<15} {'First 5 Vals'}"] # Header
             if isinstance(d1[key], torch.Tensor) and isinstance(d2[key], torch.Tensor):
-                diffs[key] = torch.norm(d1[key] - d2[key]).item()
+                # Print shapes and first few values
+                ring_vals_raw = d1[key].flatten()[:5].tolist() if d1[key].numel() > 0 else []
+                engine_vals_raw = d2[key].flatten()[:5].tolist() if d2[key].numel() > 0 else []
+                # Round values
+                ring_vals_rounded = [f"{v:.4f}" for v in ring_vals_raw]
+                engine_vals_rounded = [f"{v:.4f}" for v in engine_vals_raw]
+
+                diff_lines.append(f"  Ring:   {str(d1[key].shape):<25} {str(d1[key].dtype):<15} {ring_vals_rounded}")
+                diff_lines.append(f"  Engine: {str(d2[key].shape):<25} {str(d2[key].dtype):<15} {engine_vals_rounded}")
             elif isinstance(d1[key], tuple) and isinstance(d2[key], tuple):
-                diffs[key] = [torch.norm(a - b).item() for a, b in zip(d1[key], d2[key])]
+                # Print shapes and first few values for each tensor in the tuple
+                diff_lines.append("  (Comparing tensors within tuples)")
+                for i, (a, b) in enumerate(zip(d1[key], d2[key])):
+                    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+                        ring_vals_raw = a.flatten()[:5].tolist() if a.numel() > 0 else []
+                        engine_vals_raw = b.flatten()[:5].tolist() if b.numel() > 0 else []
+                        # Round values
+                        ring_vals_rounded = [f"{v:.4f}" for v in ring_vals_raw]
+                        engine_vals_rounded = [f"{v:.4f}" for v in engine_vals_raw]
+
+                        diff_lines.append(f"    Tuple[{i}] Ring:   {str(a.shape):<25} {str(a.dtype):<15} {ring_vals_rounded}")
+                        diff_lines.append(f"    Tuple[{i}] Engine: {str(b.shape):<25} {str(b.dtype):<15} {engine_vals_rounded}")
+                    else:
+                        diff_lines.append(f"    Tuple[{i}]: Non-tensor elements or mismatch. Ring type: {type(a)}, Engine type: {type(b)}")
             else:
-                diffs[key] = f"Non-tensor difference or structure mismatch"
+                diff_lines.append(f"  Non-tensor/tuple or structure mismatch. Ring type: {type(d1[key])}, Engine type: {type(d2[key])}")
+            diffs[key] = "\n".join(diff_lines)
         return diffs
 
     def _gather_debug_tensors(self, data, strategy):
         """Recursively gather tensors within a nested structure using explicit all_gather."""
         if isinstance(data, torch.Tensor):
-            # Only gather if distributed and world_size > 1
-            if not dist.is_initialized() or strategy.world_size == 1:
-                return data
+            # Use the strategy to gather if world_size > 1
+            if isinstance(strategy, RingAttentionStrategy) and strategy.world_size > 1:
+                # --- Add this check ---
+                # rank = dist.get_rank() if dist.is_initialized() else 0
+                # print(f"[Rank {rank}] _gather_debug_tensors: Detected RingAttentionStrategy, attempting gather for shape {data.shape}")
+                try:
+                    # Determine the sequence dimension to gather along
+                    gather_dim = -1
+                    # Assume [B, T_shard, D] or [B, H, T_shard, D_head]
+                    if data.ndim == 3: # Assume [B, T_shard, D]
+                        gather_dim = 1
+                    elif data.ndim == 4: # Assume [B, H, T_shard, D_head]
+                        gather_dim = 2
+                    else:
+                        # Cannot determine sharded dimension, return CPU copy
+                        return data.clone().detach().cpu()
 
-            try:
-                # Heuristic: Guess sharded dimension based on ndim
-                # Assumes B, T, D for 3D and B, H, T, D for 4D
-                if data.ndim == 3: # Likely sharded along dim 1 (sequence)
-                    gather_dim = 1
-                elif data.ndim == 4: # Likely sharded along dim 2 (sequence)
-                    gather_dim = 2
-                else: # Don't know how to gather other shapes
-                    return data
+                    # Use the strategy's gather method
+                    gathered_tensor = strategy.gather_tensor(data, dim=gather_dim)
+                    # Return a CPU copy for comparison
+                    return gathered_tensor.clone().detach().cpu()
 
-                # 1. Get local size and full size from all ranks
-                local_size = data.shape[gather_dim]
-                all_sizes = [torch.tensor(0, device=data.device) for _ in range(strategy.world_size)]
-                dist.all_gather(all_sizes, torch.tensor(local_size, device=data.device), group=strategy.group)
-                full_size = sum(s.item() for s in all_sizes)
-
-                # 2. Check if already gathered (simple check)
-                if data.shape[gather_dim] == full_size:
-                    return data
-
-                # 3. Allocate full tensor
-                full_shape = list(data.shape)
-                full_shape[gather_dim] = full_size
-                gathered_tensor = torch.empty(full_shape, dtype=data.dtype, device=data.device)
-
-                # 4. Perform all_gather_into_tensor
-                dist.all_gather_into_tensor(gathered_tensor, data.contiguous(), group=strategy.group)
-                return gathered_tensor
-
-            except Exception as e:
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                print(f"Warning [Rank {rank}]: Could not gather tensor for diff: {e}, returning original shape {data.shape}.")
-                return data # Return original if gather fails
+                except Exception as e:
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    print(f"Warning [Rank {rank}]: Could not gather tensor using strategy for diff: {e}, returning original shape {data.shape}.")
+                    # Return CPU copy of original on failure
+                    return data.clone().detach().cpu()
+            else:
+                # --- Add this check ---
+                # rank = dist.get_rank() if dist.is_initialized() else 0
+                # print(f"[Rank {rank}] _gather_debug_tensors: Strategy is {type(strategy)} or world_size=1, returning CPU copy for shape {data.shape}")
+                # Not using RingAttentionStrategy or world_size is 1, just return CPU copy
+                return data.clone().detach().cpu()
         elif isinstance(data, dict):
             return {k: self._gather_debug_tensors(v, strategy) for k, v in data.items()}
         elif isinstance(data, (list, tuple)):
-            return type(data)(self._gather_debug_tensors(item, strategy) for item in data)
+            # Handle tuples/lists of tensors (like QKV)
+            gathered_items = [self._gather_debug_tensors(item, strategy) for item in data]
+            return type(data)(gathered_items)
         else:
+            # For non-tensor types, just return them (they are likely scalars or strings)
             return data
 
     def _forward_ring_attention(
@@ -324,7 +348,11 @@ class LLaMABlock(nn.Module):
         # Unpack based on whether debug info was returned
         if enable_debug_info:
             attn_out, cache, ring_debug_data = ring_output
-            debug['ring_helper_internals'] = ring_debug_data
+            # --- Flatten ring_helper_internals into debug dict ---
+            if ring_debug_data:
+                for k, v in ring_debug_data.items():
+                    debug[f'ring_{k}'] = v # Prefix with 'ring_'
+            # -----------------------------------------------------
         else:
             attn_out, cache = ring_output
         debug['attn_out'] = attn_out # Store the tensor output regardless
@@ -398,7 +426,14 @@ class LLaMABlock(nn.Module):
         # Unpack based on whether debug info was returned
         if enable_debug_info:
             x, engine_debug_data = engine_output
-            debug['engine_internals'] = engine_debug_data
+            # --- Flatten engine_internals into debug dict ---
+            if engine_debug_data:
+                # engine_debug_data is Dict[block_id, Dict[str, Tensor]]
+                for block_id, block_data in engine_debug_data.items():
+                    for k, v in block_data.items():
+                        # Prefix with 'engine_' and include block_id
+                        debug[f'engine_{k}_b{block_id}'] = v
+            # ------------------------------------------------
         else:
             x = engine_output
         debug['final_out'] = x # Store the tensor output regardless

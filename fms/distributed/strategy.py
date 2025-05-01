@@ -215,3 +215,27 @@ class RingAttentionStrategy(DistributedStrategy):
         if self._original_seq_len is not None:
             full = full[:, :self._original_seq_len]
         return full
+
+    def gather_tensor(self, tensor: Tensor, dim: int = 1) -> Tensor:
+        """
+        Gathers a tensor sharded along a specific dimension across ranks.
+        Assumes the tensor might have been padded by shard_input if dim=1.
+
+        Args:
+            tensor (Tensor): The local shard of the tensor.
+            dim (int): The dimension along which the tensor is sharded. Defaults to 1 (sequence dim).
+
+        Returns:
+            Tensor: The gathered, potentially unpadded, tensor on all ranks.
+        """
+        if self.world_size == 1:
+            return tensor
+
+        gathered_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
+        dist.all_gather(gathered_list, tensor.contiguous(), group=self.group)
+        gathered_tensor = torch.cat(gathered_list, dim=dim)
+
+        # Trim padding if gathering along sequence dimension (dim=1) and padding was applied
+        if dim == 1 and self._original_seq_len is not None and gathered_tensor.shape[dim] > self._original_seq_len:
+             gathered_tensor = gathered_tensor.narrow(dim, 0, self._original_seq_len)
+        return gathered_tensor

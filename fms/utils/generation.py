@@ -390,15 +390,16 @@ def generate(
         else:
             # --- Token Selection and Broadcast ---
             if is_distributed:
-                # Only rank 0 determines the next token in distributed setting
-                next_val_for_broadcast = torch.empty((logits.size(0), 1), dtype=torch.long, device=device)
+                # Allocate tensor to hold the next token on ALL ranks
+                next_val = torch.empty((logits.size(0), 1), dtype=torch.long, device=device)
+
                 if rank == 0:
-                    next_val_for_broadcast = torch.argmax(logits, dim=-1).unsqueeze(1) # Ensure shape [B, 1]
+                    # Calculate the next token only on rank 0 and copy to the tensor
+                    calculated_next_val = torch.argmax(logits, dim=-1).unsqueeze(1) # Ensure shape [B, 1]
+                    next_val.copy_(calculated_next_val)
                     # Debug 5: Print sampled/generated token on rank 0
                     if debug_ring:
-                        print(f"[RANK 0] Iter {i} generated token: {next_val_for_broadcast.tolist()}", flush=True)
-                    # Allocate tensor to receive the token on other ranks
-                    next_val = torch.empty((logits.size(0), 1), dtype=torch.long, device=device)
+                        print(f"[RANK 0] Iter {i} generated token: {next_val.tolist()}", flush=True)
 
                 # Broadcast the chosen token from rank 0 to all other ranks
                 dist.broadcast(next_val, src=0, group=strategy.group if isinstance(strategy, RingAttentionStrategy) else None)

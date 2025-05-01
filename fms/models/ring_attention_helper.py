@@ -13,36 +13,10 @@ class RingAttentionHelper:
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
-    def compute_local_qkv_and_rope(self, q_input, k_input=None, v_input=None, position_ids=None, use_cache=False, past_key_value_state=None):
-        """
-        Computes Q, K, V projections, applies RoPE, and returns tensors
-        ready for attention calculation (B, nheads, T, head_dim).
-        """
-        B, T, _ = q_input.shape
-        k_input = q_input if k_input is None else k_input
-        v_input = q_input if v_input is None else v_input
-
-        # Use self.attn.in_proj for projection
-        q_out, k_out, v_out = self.attn.in_proj(q_input, k_input, v_input)
-
-        # Reshape for multi-head attention
-        queries = q_out.view(B, T, self.attn.nheads, self.attn.emb_kq_per_head)
-        keys = k_out.view(B, T, self.attn.kvheads, self.attn.emb_kq_per_head)
-        values = v_out.view(B, T, self.attn.kvheads, self.attn.emb_v_per_head)
-
-        # Apply Rotary Position Embeddings
-        if self.attn.position_encoder is not None:
-            if position_ids is None:
-                # Simplified position_ids logic for non-caching case
-                position_ids = torch.arange(T, device=q_input.device).unsqueeze(0).expand(B, -1)
-            queries, keys = self.attn.position_encoder.adjusted_qk(queries, keys, position_ids, past_key_value_state, use_cache)
-
-        # Transpose for attention calculation: B, num_heads, T, head_dim
-        return queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
-
     def forward(self, x_norm, mask=None, position_ids=None, past_key_value_state=None, is_causal_mask=False):
         # Step 1: Local QKV computation with RoPE
-        q, k, v = self.compute_local_qkv_and_rope(
+        # Use the unified method from the attention module
+        q, k, v = self.attn.compute_qkv_and_rope(
             x_norm, x_norm, x_norm, # Pass x_norm as q, k, v inputs
             position_ids=position_ids,
             use_cache=self.use_cache,

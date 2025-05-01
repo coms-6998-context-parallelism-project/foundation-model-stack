@@ -322,7 +322,36 @@ class MultiHeadAttention(nn.Module):
 
     def to_tp(self, group: ProcessGroup) -> "TPMultiHeadAttention":
         return TPMultiHeadAttention.import_module(self, group)
+    def compute_qkv_and_rope(self, q_input, k_input=None, v_input=None, position_ids=None, use_cache=False, past_key_value_state=None):
+        """
+        Computes Q, K, V projections, applies RoPE, and returns tensors
+        ready for attention calculation (B, nheads, T, head_dim).
+        """
+        B, T, _ = q_input.shape
+        k_input = q_input if k_input is None else k_input
+        v_input = q_input if v_input is None else v_input
 
+        # Use self.in_proj for projection
+        q_out, k_out, v_out = self.in_proj(q_input, k_input, v_input)
+
+        # Reshape for multi-head attention
+        queries = q_out.view(B, T, self.nheads, self.emb_kq_per_head)
+        keys = k_out.view(B, T, self.kvheads, self.emb_kq_per_head)
+        values = v_out.view(B, T, self.kvheads, self.emb_v_per_head)
+
+        # Apply Rotary Position Embeddings
+        if self.position_encoder is not None:
+            if position_ids is None:
+                # Simplified position_ids logic for non-caching case or initial step
+                # More complex logic might be needed if past_key_value_state implies offset
+                current_seq_len = T
+                if use_cache and past_key_value_state is not None and past_key_value_state[0].numel() > 0:
+                    current_seq_len += past_key_value_state[0].size(-2) # Adjust based on cache length
+                position_ids = torch.arange(current_seq_len - T, current_seq_len, device=q_input.device).unsqueeze(0).expand(B, -1)
+            queries, keys = self.position_encoder.adjusted_qk(queries, keys, position_ids, past_key_value_state, use_cache)
+
+        # Transpose for attention calculation: B, num_heads, T, head_dim
+        return queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
     def forward(
         self,
         q: torch.Tensor,

@@ -4,16 +4,17 @@
 # to compare two attention types using intermediate output checks.
 
 # --- Environment Detection ---
-RUN_LOCATION="local" # Default to local
-if [[ "$(hostname)" == insomnia* ]]; then
+# Check for the existence of the Insomnia-specific repo path
+INSOMNIA_REPO_DIR="/insomnia001/depts/edu/COMSE6998/sg3790/foundation-model-stack"
+if [[ -d "$INSOMNIA_REPO_DIR" ]]; then
   RUN_LOCATION="insomnia"
   echo "[INFO] Detected Insomnia environment. Will use Slurm for GPU execution."
 else
+  RUN_LOCATION="local"
   echo "[INFO] Detected Local environment. Will use Python directly for CPU execution."
 fi
 
 # --- Base Paths ---
-INSOMNIA_REPO_DIR="/insomnia001/depts/edu/COMSE6998/sg3790/foundation-model-stack"
 LOCAL_REPO_DIR="/Users/sadigulcelik/Documents/CompSci/HPML-2025-Spring/FMSwrapper/foundation-model-stack" # Adjust if your local path differs
 
 # --- Comparison Configuration ---

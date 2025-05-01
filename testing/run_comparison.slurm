@@ -31,6 +31,16 @@ echo "========================================================"
 REPO_DIR="/insomnia001/depts/edu/COMSE6998/sg3790/foundation-model-stack" # Adjust base path if needed
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH}"
 
+# --- Ensure Dependencies ---
+echo "[INFO] Checking Python and pip paths..."
+which python
+which pip
+echo "[INFO] Attempting to install/verify sentencepiece..."
+# Use -v for verbose output, check exit code
+pip install --user -v sentencepiece || { echo "[ERROR] Failed to install sentencepiece"; exit 1; }
+echo "[INFO] Verifying sentencepiece installation..."
+python -m pip show sentencepiece || echo "[WARN] sentencepiece verification failed, but proceeding anyway..."
+
 # --- Run the Comparison Script ---
 # Use torchrun for potential distributed execution (like ring attention).
 # nproc_per_node=2 assumes ring attention needs 2 GPUs. Adjust if necessary.
@@ -47,3 +57,4 @@ echo "========================================================"
 echo "Comparison Job finished at $(date) with exit code $EXIT_CODE"
 echo "========================================================"
 exit $EXIT_CODE
+

@@ -144,12 +144,13 @@ else
       local_device="mps"
       echo "[INFO] Metal GPU detected, using device_type=mps"
   fi
-  # Use torchrun for consistency, even locally (nproc=1 unless ring on GPU)
+  # Use torchrun with nproc=2 locally as requested.
+  echo "[WARN] Using nproc_per_node=2 locally. Ring Attention may not function correctly or provide benefits on CPU/MPS."
   run_command=(
-      "torchrun" "--nproc_per_node=1" # Always 1 for local CPU/MPS
+      "torchrun" "--nproc_per_node=2" # Use 2 processes locally
       "$PYTHON_SCRIPT_PATH"
       "--device_type" "$local_device"
-      "--dtype" "fp32" # fp32 safer for CPU/MPS
+      "--dtype" "fp16" # fp32 safer for CPU/MPS
       "${script_args[@]}"
   )
   echo "[INFO] Executing: ${run_command[*]} > $output_file 2>&1 &"

@@ -233,8 +233,10 @@ def run_comparison_benchmark(args):
     # Use a fixed prompt for consistency
     prompt = args.prompt if args.prompt else "Once upon a time"
     print(f"Using prompt: '{prompt}'")
-    # Move inputs to the determined device
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    # Encode the prompt using the tokenizer's encode method
+    # Assuming the tokenizer has an 'encode' method that returns a list of IDs
+    encoded_prompt = tokenizer.encode(prompt)
+    inputs = torch.tensor([encoded_prompt], dtype=torch.long, device=device) # Create tensor manually
     input_ids = inputs.input_ids
     max_gen_len = args.max_new_tokens
     use_cache = args.use_cache # Get cache setting from args

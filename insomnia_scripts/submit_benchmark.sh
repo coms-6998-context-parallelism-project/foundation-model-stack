@@ -45,6 +45,10 @@ cd "$CURRENT_REPO_DIR" || { echo "[ERROR] Failed to cd to repo"; exit 1; }
 echo "[INFO] Pulling latest changes from Git..."
 git pull || { echo "[WARN] Git pull failed, continuing with current code."; }
 
+# Re-install package in editable mode to pick up dependency changes
+echo "[INFO] Installing/updating package dependencies with 'pip install -e .'..."
+pip install -e . || { echo "[WARN] pip install failed, attempting to continue..."; }
+
 # Navigate back home to store output files there
 cd ~ || { echo "[ERROR] Failed to cd to home"; exit 1; }
 

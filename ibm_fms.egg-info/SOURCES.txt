@@ -20,7 +20,6 @@ fms/models/init_ring.py
 fms/models/llama.py
 fms/models/llama_ring.py
 fms/models/mixtral.py
-fms/models/positions_ring.py
 fms/models/roberta.py
 fms/models/hf/__init__.py
 fms/models/hf/lm_head_mixins.py
@@ -65,7 +64,6 @@ fms/utils/config.py
 fms/utils/evaluation.py
 fms/utils/fusion.py
 fms/utils/generation.py
-fms/utils/generation_ring.py
 fms/utils/gptq.py
 fms/utils/serialization.py
 fms/utils/tensors.py

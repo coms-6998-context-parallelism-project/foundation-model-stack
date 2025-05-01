@@ -1,15 +1,17 @@
-from typing import Tuple
+from typing import Tuple, Dict, Optional, Union
 import torch
 import torch.distributed as dist
 import math
 
 class RingAttentionHelper:
-    def __init__(self, attn_module, layer_idx, strategy, use_cache=False):
+    def __init__(self, attn_module, layer_idx, strategy, use_cache=False, debug_mode: bool = False):
         self.attn = attn_module
         self.layer_idx = layer_idx
         self.strategy = strategy
         self.use_cache = use_cache
+        self.debug_mode = debug_mode
 
+        # Store rank/world_size for convenience
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
@@ -22,11 +24,16 @@ class RingAttentionHelper:
             use_cache=self.use_cache,
             past_key_value_state=past_key_value_state,
         )  # Shapes: [B, H, T, D] each
+        
+        debug_info: Optional[Dict] = {} if self.debug_mode else None
+        if self.debug_mode:
+            debug_info['qkv_rope'] = (q.clone().detach().cpu(), k.clone().detach().cpu(), v.clone().detach().cpu())
 
         # Save original Q for local indexing
         q_local = q.clone()
         k_local = k.clone()
         v_local = v.clone()
+        # Note: q_local is the full Q here, it gets sharded later if needed by strategy
 
         # Step 2: Init attention accumulator
         B, H, T_q, D = q.shape
@@ -36,6 +43,10 @@ class RingAttentionHelper:
         max_score = torch.full((B, H, T_q, 1), -float("inf"), device=q.device, dtype=q.dtype)
         numerator = torch.zeros(B, H, T_q, D_v, device=q.device, dtype=q.dtype)
         denominator = torch.zeros(B, H, T_q, 1, device=q.device, dtype=q.dtype)
+        
+        if self.debug_mode:
+            debug_info['initial_max_score'] = max_score.clone().detach().cpu()
+            debug_info['loop_data'] = [] # Store data per iteration
 
         for i in range(self.world_size):
             # Step 3: Compute attention
@@ -48,6 +59,13 @@ class RingAttentionHelper:
                 causal_mask = torch.tril(torch.ones(T_q, k.shape[2], device=q.device)).unsqueeze(0).unsqueeze(0)
                 scores = scores.masked_fill(causal_mask == 0, -float("inf"))
 
+            iter_debug = {} if self.debug_mode else None
+            if self.debug_mode:
+                iter_debug['k_iter'] = k.clone().detach().cpu()
+                iter_debug['v_iter'] = v.clone().detach().cpu()
+                iter_debug['scores_iter'] = scores.clone().detach().cpu()
+
+
             block_max = scores.amax(dim=-1, keepdim=True)
             max_score = torch.maximum(max_score, block_max)
 
@@ -59,6 +77,13 @@ class RingAttentionHelper:
 
             numerator += num_update
             denominator += den_update
+            
+            if self.debug_mode:
+                iter_debug['block_max_iter'] = block_max.clone().detach().cpu()
+                iter_debug['max_score_iter'] = max_score.clone().detach().cpu()
+                iter_debug['num_update_iter'] = num_update.clone().detach().cpu()
+                iter_debug['den_update_iter'] = den_update.clone().detach().cpu()
+                debug_info['loop_data'].append(iter_debug)
 
             # Step 4: Ring shift for k/v
             if i < self.world_size - 1:
@@ -66,10 +91,17 @@ class RingAttentionHelper:
                 v, _ = self._ring_shift_tensor(v)
 
         attn_out = numerator / (denominator + 1e-10)  # [B, H, T, Dv]
+        
+        if self.debug_mode:
+            debug_info['final_numerator'] = numerator.clone().detach().cpu()
+            debug_info['final_denominator'] = denominator.clone().detach().cpu()
+            debug_info['attn_out_raw'] = attn_out.clone().detach().cpu()
+            
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, H * D_v)
         attn_out = self.attn.dense(attn_out)
 
-        return attn_out, None  # no caching for now
+        # Return debug info if enabled
+        return (attn_out, None, debug_info) if self.debug_mode else (attn_out, None)
 
     def _ring_shift_tensor(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """ Ring-shift a tensor across ranks (send left, recv right) """

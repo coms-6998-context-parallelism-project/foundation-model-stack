@@ -1,7 +1,7 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Union
 import threading
 import queue
 
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BlockData:
-    engine_instance: 'RingAttentionEngine' 
+    engine_instance: 'ThreadedRingAttentionEngine' 
     block_id: int
     num_blocks: int
     q_start: int
@@ -27,6 +27,7 @@ class BlockData:
     await_sums: threading.Barrier
     result_buffer: Dict[int, Tensor]
     q_block: Tensor
+    debug_buffer: Optional[Dict[int, Dict]] # Added for debug info
     k_local: Tensor
     v_local: Tensor
     x_block: Tensor
@@ -34,9 +35,9 @@ class BlockData:
 
 
 # fake ring attention, for now (no multi gpu setup quite yet)
-class RingAttentionEngine:
+class ThreadedRingAttentionEngine:
 
-    def __init__(self, block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool):
+    def __init__(self, block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool, debug_mode: bool = False):
 
         self.block_size = block_size
         self.attn = attn
@@ -45,10 +46,11 @@ class RingAttentionEngine:
         self.is_causal = is_causal
         self.head_dim = attn.emb_kq_per_head
         self.scale = math.sqrt(self.head_dim)
+        self.debug_mode = debug_mode
 
 
     # main method
-    def forward_full(self, q_global: Tensor, k_global: Tensor, v_global: Tensor, mask_global: Optional[Tensor], x_global: Tensor) -> Tensor:
+    def forward_full(self, q_global: Tensor, k_global: Tensor, v_global: Tensor, mask_global: Optional[Tensor], x_global: Tensor) -> Union[Tensor, Tuple[Tensor, Dict]]:
 
         T_q = q_global.shape[2]
 
@@ -57,6 +59,7 @@ class RingAttentionEngine:
         if num_blocks == 0: return torch.empty_like(x_global)
 
         result_buffer: Dict[int, Tensor] = {}
+        debug_buffer: Dict[int, Dict] = {} if self.debug_mode else None # Initialize if debug mode is on
 
         block_queues = [queue.Queue() for _ in range(num_blocks)] # Renamed
         max_barrier = threading.Barrier(num_blocks) # Renamed
@@ -74,22 +77,28 @@ class RingAttentionEngine:
 
             block_data = BlockData(
                 engine_instance=self, block_id=block_id, num_blocks=num_blocks, q_start=q_start, q_end=q_end, mask_global=mask_global, block_queues=block_queues, 
-                await_max=max_barrier, await_sums=sum_barrier, result_buffer=result_buffer, q_block=q_block, k_local=k_block, v_local=v_block, x_block=x_block
+                await_max=max_barrier, await_sums=sum_barrier, result_buffer=result_buffer, debug_buffer=debug_buffer, q_block=q_block, k_local=k_block, v_local=v_block, x_block=x_block
             )
 
-            thread = threading.Thread(target=RingAttentionEngine.block_worker, args=(block_data,), daemon=True)
+            thread = threading.Thread(target=ThreadedRingAttentionEngine.block_worker, args=(block_data,), daemon=True)
             threads.append(thread)
             thread.start()
 
         for thread in threads: thread.join()
 
         ordered_results = [result_buffer[q_start] for q_start in q_starts]
-        return torch.cat(ordered_results, dim=1)
+        final_output = torch.cat(ordered_results, dim=1)
+
+        if self.debug_mode:
+            return final_output, debug_buffer
+        else:
+            return final_output
     
     # block outline
     @staticmethod
     def block_worker(args: BlockData):
 
+        block_debug_info = {} # Local dict for this block's debug info
         engine = args.engine_instance
         initial_max_score, initial_num, initial_den = engine.init_values(args.q_block)
 
@@ -99,7 +108,19 @@ class RingAttentionEngine:
         final_num, final_den = engine.compute_sums(args, final_max_score, initial_num, initial_den)
         args.await_sums.wait()
 
-        args.result_buffer[args.q_start] = engine.compute_block_output(args.x_block, final_num, final_den)
+        block_output = engine.compute_block_output(args.x_block, final_num, final_den)
+        args.result_buffer[args.q_start] = block_output
+
+        # Store debug info if enabled
+        if engine.debug_mode and args.debug_buffer is not None:
+            block_debug_info['q_block'] = args.q_block.clone().detach().cpu() # Example: clone, detach, move to CPU
+            block_debug_info['k_local'] = args.k_local.clone().detach().cpu()
+            block_debug_info['v_local'] = args.v_local.clone().detach().cpu()
+            block_debug_info['x_block'] = args.x_block.clone().detach().cpu()
+            block_debug_info['final_max_score'] = final_max_score.clone().detach().cpu()
+            block_debug_info['final_num'] = final_num.clone().detach().cpu()
+            block_debug_info['final_den'] = final_den.clone().detach().cpu()
+            args.debug_buffer[args.block_id] = block_debug_info # Store this block's info
 
 
     """ compute max scores for stability (first flash pass) """

@@ -162,76 +162,56 @@ class TensorParallelStrategy(DistributedStrategy):
 
 
 class RingAttentionStrategy(DistributedStrategy):
-
     """
-    A strategy placeholder for Ring Attention.
-
-    This strategy itself doesn't modify the model structure significantly during
-    distribution (like TP or MP do). Instead, it primarily serves as a signal
-    and potentially holds configuration (like the process group) needed by the
-    attention mechanism's forward pass to implement the ring communication logic.
-
-    The actual sequence partitioning, communication, and computation logic for
-    ring attention should be implemented within the attention module's forward method.
+    Distributed strategy for ring attention with automatic input padding.
+    Handles input sharding and output gathering across ranks.
     """
 
     def __init__(self, group=None, from_meta=False):
         super().__init__(from_meta)
-        assert torch.distributed.is_initialized(), "RingAttentionStrategy requires an initialized process group"
-        self.group = group if group is not None else torch.distributed.GroupMember.WORLD
+        assert torch.distributed.is_initialized(), "Requires initialized process group"
+        self.group = group or torch.distributed.GroupMember.WORLD
         self.rank = self.group.rank()
-        # world_size needs to be stored for sharding/gathering logic
         self.world_size = self.group.size()
+        self._original_seq_len = None  # Track original sequence length for unpadding
 
-    def _distribute_module(
-        self, module: nn.Module, final_layers: bool = False
-    ) -> nn.Module:
-        # Ring attention typically requires the module to be replicated on each device.
-        # We assume the underlying setup (e.g., FSDP, manual placement) handles this.
-        # This strategy doesn't add further sharding like TP.
+    def _distribute_module(self, module: nn.Module, final_layers: bool = False) -> nn.Module:
         return module
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
-        # Similar to _distribute_module, assume replication is handled elsewhere.
         return block
 
     def shard_input(self, x: Tensor) -> Tensor:
         """
-        Shards the input tensor `x` along the sequence dimension for the current rank.
-        Assumes x has shape [batch_size, seq_len, emb_dim].
+        Shard input along the sequence dimension. Automatically pads if needed.
         """
-        # If world size is 1, or sequence length is 1 (decode step), no sharding needed/possible
-        batch_size, seq_len = x.shape[:2]
-        if self.world_size == 1 or seq_len == 1:
+        if self.world_size == 1 or x.size(1) == 1:
             return x
-        # Ensure sequence length is divisible by world size for simplicity
-        # TODO: Handle cases where seq_len is not divisible (e.g., padding)
-        if seq_len % self.world_size != 0:
-            raise ValueError(
-                f"Sequence length ({seq_len}) must be divisible by world size ({self.world_size}) for ring attention sharding."
-            )
 
-        local_seq_len = seq_len // self.world_size
-        # Split along dim 1 (sequence dimension) and select the chunk for the current rank
-        x_local = x.split(local_seq_len, dim=1)[self.rank]
+        batch_size, seq_len = x.size(0), x.size(1)
+        self._original_seq_len = seq_len
 
-        # Return a contiguous view
-        return x_local.contiguous()
+        # Calculate padded length
+        pad_len = (self.world_size - seq_len % self.world_size) % self.world_size
+        if pad_len > 0:
+            pad_tensor = torch.zeros((batch_size, pad_len, *x.shape[2:]), dtype=x.dtype, device=x.device)
+            x = torch.cat([x, pad_tensor], dim=1)
+
+        local_seq_len = x.size(1) // self.world_size
+        return x.split(local_seq_len, dim=1)[self.rank].contiguous()
 
     def gather_output(self, x_local: Tensor) -> Tensor:
         """
-        Gathers the sharded output tensor `x_local` from all ranks along the sequence dimension.
-        Assumes x_local has shape [batch_size, local_seq_len, emb_dim].
+        Gather sequence shards and trim padding to recover original sequence length.
         """
-        # Check if world size is 1, no gather needed
         if self.world_size == 1:
             return x_local
 
-        # Prepare a list of tensors to receive gathered data
-        output_tensors = [torch.empty_like(x_local) for _ in range(self.world_size)]
+        gathered = [torch.empty_like(x_local) for _ in range(self.world_size)]
+        dist.all_gather(gathered, x_local.contiguous(), group=self.group)
+        full = torch.cat(gathered, dim=1)
 
-        # Perform all-gather operation
-        dist.all_gather(output_tensors, x_local.contiguous(), group=self.group)
-
-        # Concatenate along the sequence dimension (dim 1)
-        return torch.cat(output_tensors, dim=1)
+        # Trim padding if it was added
+        if self._original_seq_len is not None:
+            full = full[:, :self._original_seq_len]
+        return full

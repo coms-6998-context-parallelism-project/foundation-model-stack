@@ -195,10 +195,10 @@ if args.context_file is not None:
         # prompt1 = long_prompt + "\nDescribe work that was done concurrently with the research in this paper."
         prompt2 = long_prompt + "\nPlease write me the abstract for this paper."
 else:
-    template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{}\n\n### Response:"
+    template = "Instruction:{}\nResponse:"
 
     prompt1 = template.format(
-        "Provide a list of instructions for preparing chicken soup."
+        "One plus two?"
     )
     prompt2 = template.format("Explain some popular greetings in Spanish.")
 
@@ -255,7 +255,7 @@ def infer(use_cache, do_sample):
     result = generate(
         model,
         ids,
-        max_new_tokens=100,
+        max_new_tokens=3,
         use_cache=use_cache,
         do_sample=do_sample,
         max_seq_len=max_seq_len,

@@ -10,6 +10,7 @@ from fms import models
 from fms.distributed.strategy import (
     DistributedStrategy,
     NoOpStrategy,
+    RingAttentionStrategy,
     TensorParallelStrategy,
 )
 from fms.modules.attention import MultiHeadAttention
@@ -56,8 +57,9 @@ class LLaMAConfig(ModelConfig):
 
 
 class LLaMABlock(nn.Module):
-    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
+    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding, layer_index: int):
         super(LLaMABlock, self).__init__()
+        self.layer_index = layer_index
         self.config = config
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
@@ -121,19 +123,33 @@ class LLaMABlock(nn.Module):
         use_cache=False,
         is_causal_mask=False,
         attn_algorithm=None,
+        distributed_strategy: Optional[DistributedStrategy] = None,
     ):
-        # if the cache is not empty, we need to get the kv cache for self and cross attention
         self_attn_past_key_value = past_key_value_state
-        # if past_key_value_state is not None:
-        #     self_attn_past_key_value = past_key_value_state[:2]
-        # else:
-        #     self_attn_past_key_value = None
 
-        # first we do MHA and Add&Norm
+        # if isinstance(distributed_strategy, RingAttentionStrategy):
+        #     if(self.layer_index == 1):
+        #         print(x.shape, end = ", ")
+        #     x = distributed_strategy.shard_input(x)
+
+        if isinstance(distributed_strategy, RingAttentionStrategy):
+            if(self.layer_index ==0):
+            # Each rank gathers the full sequence before attention
+                x = distributed_strategy.gather_output(x)
+        # === End RingAttention gather ===
+
+
+        x_full = x
+        # Store original input for residual connection
         residual = x
-        x = self.ln(x)
-        x = self.attn(
-            q=x,
+
+
+        # === Begin RingAttention gather (mock global attention) ===
+        
+
+        x_norm = self.ln(x_full)
+        attn_out = self.attn(
+            q=x_norm,
             mask=mask,
             position_ids=position_ids,
             attn_algorithm=attn_algorithm,
@@ -142,27 +158,31 @@ class LLaMABlock(nn.Module):
             is_self=True,
             is_causal_mask=is_causal_mask,
         )
-        cache = None
-        if use_cache:
-            x, cache = x
-        if self.config.p_dropout != 0:
-            x = self.dropout(x)
-        # residual connection
-        x = x + residual
 
-        # then we do FF and Add&Norm
+        if use_cache:
+            attn_out, cache = attn_out
+        else:
+            cache = None
+
+        # === Begin RingAttention re-shard ===
+
+        # === End RingAttention re-shard ===
+
+        if self.config.p_dropout != 0:
+            attn_out = self.dropout(attn_out)
+        x = attn_out + residual
+
+        # FF layer
         residual = x
         x = self.ff_ln(x)
         x = self.ff_sub_layer(x)
         if self.config.p_dropout != 0:
             x = self.dropout(x)
-        # another residual
         x = x + residual
 
-        if use_cache:
-            return (x, cache)
-        else:
-            return x
+
+
+        return (x, cache) if use_cache else x
 
 
 class LLaMA(nn.Module):
@@ -223,7 +243,7 @@ class LLaMA(nn.Module):
 
         layers = []
         for i in range(self.config.nlayers):
-            block: nn.Module = LLaMABlock(self.config, self.rot_emb)
+            block: nn.Module = LLaMABlock(self.config, self.rot_emb, layer_index=i)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
@@ -341,6 +361,7 @@ class LLaMA(nn.Module):
         past_key_value_states=None,
         use_cache=False,
         attn_algorithm=None,
+        distributed_strategy: Optional[DistributedStrategy] = None,
     ):
         # Embed the given vocabulary indices using the given attention mask, with pre-/post-norm and dropout as specified
         # x_in: batch_size x seq_len
@@ -369,6 +390,10 @@ class LLaMA(nn.Module):
 
         x_in = self.shared(x_in)
 
+        if isinstance(distributed_strategy, RingAttentionStrategy):
+            x_in = self.distributed_strategy.shard_input(x_in)
+
+
         # this is the output cache for all the decoder layers
         present_key_value_states = []
 
@@ -381,6 +406,7 @@ class LLaMA(nn.Module):
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
+                distributed_strategy=distributed_strategy, # Pass strategy to the block
             )
 
             if use_cache:
@@ -395,6 +421,9 @@ class LLaMA(nn.Module):
         if self.config.p_dropout:
             dec_out = self.dropout(dec_out)
 
+        # if isinstance(distributed_strategy, RingAttentionStrategy):
+        #     dec_out = distributed_strategy.gather_output(dec_out)
+
         return dec_out, present_key_value_states
 
     def forward(
@@ -408,7 +437,14 @@ class LLaMA(nn.Module):
         attn_algorithm: Optional[str] = None,
     ):
         output, cache = self._helper(
-            x, mask, position_ids, past_key_value_states, use_cache, attn_algorithm
+            x,
+            mask,
+            position_ids,
+            past_key_value_states,
+            use_cache,
+            attn_algorithm,
+            # Pass the strategy from the main model instance
+            distributed_strategy=self.distributed_strategy,
         )
 
         if only_last_token:

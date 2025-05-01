@@ -288,6 +288,9 @@ else:
 def print_result(result):
     if local_rank != 0:
         return
+    # Debug: Print the raw result tensor received by print_result on rank 0
+    if args.debug_ring:
+        print(f"[RANK 0 print_result] Raw result tensor: {result.tolist()}", flush=True)
     if padding_kwargs is not None:
         result = generation.trim_prefix(result)
 

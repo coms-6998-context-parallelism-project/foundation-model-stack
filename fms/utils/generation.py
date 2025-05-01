@@ -440,6 +440,9 @@ def generate(
             )
 
         result = torch.cat((result, next_val), dim=-1)
+        # Debug: Print result shape after concatenation on rank 0
+        if debug_ring and rank == 0:
+            print(f"[RANK 0] Iter {i} result shape after cat: {result.shape}", flush=True)
 
         # avoid continuing to generate if all have reached EOS
         if eos_token_id is not None:
@@ -484,6 +487,7 @@ def generate(
     # Debug 19: At the end, print final generated sequence on rank 0 (assuming tokenizer available)
     if debug_ring and rank == 0 and tokenizer:
         final_decoded = tokenizer.decode(result, skip_special_tokens=True) # Use result directly if not is_batch handled it
+        print(f"[RANK 0] Final raw result tokens: {result.tolist()}", flush=True) # Print raw tokens too
         print(f"[RANK 0] Final generated text: {final_decoded}", flush=True)
     # Debug 20: Confirm total number of tokens generated per rank
     if debug_ring:

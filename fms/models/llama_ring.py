@@ -206,7 +206,8 @@ class LLaMABlock(nn.Module):
                 ff=self.ff_sub_layer,
                 ff_norm=self.ff_ln,
                 is_causal=engine_is_causal,
-                group=ring_attention_group
+                group=ring_attention_group,
+                debug_ring=getattr(self.config, 'debug_ring', False) # Pass debug flag if available in config
              )
 
             x_out = engine.forward_full(

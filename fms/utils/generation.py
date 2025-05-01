@@ -1,9 +1,11 @@
 import logging
 import time
 from typing import Any, Callable, Iterable, List, MutableMapping, Optional, Tuple, Union
+import os # For rank/world size if not passed
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist # Import torch.distributed
 
 # Import RingAttentionStrategy and distributed utils
 from fms.distributed.strategy import RingAttentionStrategy
@@ -188,6 +190,7 @@ def generate(
     ] = None,
     extra_kwargs: Optional[MutableMapping[str, Any]] = None,
     attn_algorithm: Optional[str] = None, # Add attn_algorithm parameter
+    debug_ring: bool = False, # Add debug flag
     **kwargs, # Keep accepting other kwargs
 ):
     """
@@ -230,6 +233,16 @@ def generate(
         attn_algorithm: Optional string specifying the attention algorithm to use (e.g., 'ring').
         **kwargs: Additional keyword arguments to pass to the model's forward function.
     """
+    # Get rank/world_size for debug prints if distributed
+    rank = int(os.getenv("RANK", 0))
+    world_size = int(os.getenv("WORLD_SIZE", 1))
+    is_distributed = world_size > 1
+    device = input_ids.device # Get device for memory print
+
+    # Debug 1: Print rank and world size at the start of generation
+    if debug_ring and is_distributed:
+        print(f"[RANK {rank}] Initialized. World size: {dist.get_world_size()}", flush=True)
+
     if num_beams != 1:
         raise NotImplementedError("generate() does yet not support beam search")
 
@@ -244,6 +257,24 @@ def generate(
         if not is_batch:
             input_ids = input_ids.unsqueeze(0)
     else:
+        # Debug 2: Print input prompt shape and contents at rank 0
+        if debug_ring and rank == 0:
+            # Assuming input_ids is a list of tensors here, need tokenizer
+            # print(f"[RANK 0] Initial input_ids list: {[tokenizer.decode(t) for t in input_ids]}", flush=True)
+            # If it's already padded:
+            # print(f"[RANK 0] Initial input_ids (padded): {input_ids.tolist()}", flush=True)
+            pass # Placeholder as input handling varies
+        # Debug 3: Verify all ranks have the same tokenizer output (hash check)
+        if debug_ring:
+            # Hashing might be tricky with tensors, string representation is safer
+            print(f"[RANK {rank}] Initial input_ids hash: {hash(str(input_ids.tolist()))}", flush=True)
+        # Debug 11: Log attention type being used at init (requires model access)
+        # Debug 12: Dump selected attention module class name (requires model access)
+        # Debug 13: Print per-layer rotary embedding device and shape (requires model access)
+        # Debug 14: Check model is in eval mode (requires model access)
+        if debug_ring and isinstance(model, torch.nn.Module):
+            # print(f"[RANK {rank}] Attention type: {getattr(model.config, 'attn_type', 'N/A')}", flush=True) # Example access
+            print(f"[RANK {rank}] Model eval mode: {not model.training}", flush=True)
         raise TypeError("input_ids must be one of Tensor or List")
 
     eos_found = torch.zeros(
@@ -262,12 +293,17 @@ def generate(
         start_time = time.time()
 
     for i in range(max_new_tokens):
+        # Debug 15: Measure and print time per iteration
+        iter_start_time = time.time()
+
         # --- Ring Attention Length Check ---
         # Check if the next token would exceed the max length allowed by Ring Attention's fixed blocks
         strategy = getattr(model, "distributed_strategy", None)
         if isinstance(strategy, RingAttentionStrategy):
             # The max length the ring mechanism can handle due to fixed block sizes
             max_ring_len = strategy.world_size * strategy.block_size
+            if debug_ring:
+                print(f"[RANK {rank}] Iter {i} Current result len: {result.shape[1]}, Max ring len: {max_ring_len}", flush=True)
             # Check if the *current* length already meets or exceeds the limit.
             # The loop should break *before* trying to generate the token that would exceed the limit.
             if result.shape[1] >= max_ring_len:
@@ -275,6 +311,14 @@ def generate(
         # --- End Ring Attention Length Check ---
 
         input_ids = next_input[:, -max_seq_len:]
+
+        # Debug 7: Confirm `input_ids` shape on each rank before each iteration
+        if debug_ring:
+            print(f"[RANK {rank}] Iter {i} input_ids shape for model call: {input_ids.shape}", flush=True)
+        # Debug 8: Print current sequence (decoded) for each rank (assuming tokenizer available)
+        if debug_ring:
+            decoded = tokenizer.decode(result[0], skip_special_tokens=True) # Assuming batch size 1 for simplicity here
+            print(f"[RANK {rank}] Iter {i} current decoded sequence: {decoded}", flush=True)
 
         # prepare any padding keyword arguments
         # iteration 0 is the prefill step (cache has not been filled yet), so no need to extend the mask/position_ids
@@ -315,12 +359,23 @@ def generate(
         if "only_last_token" not in model_kwargs:
             logits = logits[:, -1, :]
 
+        # Debug 17: Print if logits contain NaNs or infs
+        if debug_ring:
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print(f"[RANK {rank}] Iter {i} logits contain NaNs or Infs!", flush=True)
+        # Debug 18: Print logits mean/std
+        if debug_ring:
+            print(f"[RANK {rank}] Iter {i} logits stats: mean={logits.mean().item():.4f}, std={logits.std().item():.4f}", flush=True)
+
         # --- Debug Ring Attention Logits (Sampling/Argmax Input) ---
         if isinstance(strategy, RingAttentionStrategy):
-            rank, _ = distributed.rank_and_world(strategy.group)
+            # rank, _ = distributed.rank_and_world(strategy.group) # Rank already obtained
             if rank == 0: # Only print from rank 0
                 top_probs, top_indices = torch.topk(F.softmax(logits.float(), dim=-1), 5)
-                print(f"[DEBUG Ring Gen rank0] Iter {i} Logits (Top 5): Indices={top_indices.tolist()}, Probs={top_probs.tolist()}", flush=True) # Uncommented
+                # Debug 4: Print logits top-5 indices and probabilities on each rank (already partially done):
+                if debug_ring: # This is already inside a debug_ring check
+                    print(f"[RANK {rank}] Iter {i} Top-5 logits: Indices={top_indices.tolist()} :: Probs={top_probs.tolist()}", flush=True)
+
         # --- End Debug ---
 
         if do_sample:
@@ -333,7 +388,38 @@ def generate(
             probs = F.softmax(logits, dim=-1)
             next_val = torch.multinomial(probs, num_samples=1)
         else:
-            next_val = torch.argmax(logits, dim=-1).unsqueeze(0).t()
+            # --- Token Selection and Broadcast ---
+            if is_distributed:
+                # Only rank 0 determines the next token in distributed setting
+                next_val_for_broadcast = torch.empty((logits.size(0), 1), dtype=torch.long, device=device)
+                if rank == 0:
+                    next_val_for_broadcast = torch.argmax(logits, dim=-1).unsqueeze(1) # Ensure shape [B, 1]
+                    # Debug 5: Print sampled/generated token on rank 0
+                    if debug_ring:
+                        print(f"[RANK 0] Iter {i} generated token: {next_val_for_broadcast.tolist()}", flush=True)
+                    # Allocate tensor to receive the token on other ranks
+                    next_val = torch.empty((logits.size(0), 1), dtype=torch.long, device=device)
+
+                # Broadcast the chosen token from rank 0 to all other ranks
+                dist.broadcast(next_val, src=0, group=strategy.group if isinstance(strategy, RingAttentionStrategy) else None)
+                # Debug 9: Print confirmation after broadcast completes
+                if debug_ring:
+                    print(f"[RANK {rank}] Iter {i} broadcast completed", flush=True)
+                # Debug 6: Print token received on non-zero ranks after broadcast
+                if debug_ring and rank != 0:
+                    print(f"[RANK {rank}] Iter {i} received token after broadcast: {next_val.tolist()}", flush=True)
+                # Debug 10: Check all ranks have same token value after broadcast
+                if debug_ring:
+                    # Simple check by summing and dividing (assumes positive token IDs)
+                    # Clone to avoid modifying the original tensor if needed elsewhere
+                    token_check = next_val.clone().float()
+                    dist.all_reduce(token_sum, op=dist.ReduceOp.SUM, group=strategy.group if isinstance(strategy, RingAttentionStrategy) else None)
+                    expected_sum = next_val.item() * world_size # Assumes batch size 1 for simple check
+                    print(f"[RANK {rank}] Iter {i} all-reduced token check (val={next_val.item()}, sum={token_sum.item()}, expected={expected_sum})", flush=True)
+                    # assert token_sum.item() == expected_sum # Optional: hard assertion
+            else: # Single process case
+                next_val = torch.argmax(logits, dim=-1).unsqueeze(1) # Ensure shape [B, 1]
+
 
         if post_iteration_hook is not None:
             next_val, model_kwargs = post_iteration_hook(
@@ -357,6 +443,13 @@ def generate(
         else:
             next_input = result
 
+        # Debug 15 cont'd: Print iteration time
+        if debug_ring:
+            print(f"[RANK {rank}] Iter {i} duration: {time.time() - iter_start_time:.3f}s", flush=True)
+        # Debug 16: Print GPU memory usage per step (if available)
+        if debug_ring and device.type == 'cuda': # Use the obtained device
+            print(f"[RANK {rank}] Iter {i} CUDA memory used: {torch.cuda.memory_allocated(device) / 1e6:.2f} MB", flush=True)
+
         if timing == "per-token":
             if input_ids.device.type == "cuda":
                 torch.cuda.synchronize()
@@ -372,6 +465,14 @@ def generate(
 
     if not is_batch:
         result = result[0]
+
+    # Debug 19: At the end, print final generated sequence on rank 0 (assuming tokenizer available)
+    if debug_ring and rank == 0:
+        final_decoded = tokenizer.decode(result, skip_special_tokens=True) # Use result directly if not is_batch handled it
+        print(f"[RANK 0] Final generated text: {final_decoded}", flush=True)
+    # Debug 20: Confirm total number of tokens generated per rank
+    if debug_ring:
+        print(f"[RANK {rank}] Total tokens generated (incl. prompt): {result.shape[-1]}", flush=True)
 
     if timing != "":
         return result, times

@@ -139,6 +139,7 @@ class RotaryEmbedding(PositionEncoder):
 
         # --- Prompt 17: Flag to bypass RoPE ---
         self.bypass_rope = False # Set to True to temporarily disable RoPE
+        self.debug_ring = False # Add a debug flag, ideally set from config/args
 
     def _alpha(self, seq_len) -> int:
         if not self.ntk_scaling:
@@ -229,7 +230,7 @@ class RotaryEmbedding(PositionEncoder):
         """
         --- Prompt 17: Check bypass flag ---
         """
-        if self.bypass_rope:
+        if self.bypass_rope: # Keep existing bypass
             return q, k
         """
         Applies rotary position embedding to query and key tensors.
@@ -250,7 +251,8 @@ class RotaryEmbedding(PositionEncoder):
         """
         # Debug: Print input arguments and shapes
         rank, _ = distributed.rank_and_world() # Use default group
-        # print(f"RotaryEmbedding.adjusted_qk: q_shape={q.shape}, k_shape={k.shape}, has_pos_ids={position_ids is not None}") # Minimal debug
+        if self.debug_ring:
+            print(f"[RANK {rank} RoPE] adjusted_qk: q={q.shape}, k={k.shape}, pos_ids provided={position_ids is not None}, use_cache={use_cache}", flush=True)
         # Input validation: Ensure expected shape [B, S, H, D]
         assert len(q.size()) == 4
         assert len(k.size()) == 4
@@ -262,7 +264,8 @@ class RotaryEmbedding(PositionEncoder):
         seq_len = max(k.size(1), q.size(1))
         q_seq_len = q.size(1) # Store original q_seq_len for clarity
         if position_ids is None:
-            # print(f"[DEBUG RoPE rank{rank}] position_ids is None, entering fallback logic.", flush=True) # Removed
+            if self.debug_ring:
+                print(f"[RANK {rank} RoPE] position_ids is None, using fallback logic.", flush=True)
             # Fallback for standard attention (non-ring)
             # Check if we are in decoding phase (use_cache=True and past state exists)
             cache_len = -1 # Initialize cache_len
@@ -276,15 +279,17 @@ class RotaryEmbedding(PositionEncoder):
                     # --- Prompt 15: Check fallback decode position_ids ---
                     assert position_ids.shape == (batch_size, 1), f"Fallback decode position_ids shape mismatch: expected ({batch_size}, 1), got {position_ids.shape}"
                     assert position_ids[0, 0].item() == cache_len, f"Fallback decode position_ids value mismatch: expected {cache_len}, got {position_ids[0, 0].item()}"
-                    # print(f"[DEBUG RoPE rank{rank}] Fallback: Decode phase. cache_len={cache_len}. Calculated position_ids={position_ids.flatten().tolist()}", flush=True) # Removed
+                    if self.debug_ring:
+                        print(f"[RANK {rank} RoPE] Fallback: Decode phase. cache_len={cache_len}. Calculated position_ids={position_ids.flatten().tolist()}", flush=True)
                 except IndexError:
-                     # print(f"[WARN RoPE rank{rank}] Fallback failed to get cache length. Shape: {past_kv_state[0].shape}", flush=True) # Removed
+                     if self.debug_ring: print(f"[WARN RoPE rank{rank}] Fallback failed to get cache length. Shape: {past_kv_state[0].shape}", flush=True)
                      # Fallback further to just sequence length (likely incorrect for decode)
                      position_ids = torch.arange(0, q_seq_len, dtype=torch.long, device=q.device).unsqueeze(0)
                      # --- Prompt 15: Check fallback decode (error case) position_ids ---
                      # This case is less critical as it's likely wrong anyway, but check shape
                      assert position_ids.shape[1] == q_seq_len, f"Fallback decode (error) position_ids seq len mismatch: expected {q_seq_len}, got {position_ids.shape[1]}"
-                     # print(f"[WARN RoPE rank{rank}] Fallback: Decode phase (IndexError). Using arange({q_seq_len}). Calculated position_ids={position_ids.flatten().tolist()}", flush=True) # Removed
+                     if self.debug_ring:
+                         print(f"[WARN RoPE rank{rank}] Fallback: Decode phase (IndexError). Using arange({q_seq_len}). Calculated position_ids={position_ids.flatten().tolist()}", flush=True)
             else:
                 # Prefill phase: positions are 0 to seq_len-1
                 # Note: This simple arange doesn't account for left-padding.
@@ -295,13 +300,14 @@ class RotaryEmbedding(PositionEncoder):
                 if q_seq_len > 0:
                     expected_vals = torch.arange(0, q_seq_len, device=q.device)
                     assert torch.equal(position_ids.squeeze(0), expected_vals), f"Fallback prefill position_ids value mismatch: expected {expected_vals.tolist()}, got {position_ids.squeeze(0).tolist()}"
-                # print(f"[DEBUG RoPE rank{rank}] Fallback: Prefill phase. Using arange({q_seq_len}). Calculated position_ids={position_ids.flatten().tolist()}", flush=True) # Removed
+                if self.debug_ring:
+                    print(f"[RANK {rank} RoPE] Fallback: Prefill phase. Using arange({q_seq_len}). Calculated position_ids={position_ids.flatten().tolist()}", flush=True)
 
             # Expand batch dimension if needed (should match q batch size)
             if position_ids.size(0) != q.size(0):
                  position_ids = position_ids.expand(q.size(0), -1)
         else:
-            pass # Removed print
+            if self.debug_ring: print(f"[RANK {rank} RoPE] Received position_ids (shape {position_ids.shape}): {position_ids.flatten().tolist()}", flush=True)
             # print(f"[DEBUG RoPE rank{rank}] Received position_ids (shape {position_ids.shape}): {position_ids.flatten().tolist()}", flush=True) # Removed
 
         if self.partial_rope != 1.0:
@@ -322,12 +328,12 @@ class RotaryEmbedding(PositionEncoder):
         max_start_pos = torch.max(position_ids[:, 0]) if position_ids.numel() > 0 else 0
         # Use max position ID to determine required cache length
         max_pos_id_needed = torch.max(position_ids).item() if position_ids.numel() > 0 else 0
-        # --- Prompt 18: Print max position needed ---
-        # print(f"[DEBUG RoPE rank{rank}] Max position ID needed: {max_pos_id_needed}", flush=True) # Keep commented for now
+        if self.debug_ring:
+            print(f"[RANK {rank} RoPE] Max position ID needed: {max_pos_id_needed}", flush=True)
         alpha = self.compute_freqs_cis(q.device, max_pos_id_needed + 1)
-        # --- Prompt 18: Print cache size after computation ---
         dev_idx = q.device.index if q.device.type == 'cuda' else 0 # Handle CPU case
-        # print(f"[DEBUG RoPE rank{rank}] Max seq len cached for device {dev_idx}: {self.max_seq_len_cached.get(dev_idx, 0)}", flush=True) # Keep commented for now
+        if self.debug_ring:
+            print(f"[RANK {rank} RoPE] Max seq len cached for device {dev_idx}: {self.max_seq_len_cached.get(dev_idx, 0)}", flush=True)
         assert self.max_seq_len_cached.get(dev_idx, 0) > max_pos_id_needed, \
             f"RoPE cache size insufficient: max needed={max_pos_id_needed}, cache size={self.max_seq_len_cached.get(dev_idx, 0)}"
         # print(f"[DEBUG RoPE rank{rank}] Using alpha={alpha}. Cache size for alpha: {self.cached_freqs.get(q.device.index, {}).get(alpha, torch.empty(0)).shape[0]}", flush=True) # Less noisy
@@ -338,7 +344,8 @@ class RotaryEmbedding(PositionEncoder):
             # --- Prompt 16: Check frequency indexing shape ---
             assert freqs.size(0) == batch_size, f"Freqs batch size mismatch: expected {batch_size}, got {freqs.size(0)}"
             assert freqs.size(1) == position_ids.size(1), f"Freqs seq len mismatch: expected {position_ids.size(1)} (from position_ids), got {freqs.size(1)}"
-            # print(f"[DEBUG RoPE rank{rank}] Successfully indexed freqs cache. freqs.shape={freqs.shape}", flush=True) # Removed
+            if self.debug_ring:
+                print(f"[RANK {rank} RoPE] Successfully indexed freqs cache. freqs.shape={freqs.shape}", flush=True)
         except IndexError as e:
             print(f"[ERROR RoPE rank{rank}] Failed to index freqs cache. Max requested pos: {max_pos_id_needed}, Cache size: {self.cached_freqs[dev_idx][alpha].shape[0]}. Error: {e}", flush=True) # Keep critical error
             # Fallback or re-raise depending on desired behavior
@@ -358,7 +365,8 @@ class RotaryEmbedding(PositionEncoder):
         # --- Prompt 16: Check sliced frequency shape ---
         assert freqs_q.size(1) == q_len, f"Sliced freqs_q seq len mismatch: expected {q_len}, got {freqs_q.size(1)}"
         assert freqs_k.size(1) == k_len, f"Sliced freqs_k seq len mismatch: expected {k_len}, got {freqs_k.size(1)}"
-        # print(f"[DEBUG RoPE rank{rank}] Sliced freqs_q.shape={freqs_q.shape}, freqs_k.shape={freqs_k.shape}", flush=True) # Removed
+        if self.debug_ring:
+            print(f"[RANK {rank} RoPE] Sliced freqs_q.shape={freqs_q.shape}, freqs_k.shape={freqs_k.shape}", flush=True)
 
         # --- Use Alternative RoPE Math ---
         # Original FMS math commented out:
@@ -379,6 +387,9 @@ class RotaryEmbedding(PositionEncoder):
         # Cast back to the original input type (e.g., fp16)
         q_out = q_rotated_float.to(orig_dtype)
         k_out = k_rotated_float.to(orig_dtype)
+
+        if self.debug_ring:
+            print(f"[RANK {rank} RoPE] adjusted_qk complete. q_out={q_out.shape}, k_out={k_out.shape}", flush=True)
 
         if self.partial_rope != 1.0:
             # Ensure the non-rotated part has the same type before concatenating

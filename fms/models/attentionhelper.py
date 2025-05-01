@@ -31,7 +31,8 @@ class BlockData:
 
 # Ring Attention computation logic
 class RingAttentionEngine:
-    def __init__(self, strategy_block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool, group: dist.ProcessGroup):
+    # Add debug_ring flag to init or access it globally/via attn module
+    def __init__(self, strategy_block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool, group: dist.ProcessGroup, debug_ring: bool = False):
         self.attn = attn
         self.ff = ff
         self.ff_norm = ff_norm
@@ -44,6 +45,7 @@ class RingAttentionEngine:
         self.prev_rank = (self.rank - 1 + self.world_size) % self.world_size
         self.next_rank = (self.rank + 1) % self.world_size
         self.strategy_block_size = strategy_block_size # Get the strategy's block size directly
+        self.debug_ring = debug_ring # Store debug flag
 
     # main method
     def forward_full(self, q_shard: Tensor, k_shard: Tensor, v_shard: Tensor, mask_global: Optional[Tensor], x_shard: Tensor, q_global_offset: int, global_seq_len: int) -> Tensor:
@@ -54,6 +56,9 @@ class RingAttentionEngine:
         global_seq_len is the total sequence length across all ranks.
         Returns the computed output shard for the current rank (size strategy_block_size).
         """
+        if self.debug_ring:
+            print(f"[RANK {self.rank} RingEngine] forward_full: q_shard={q_shard.shape}, k_shard={k_shard.shape}, v_shard={v_shard.shape}, x_shard={x_shard.shape}, q_offset={q_global_offset}, global_len={global_seq_len}", flush=True)
+
         T_q_local = q_shard.shape[2]
         if T_q_local == 0: return torch.empty_like(x_shard)
 
@@ -109,6 +114,9 @@ class RingAttentionEngine:
         # Temporary buffer for receiving K, size is fixed to strategy_block_size
         recv_shape = list(args.k_shard.shape)
         recv_shape[2] = self.strategy_block_size
+        if self.debug_ring:
+            print(f"[RANK {args.rank} RingEngine] _compute_max_score loop init: max_score={max_score.shape}, current_k_rank={current_k_rank}, recv_k_buffer={recv_shape}", flush=True)
+
         recv_k = torch.empty(recv_shape, dtype=args.k_shard.dtype, device=device)
 
         # All shards have the same length now
@@ -126,10 +134,16 @@ class RingAttentionEngine:
             # Use expected_recv_len (strategy_block_size) for slicing the *received* data *after* communication
             effective_recv_k = recv_k[:, :, :expected_recv_len, :] if i > 0 else current_k_shard
 
+            if self.debug_ring:
+                print(f"[RANK {args.rank} RingEngine] _compute_max_score iter {i}: Processing K from rank {current_k_rank} (shape={effective_recv_k.shape})", flush=True)
+
             # Compute attention with current K block
             # Mask needs to be sliced using global indices
             mask_slice = args.mask_global[:, :, args.q_global_offset:args.q_global_offset+args.q_shard.shape[2], current_k_global_offset:current_k_global_offset+current_k_len] if args.mask_global is not None else None
             max_score = engine._update_max_attn(args.q_shard, effective_recv_k, mask_slice, q_global_indices, current_k_global_indices, max_score)
+
+            if self.debug_ring:
+                print(f"[RANK {args.rank} RingEngine] _compute_max_score iter {i}: Updated max_score stats: mean={max_score.mean().item():.4f}, max={max_score.max().item():.4f}", flush=True)
 
             # Send current_k_shard, receive into the full buffer
             current_k_shard = self._send_recv_tensor(current_k_shard, recv_k, expected_recv_len)
@@ -154,6 +168,9 @@ class RingAttentionEngine:
         # Temporary buffers for receiving K and V
         recv_k_shape = list(args.k_shard.shape); recv_k_shape[2] = self.strategy_block_size
         recv_v_shape = list(args.v_shard.shape); recv_v_shape[2] = self.strategy_block_size
+        if self.debug_ring:
+            print(f"[RANK {args.rank} RingEngine] _compute_sums loop init: num={num.shape}, den={den.shape}, current_kv_rank={current_kv_rank}", flush=True)
+
         recv_k = torch.empty(recv_k_shape, dtype=args.k_shard.dtype, device=device)
         recv_v = torch.empty(recv_v_shape, dtype=args.v_shard.dtype, device=device)
 
@@ -172,10 +189,16 @@ class RingAttentionEngine:
             effective_recv_k = recv_k[:, :, :expected_recv_len, :] if i > 0 else current_k_shard
             effective_recv_v = recv_v[:, :, :expected_recv_len, :] if i > 0 else current_v_shard
 
+            if self.debug_ring:
+                print(f"[RANK {args.rank} RingEngine] _compute_sums iter {i}: Processing K/V from rank {current_kv_rank} (K shape={effective_recv_k.shape}, V shape={effective_recv_v.shape})", flush=True)
+
             # Compute attention with current K, V blocks
             # Mask needs to be sliced using global indices
             mask_slice = args.mask_global[:, :, args.q_global_offset:args.q_global_offset+args.q_shard.shape[2], current_kv_global_offset:current_kv_global_offset+current_kv_len] if args.mask_global is not None else None
             num, den = engine._update_totals(args.q_shard, effective_recv_k, effective_recv_v, mask_slice, q_global_indices, current_k_global_indices, final_max_score, num, den)
+
+            if self.debug_ring:
+                print(f"[RANK {args.rank} RingEngine] _compute_sums iter {i}: Updated num stats: mean={num.mean().item():.4f}, max={num.max().item():.4f} | den stats: mean={den.mean().item():.4f}, max={den.max().item():.4f}", flush=True)
 
             # Send current K, V shards, receive into buffers sliced for the *expected incoming length*
             recv_k_slice_for_irecv = recv_k[:, :, :expected_recv_len, :]
@@ -189,6 +212,9 @@ class RingAttentionEngine:
 
     """ final output """
     def compute_block_output(self, x: Tensor, num: Tensor, den: Tensor) -> Tensor:
+
+        if self.debug_ring:
+            print(f"[RANK {self.rank} RingEngine] compute_block_output: Final num/den stats before division: num_mean={num.mean().item():.4f}, den_mean={den.mean().item():.4f}", flush=True)
 
         B, q_len, E = x.shape; H, D_v = num.shape[1], num.shape[3]
         attn_out_h = num / (den + 1e-6) # Add epsilon for stability
@@ -207,6 +233,9 @@ class RingAttentionEngine:
 
         send_tensor_c = send_tensor.contiguous() # Ensure contiguous before sending
 
+        if self.debug_ring:
+            print(f"[RANK {self.rank} RingEngine] _send_recv_tensor: Sending to {self.next_rank}, Receiving from {self.prev_rank}. Tensor shape: {send_tensor_c.shape}", flush=True)
+
         if self.rank % 2 == 0:
             dist.send(send_tensor_c, self.next_rank, group=self.group)
             # Receive into the correctly sized slice
@@ -215,6 +244,9 @@ class RingAttentionEngine:
             # Receive into the correctly sized slice
             dist.recv(recv_buffer_slice, self.prev_rank, group=self.group)
             dist.send(send_tensor_c, self.next_rank, group=self.group)
+
+        if self.debug_ring:
+            print(f"[RANK {self.rank} RingEngine] _send_recv_tensor: Communication complete.", flush=True)
 
         # Return the relevant slice of the buffer
         return recv_buffer_slice
@@ -231,6 +263,9 @@ class RingAttentionEngine:
         recv_k_buf_c = recv_k_buf.contiguous() # Ensure contiguous for recv (already sliced)
         recv_v_buf_c = recv_v_buf.contiguous() # Ensure contiguous for recv (already sliced)
 
+        if self.debug_ring:
+            print(f"[RANK {self.rank} RingEngine] _send_recv_kv: Sending K/V to {self.next_rank}, Receiving from {self.prev_rank}. K shape: {send_k_c.shape}, V shape: {send_v_c.shape}", flush=True)
+
         if self.rank % 2 == 0:
             dist.send(send_k_c, self.next_rank, group=self.group)
             dist.send(send_v_c, self.next_rank, group=self.group)
@@ -241,6 +276,9 @@ class RingAttentionEngine:
             dist.recv(recv_v_buf_c, self.prev_rank, group=self.group)
             dist.send(send_k_c, self.next_rank, group=self.group)
             dist.send(send_v_c, self.next_rank, group=self.group)
+
+        if self.debug_ring:
+            print(f"[RANK {self.rank} RingEngine] _send_recv_kv: Communication complete.", flush=True)
 
         return recv_k_buf, recv_v_buf
 
@@ -282,6 +320,10 @@ class RingAttentionEngine:
             # Mask shape could be [1, 1, q_len, k_len] or [B, 1/H, q_len, k_len]
             scores = scores.masked_fill(final_mask_bool, -torch.inf)
 
+        # Debug 17 (partial): Check scores for NaNs/Infs
+        if self.debug_ring and (torch.isnan(scores).any() or torch.isinf(scores).any()):
+             print(f"[RANK {self.rank} RingEngine] _raw_attention: Scores contain NaNs or Infs AFTER masking!", flush=True)
+
         return scores
 
     def _init_values(self, q: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -296,6 +338,10 @@ class RingAttentionEngine:
 
     def _update_max_attn(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, current_max_score: Tensor) -> Tensor:
         attn_scores = self._raw_attention(q, k, mask, q_indices, k_indices)
+        # Debug 18 (partial): Print score stats
+        if self.debug_ring:
+            print(f"[RANK {self.rank} RingEngine] _update_max_attn: Raw scores stats: mean={attn_scores.mean().item():.4f}, std={attn_scores.std().item():.4f}, max={attn_scores.max().item():.4f}", flush=True)
+
         block_max = attn_scores.masked_fill(attn_scores == -torch.inf, torch.finfo(attn_scores.dtype).min).amax(dim=-1, keepdim=True)
         return torch.maximum(current_max_score, block_max)
 
@@ -320,6 +366,10 @@ class RingAttentionEngine:
         stable_scores = attn_scores - safe_max_score
         # Replace potential NaN from (-inf - (-inf)) with -inf before exp
         stable_scores = torch.nan_to_num(stable_scores, nan=-torch.inf)
+
+        # Debug 17/18 (partial): Check stable scores
+        if self.debug_ring and (torch.isnan(stable_scores).any() or torch.isinf(stable_scores).any()):
+             print(f"[RANK {self.rank} RingEngine] _update_totals: Stable scores contain NaNs or Infs BEFORE exp!", flush=True)
 
         stable_scores = torch.clamp(stable_scores, max=10.0, min = -10.0)
 

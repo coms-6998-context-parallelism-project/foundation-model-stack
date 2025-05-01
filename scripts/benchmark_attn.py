@@ -38,6 +38,8 @@ def run_inference_benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
     # Pass the flag down, even if inference.py doesn't use it yet
     if config.get("print_response", False):
         base_command.append("--print_response")
+    if config.get("debug_ring", False):
+        base_command.append("--print_response")
 
     if config["dtype"]:
         base_command.extend(["--default_dtype", config["dtype"]])
@@ -125,6 +127,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", nargs='+', type=int, default=[256], help="List of max_new_tokens values to test")
     parser.add_argument("--print_response", action="store_true", help="Print the generated response captured from inference.py stdout")
     parser.add_argument("--ring_block_size", type=int, default=4096, help="Block size for Ring Attention runs")
+    parser.add_argument("--debug_ring", action="store_true", help="Enable detailed ring attention debugging prints in inference.py")
     # Add other parameters you want to vary, e.g., context lengths (would require prompt generation)
     # parser.add_argument("--context_lengths", nargs='+', type=int, default=[512], help="List of context lengths to test")
 
@@ -146,6 +149,7 @@ if __name__ == "__main__":
                 "attn_type": attn_type,
                 "max_new_tokens": tokens,
                 "print_response": args.print_response, # Store the flag in the config
+                "debug_ring": args.debug_ring, # Store the debug flag
                 "ring_block_size": args.ring_block_size if attn_type == "ring" else None, # Only relevant for ring
                 # Add other varying params here, e.g. "context_length": length
             }

@@ -135,6 +135,11 @@ parser.add_argument(
     action="store_true",
     help="Print the generated response text to stdout",
 )
+parser.add_argument(
+    "--debug_ring",
+    action="store_true",
+    help="Enable detailed ring attention debugging prints",
+)
 
 
 args = parser.parse_args()
@@ -166,6 +171,10 @@ if args.deterministic:
 
 if args.distributed:
     dist.init_process_group()
+    # Debug 1 (from inference script): Print rank and world size at the start
+    if args.debug_ring:
+        print(f"[RANK {rank}] Initialized via inference script. World size: {dist.get_world_size()}", flush=True)
+
 
 print("loading model")
 
@@ -197,6 +206,21 @@ model = get_model(
     fused_weights=not args.unfuse_weights,
     **get_model_kwargs, # Pass ring_block_size if needed
 )
+
+# Debug 11: Log attention type being used at init
+if args.debug_ring:
+    attn_type_config = getattr(model.config, 'attn_type', 'N/A') # Example access, might vary
+    print(f"[RANK {rank}] Config attention type: {attn_type_config}", flush=True)
+# Debug 12: Dump selected attention module class name
+if args.debug_ring and hasattr(model, 'layers') and len(model.layers) > 0 and hasattr(model.layers[0], 'attn'):
+    print(f"[RANK {rank}] Using attention class: {type(model.layers[0].attn).__name__}", flush=True)
+# Debug 13: Print per-layer rotary embedding device and shape
+if args.debug_ring and hasattr(model, 'rot_emb') and hasattr(model.rot_emb, 'cached_freqs'):
+    dev_idx = device.index if device.type == 'cuda' else 0
+    freq_shape = model.rot_emb.cached_freqs.get(dev_idx, {}).get(1, torch.empty(0)).shape # Get shape for alpha=1 if exists
+    print(f"[RANK {rank}] Layer 0 rotary_emb.cached_freqs[alpha=1]: {freq_shape} on device {dev_idx}", flush=True)
+# Debug 14: Check model is in eval mode
+if args.debug_ring: print(f"[RANK {rank}] Model eval mode: {not model.training}", flush=True)
 
 tokenizer = tokenizers.get_tokenizer(args.tokenizer)
 model.eval()
@@ -243,11 +267,20 @@ max_len = max([len(prompt) for prompt in [prompt1, prompt2]])
 
 if args.batch_input:
     ids = [prompt1, prompt2]
+    # Debug 2: Print input prompt shape and contents at rank 0 (before padding)
+    if args.debug_ring and rank == 0:
+        print(f"[RANK 0] Initial input prompts (decoded): {[tokenizer.decode(p) for p in ids]}", flush=True)
     ids, padding_kwargs = pad_input_ids(ids, min_pad_length=args.min_pad_length)
+    # Debug 3: Verify all ranks have the same tokenizer output (hash check after padding)
+    if args.debug_ring:
+        print(f"[RANK {rank}] Padded input_ids hash: {hash(str(ids.tolist()))}", flush=True)
 else:
     ids = prompt1
     if args.min_pad_length != 0:
         ids, padding_kwargs = pad_input_ids([ids], min_pad_length=args.min_pad_length)
+        # Debug 2 & 3 for single input
+        if args.debug_ring and rank == 0: print(f"[RANK 0] Initial input_ids (padded): {ids.tolist()}", flush=True)
+        if args.debug_ring: print(f"[RANK {rank}] Padded input_ids hash: {hash(str(ids.tolist()))}", flush=True)
     else:
         padding_kwargs = None
 
@@ -291,6 +324,7 @@ def infer(use_cache, do_sample):
 
     generate_kwargs = {
         "attn_algorithm": args.attn_algorithm, # Pass the attention algorithm
+        "debug_ring": args.debug_ring, # Pass the debug flag
     }
     if args.attn_algorithm == "ring" and args.ring_block_size is not None:
         generate_kwargs["ring_block_size"] = args.ring_block_size

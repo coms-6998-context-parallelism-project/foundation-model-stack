@@ -265,12 +265,12 @@ def generate(
         # --- Ring Attention Length Check ---
         # Check if the next token would exceed the max length allowed by Ring Attention's fixed blocks
         strategy = getattr(model, "distributed_strategy", None)
-        if isinstance(strategy, RingAttentionStrategy):
-            max_ring_len = strategy.world_size * strategy.block_size
-            if result.shape[1] >= max_ring_len:
-                rank, _ = distributed.rank_and_world(strategy.group)
-                # print(f"[rank{rank}] generate: Stopping generation. Sequence length {result.shape[1]} reached Ring Attention limit {max_ring_len}.") # Removed
-                break
+        # if isinstance(strategy, RingAttentionStrategy):
+        #     max_ring_len = strategy.world_size * strategy.block_size
+        #     if result.shape[1] >= max_ring_len:
+        #         rank, _ = distributed.rank_and_world(strategy.group)
+        #         # print(f"[rank{rank}] generate: Stopping generation. Sequence length {result.shape[1]} reached Ring Attention limit {max_ring_len}.") # Removed
+        #         break
         # --- End Ring Attention Length Check ---
 
         input_ids = next_input[:, -max_seq_len:]

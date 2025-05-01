@@ -1,5 +1,7 @@
 #!/bin/bash
 #
+# This script runs the benchmark_attn.py script, potentially in comparison mode.
+
 #SBATCH --account=edu             # Your account name
 #SBATCH --job-name=llama_benchmark # Job name appearing in squeue
 #SBATCH -N 1                      # Requesting one node
@@ -7,12 +9,12 @@
 #SBATCH --time=00:30:00           # Max job time (adjust based on expected benchmark duration)
 #SBATCH --mem=40G                 # Memory request (adjust if needed)
 #SBATCH --gres=gpu:2              # Requesting 2 GPUs (needed for nproc_per_node=2 for ring)
-#SBATCH --output=benchmark_%j.out # Standard output file (%j expands to job ID)
+#SBATCH --output=benchmark_compare_%j.out # Standard output file (%j expands to job ID) - Changed name
 
 echo "========================================================"
 echo "Starting Benchmark Job on $(hostname) at $(date)"
 echo "SLURM Job ID: $SLURM_JOB_ID"
-echo "Arguments passed to Slurm script: $@"
+echo "Arguments passed to Python script: $@" # No longer shifting args here
 echo "========================================================"
 
 # --- Environment Setup ---
@@ -48,7 +50,7 @@ python scripts/benchmark_attn.py \
     --device_type cuda \
     --dtype fp16 \
     --print_response \
-    "$@" # Pass along arguments like --max_new_tokens, --attn_types etc.
+    "$@" # Pass along arguments like --max_new_tokens, --attn_types_to_compare etc.
 
 echo "========================================================"
 echo "Benchmark Job finished at $(date)"

@@ -111,17 +111,19 @@ class ThreadedRingAttentionEngine:
         block_output = engine.compute_block_output(args.x_block, final_num, final_den)
         args.result_buffer[args.q_start] = block_output
 
-        # Store debug info if enabled
-        if engine.debug_mode and args.debug_buffer is not None:
-            block_debug_info['q_block'] = args.q_block.clone().detach().cpu() # Example: clone, detach, move to CPU
-            block_debug_info['k_local'] = args.k_local.clone().detach().cpu()
-            block_debug_info['v_local'] = args.v_local.clone().detach().cpu()
-            block_debug_info['x_block'] = args.x_block.clone().detach().cpu()
-            block_debug_info['final_max_score'] = final_max_score.clone().detach().cpu()
-            block_debug_info['final_num'] = final_num.clone().detach().cpu()
-            block_debug_info['final_den'] = final_den.clone().detach().cpu()
-            args.debug_buffer[args.block_id] = block_debug_info # Store this block's info
+        # Retrieve additional debug info logged within compute_block_output
+        attn_out_raw_debug = block_output._debug_extras if hasattr(block_output, '_debug_extras') else None
+        if hasattr(block_output, '_debug_extras'): del block_output._debug_extras # Clean up temporary attribute
 
+        # Store debug info if enabled, using the standardized keys
+        if engine.debug_mode and args.debug_buffer is not None:
+            block_id = args.block_id
+            args.debug_buffer.update({
+                f"q_local_r{block_id}": args.q_block.clone().detach().cpu(),
+                f"k_local_r{block_id}": args.k_local.clone().detach().cpu(),
+                f"v_local_r{block_id}": args.v_local.clone().detach().cpu(),
+            })
+            if attn_out_raw_debug is not None: args.debug_buffer[f"attn_out_raw_r{block_id}"] = attn_out_raw_debug # Add attn_out_raw
 
     """ compute max scores for stability (first flash pass) """
     def compute_max_score(self, args: BlockData, initial_max_score: Tensor) -> Tensor:

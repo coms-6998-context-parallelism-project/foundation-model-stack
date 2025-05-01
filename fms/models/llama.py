@@ -143,13 +143,12 @@ class LLaMABlock(nn.Module):
         attn_algorithm=None,
         distributed_strategy: Optional[DistributedStrategy] = None,
     ):
-        # --- Debugging Flag ---
-        enable_debug_info = True # Set to True to collect debug info
-        # ----------------------
-        debug_info = {} # Initialize debug info dictionary
+        enable_debug_info = True  # Set to True to collect debug info
+        debug_info = {}
 
         if isinstance(distributed_strategy, RingAttentionStrategy):
-            # Path for RingAttentionStrategy
+            # --- RING ATTENTION PATH ---
+            rank = dist.get_rank() 
             output_ring = self._forward_ring_attention(
                 x,
                 mask=mask,
@@ -158,59 +157,56 @@ class LLaMABlock(nn.Module):
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
                 strategy=distributed_strategy,
-                enable_debug_info=enable_debug_info, # Pass the flag
+                enable_debug_info=enable_debug_info,
+                rank = rank
             )
-            # Unpack output from _forward_ring_attention
+
             if use_cache:
                 x, cache, debug_ring = output_ring
             else:
-                # Expects (tensor, None, debug_dict or None) when use_cache is False
                 x, _, debug_ring = output_ring
                 cache = None
-            debug_info['ring'] = debug_ring
 
-            # --- If RingAttentionStrategy, also run Engine path for comparison ---
+            # No nested dict expected — flatten directly
+            if enable_debug_info and debug_ring:
+                for k, v in debug_ring.items():
+                    debug_info[f"{k}_r{dist.get_rank() if dist.is_initialized() else 0}"] = v
+
+            # --- ENGINE PATH FOR COMPARISON ---
             if enable_debug_info:
-                # Gather inputs needed for the engine path
-                # Note: mask and position_ids are typically not sharded
                 x_gathered = distributed_strategy.gather_output(x)
-                mask_gathered = mask
-                position_ids_gathered = position_ids
-                # past_key_value_state might be sharded depending on TP strategy,
-                # but for RingAttention comparison, we assume it's either None or compatible.
-                # For a fair comparison, force use_cache=False for engine path too.
-                past_key_value_state_gathered = past_key_value_state
-
-                # Run the engine path on gathered data
                 output_engine_gathered = self._forward_engine_attention(
                     x_gathered,
-                    mask=mask_gathered,
-                    position_ids=position_ids_gathered,
-                    past_key_value_state=past_key_value_state_gathered,
-                    use_cache=False, # Force no cache for comparison
+                    mask=mask,
+                    position_ids=position_ids,
+                    past_key_value_state=past_key_value_state,
+                    use_cache=False,
                     is_causal_mask=is_causal_mask,
-                    enable_debug_info=enable_debug_info, # Pass the flag
+                    enable_debug_info=True,
                 )
-                # Unpack engine output (we only need the debug info here)
                 _, _, debug_engine = output_engine_gathered
-                debug_info['engine'] = debug_engine
 
-                # Compare debug info if both were collected
-                if 'ring' in debug_info and 'engine' in debug_info:
-                    diffs = self._diff_debug_dicts(debug_info['ring'], debug_info['engine'])
-                    rank = dist.get_rank() if dist.is_initialized() else 0
-                    print(f"\n--- [Rank {rank}] Debug Info Diffs in LLaMABlock {self.layer_index} (Gathered Ring vs Engine) ---")
-                    # Iterate and print each formatted string value to respect newlines
-                    for key, formatted_string in diffs.items(): # Ensure this loop is active
-                        print(formatted_string)
-                    print(f"--- Exiting after printing debug diffs on Rank {rank}, Layer {self.layer_index} ---")
-                    # Ensure all ranks exit if rank 0 finds a mismatch
-                    if dist.is_initialized():
-                        dist.barrier() # Wait for other ranks
-                    exit(0) # Exit cleanly after printing diffs
-            # ---------------------------------------------------------------------
+                if debug_engine:
+                    for k, v in debug_engine.items():
+                        debug_info[k] = v
+
+                # --- DEBUG DIFF ---
+                diffs = self._diff_debug_dicts(
+                    {k: v for k, v in debug_info.items() if k.startswith("ring")},
+                    {k: v for k, v in debug_info.items() if k.startswith("engine")},
+                )
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                print(f"\n--- [Rank {rank}] Debug Info Diffs in LLaMABlock {self.layer_index} ---")
+                for key, formatted_string in diffs.items():
+                    print(formatted_string)
+                print(f"--- Exiting after debug diff in Rank {rank}, Layer {self.layer_index} ---")
+
+                if dist.is_initialized():
+                    dist.barrier()
+                exit(0)
+
         else:
-            # Path for other strategies (including NoOpStrategy, which uses RingAttentionEngine)
+            # --- ENGINE-ONLY PATH ---
             output_engine = self._forward_engine_attention(
                 x,
                 mask=mask,
@@ -218,123 +214,134 @@ class LLaMABlock(nn.Module):
                 past_key_value_state=past_key_value_state,
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
-                enable_debug_info=enable_debug_info, # Pass the flag
+                enable_debug_info=enable_debug_info,
             )
-            # Unpack output from _forward_engine_attention
-            if use_cache: # If caching, expect (tensor, cache_tuple, debug_dict)
+
+            if use_cache:
                 x, cache, debug_engine = output_engine
             else:
-                # Expects (tensor, None, debug_dict or None) when use_cache is False
-                x, _, debug_engine = output_engine # Unpack, ignore cache (which is None)
+                x, _, debug_engine = output_engine
                 cache = None
-            debug_info['engine'] = debug_engine
 
-        # Optional: diff the debug dicts if both present (for debugging fallback behavior, etc.)
-        # This comparison logic might need adjustment depending on when/how you run both paths
-        if 'ring' in debug_info and 'engine' in debug_info:
-            debug_info['diff'] = self._diff_debug_dicts(debug_info['ring'], debug_info['engine'])
+            if enable_debug_info and debug_engine:
+                for k, v in debug_engine.items():
+                    debug_info[f"engine_{k}_r{dist.get_rank() if dist.is_initialized() else 0}"] = v
 
-        # Return based on use_cache, matching expected signature by the caller (_helper)
-        # We discard the debug_info here for the standard return path.
-        # If debug_info needs to be propagated further up, the _helper loop needs modification.
         return (x, cache) if use_cache else x
+
+
 
     def _diff_debug_dicts(self, d1, d2):
         diffs = {}
-        for key in d1.keys() & d2.keys():
-            diff_lines = [f"--- Key: {key} ---",
-                          f"          {'Shape':<25} {'Dtype':<15} {'First 5 Vals'}"] # Header
-            if isinstance(d1[key], torch.Tensor) and isinstance(d2[key], torch.Tensor):
-                # Print shapes and first few values
-                ring_vals_raw = d1[key].flatten()[:5].tolist() if d1[key].numel() > 0 else []
-                engine_vals_raw = d2[key].flatten()[:5].tolist() if d2[key].numel() > 0 else []
-                # Round values
-                ring_vals_rounded = [f"{v:.4f}" for v in ring_vals_raw]
-                engine_vals_rounded = [f"{v:.4f}" for v in engine_vals_raw]
 
-                diff_lines.append(f"  Ring:   {str(d1[key].shape):<25} {str(d1[key].dtype):<15} {ring_vals_rounded}")
-                diff_lines.append(f"  Engine: {str(d2[key].shape):<25} {str(d2[key].dtype):<15} {engine_vals_rounded}")
-            elif isinstance(d1[key], tuple) and isinstance(d2[key], tuple):
-                # Print shapes and first few values for each tensor in the tuple
+        def normalize(key, prefix):
+            # Strip prefix and collapse repeated _rX at the end
+            base = key[len(prefix):]
+            if base.count("_r") > 1:  # e.g., "final_num_r0_r0" -> "final_num_r0"
+                parts = base.split("_r")
+                base = "_r".join(parts[:2])
+            return base
+
+        # Build reverse maps
+        ring_map = {normalize(k, "ring_"): k for k in d1 if k.startswith("ring_")}
+        engine_map = {normalize(k, "engine_"): k for k in d2 if k.startswith("engine_")}
+
+        shared = ring_map.keys() & engine_map.keys()
+        missing_ring = sorted(set(engine_map.keys()) - set(ring_map.keys()))
+        missing_engine = sorted(set(ring_map.keys()) - set(engine_map.keys()))
+
+        if missing_ring:
+            print("Missing in Ring:")
+            for k in missing_ring:
+                print(f"  {engine_map[k]}")
+
+        if missing_engine:
+            print("Missing in Engine:")
+            for k in missing_engine:
+                print(f"  {ring_map[k]}")
+
+        for suffix in sorted(shared):
+            rk, ek = ring_map[suffix], engine_map[suffix]
+            val1, val2 = d1[rk], d2[ek]
+
+            diff_lines = [f"--- Key Suffix: {suffix} ---",
+                        f"        {'Shape':<25} {'Dtype':<15} {'First 5 Vals'}"]
+
+            if isinstance(val1, torch.Tensor) and isinstance(val2, torch.Tensor):
+                v1 = [f"{v:.4f}" for v in val1.flatten()[:5].tolist()]
+                v2 = [f"{v:.4f}" for v in val2.flatten()[:5].tolist()]
+                diff_lines.append(f"Ring:   {str(val1.shape):<25} {str(val1.dtype):<15} {v1}")
+                diff_lines.append(f"Engine: {str(val2.shape):<25} {str(val2.dtype):<15} {v2}")
+
+            elif isinstance(val1, tuple) and isinstance(val2, tuple):
                 diff_lines.append("  (Comparing tensors within tuples)")
-                for i, (a, b) in enumerate(zip(d1[key], d2[key])):
+                for i, (a, b) in enumerate(zip(val1, val2)):
                     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-                        ring_vals_raw = a.flatten()[:5].tolist() if a.numel() > 0 else []
-                        engine_vals_raw = b.flatten()[:5].tolist() if b.numel() > 0 else []
-                        # Round values
-                        ring_vals_rounded = [f"{v:.4f}" for v in ring_vals_raw]
-                        engine_vals_rounded = [f"{v:.4f}" for v in engine_vals_raw]
-
-                        diff_lines.append(f"    Tuple[{i}] Ring:   {str(a.shape):<25} {str(a.dtype):<15} {ring_vals_rounded}")
-                        diff_lines.append(f"    Tuple[{i}] Engine: {str(b.shape):<25} {str(b.dtype):<15} {engine_vals_rounded}")
+                        a_flat = [f"{v:.4f}" for v in a.flatten()[:5].tolist()]
+                        b_flat = [f"{v:.4f}" for v in b.flatten()[:5].tolist()]
+                        diff_lines.append(f"  Tuple[{i}] Ring:   {str(a.shape):<25} {str(a.dtype):<15} {a_flat}")
+                        diff_lines.append(f"  Tuple[{i}] Engine: {str(b.shape):<25} {str(b.dtype):<15} {b_flat}")
                     else:
-                        diff_lines.append(f"    Tuple[{i}]: Non-tensor elements or mismatch. Ring type: {type(a)}, Engine type: {type(b)}")
+                        diff_lines.append(f"  Tuple[{i}]: Incompatible types: Ring={type(a)}, Engine={type(b)}")
             else:
-                diff_lines.append(f"  Non-tensor/tuple or structure mismatch. Ring type: {type(d1[key])}, Engine type: {type(d2[key])}")
-            diffs[key] = "\n".join(diff_lines)
+                diff_lines.append(f"  Mismatched types: Ring={type(val1)}, Engine={type(val2)}")
+
+            diffs[suffix] = "\n".join(diff_lines)
+
         return diffs
 
+
+
+
     def _gather_debug_tensors(self, data, strategy):
-        """Recursively gather tensors within a nested structure using explicit all_gather."""
+        """Recursively gathers tensors (if sharded) and returns CPU copy."""
         if isinstance(data, torch.Tensor):
-            # Use the strategy to gather if world_size > 1
-            if isinstance(strategy, RingAttentionStrategy) and strategy.world_size > 1:
-                # --- Add this check ---
-                # rank = dist.get_rank() if dist.is_initialized() else 0
-                # print(f"[Rank {rank}] _gather_debug_tensors: Detected RingAttentionStrategy, attempting gather for shape {data.shape}")
-                try:
-                    # Determine the sequence dimension to gather along
-                    gather_dim = -1
-                    # Assume [B, T_shard, D] or [B, H, T_shard, D_head]
-                    if data.ndim == 3: # Assume [B, T_shard, D]
-                        gather_dim = 1
-                    elif data.ndim == 4: # Assume [B, H, T_shard, D_head]
-                        gather_dim = 2
+            try:
+                if isinstance(strategy, RingAttentionStrategy) and strategy.world_size > 1:
+                    if data.ndim == 3:
+                        dim = 1
+                    elif data.ndim == 4:
+                        dim = 2
                     else:
-                        # Cannot determine sharded dimension, return CPU copy
-                        return data.clone().detach().cpu()
+                        return data.detach().cpu()
+                    return strategy.gather_tensor(data, dim=dim).detach().cpu()
+            except Exception as e:
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                print(f"[Rank {rank}] Warning: gather failed: {e}")
+            return data.detach().cpu()
 
-                    # Use the strategy's gather method
-                    gathered_tensor = strategy.gather_tensor(data, dim=gather_dim)
-                    # Return a CPU copy for comparison
-                    return gathered_tensor.clone().detach().cpu()
-
-                except Exception as e:
-                    rank = dist.get_rank() if dist.is_initialized() else 0
-                    print(f"Warning [Rank {rank}]: Could not gather tensor using strategy for diff: {e}, returning original shape {data.shape}.")
-                    # Return CPU copy of original on failure
-                    return data.clone().detach().cpu()
-            else:
-                # --- Add this check ---
-                # rank = dist.get_rank() if dist.is_initialized() else 0
-                # print(f"[Rank {rank}] _gather_debug_tensors: Strategy is {type(strategy)} or world_size=1, returning CPU copy for shape {data.shape}")
-                # Not using RingAttentionStrategy or world_size is 1, just return CPU copy
-                return data.clone().detach().cpu()
         elif isinstance(data, dict):
             return {k: self._gather_debug_tensors(v, strategy) for k, v in data.items()}
+
         elif isinstance(data, (list, tuple)):
-            # Handle tuples/lists of tensors (like QKV)
-            gathered_items = [self._gather_debug_tensors(item, strategy) for item in data]
-            return type(data)(gathered_items)
-        else:
-            # For non-tensor types, just return them (they are likely scalars or strings)
-            return data
+            return type(data)(self._gather_debug_tensors(v, strategy) for v in data)
+
+        return data  # Scalar or unknown type
+
 
     def _forward_ring_attention(
-        self, x, *, mask, position_ids, past_key_value_state, use_cache, is_causal_mask, strategy, enable_debug_info: bool
+        self,
+        x,
+        *,
+        mask,
+        position_ids,
+        past_key_value_state,
+        use_cache,
+        is_causal_mask,
+        strategy,
+        enable_debug_info: bool,
+        rank = 0
     ):
-        # Note: This debug dict is local to this helper, not the main forward's debug_info
         debug = {}
         residual = x
         x_norm = self.ln(x)
-        debug['x_norm'] = x_norm
 
         ring_helper = RingAttentionHelper(
             attn_module=self.attn,
             layer_idx=self.layer_index,
             strategy=strategy,
             use_cache=use_cache,
-            debug_mode=enable_debug_info, # Pass flag to helper
+            debug_mode=enable_debug_info,
         )
 
         ring_output = ring_helper.forward(
@@ -343,19 +350,17 @@ class LLaMABlock(nn.Module):
             position_ids=position_ids,
             past_key_value_state=past_key_value_state,
             is_causal_mask=is_causal_mask,
+            rank = rank
         )
-        
-        # Unpack based on whether debug info was returned
+
         if enable_debug_info:
             attn_out, cache, ring_debug_data = ring_output
-            # --- Flatten ring_helper_internals into debug dict ---
             if ring_debug_data:
                 for k, v in ring_debug_data.items():
-                    debug[f'ring_{k}'] = v # Prefix with 'ring_'
-            # -----------------------------------------------------
+                    debug[f"ring_{k}"] = v
         else:
             attn_out, cache = ring_output
-        debug['attn_out'] = attn_out # Store the tensor output regardless
+
 
         if self.config.p_dropout != 0:
             attn_out = self.dropout(attn_out)
@@ -363,25 +368,30 @@ class LLaMABlock(nn.Module):
 
         residual = x
         x = self.ff_ln(x)
-        debug['ff_ln'] = x
         x = self.ff_sub_layer(x)
-        debug['ff_out'] = x
+
         if self.config.p_dropout != 0:
             x = self.dropout(x)
         x = x + residual
-        debug['final_out'] = x
 
         return x, cache, debug
-    
+
+
 
 
     def _forward_engine_attention(
-        self, x, *, mask, position_ids, past_key_value_state, use_cache, is_causal_mask, enable_debug_info: bool
+        self,
+        x,
+        *,
+        mask,
+        position_ids,
+        past_key_value_state,
+        use_cache,
+        is_causal_mask,
+        enable_debug_info: bool
     ):
-        # Note: This debug dict is local to this helper, not the main forward's debug_info
         debug = {}
         x_norm = self.ln(x)
-        debug['x_norm'] = x_norm
 
         queries, keys, values = self.compute_local_qkv_and_rope(
             self.attn,
@@ -393,17 +403,14 @@ class LLaMABlock(nn.Module):
             past_key_value_state=past_key_value_state,
             is_self=True,
         )
-        debug['qkv'] = (queries, keys, values)
 
         if use_cache and past_key_value_state and past_key_value_state[0].numel() > 0:
             keys = torch.cat((past_key_value_state[0], keys), dim=2)
             values = torch.cat((past_key_value_state[1], values), dim=2)
-        debug['concat_kv'] = (keys, values)
 
         expansion = self.attn.nheads // self.attn.kvheads
         keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
         values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
-        debug['expanded_kv'] = (keys_e, values_e)
 
         engine = ThreadedRingAttentionEngine(
             block_size=32,
@@ -411,37 +418,29 @@ class LLaMABlock(nn.Module):
             ff=self.ff_sub_layer,
             ff_norm=self.ff_ln,
             is_causal=is_causal_mask and mask is None,
-            debug_mode=enable_debug_info, # Pass flag to engine
+            debug_mode=enable_debug_info,
         )
 
         engine_output = engine.forward_full(
-            q_global=queries, # Pass original x for residual inside engine
+            q_global=queries,
             k_global=keys_e,
             v_global=values_e,
             mask_global=mask,
             x_global=x,
         )
-        debug['final_out'] = x
 
-        # Unpack based on whether debug info was returned
         if enable_debug_info:
             x, engine_debug_data = engine_output
-            # --- Flatten engine_internals into debug dict ---
             if engine_debug_data:
-                # engine_debug_data is Dict[block_id, Dict[str, Tensor]]
-                for block_id, block_data in engine_debug_data.items():
-                    for k, v in block_data.items():
-                        # Prefix with 'engine_' and include block_id
-                        debug[f'engine_{k}_b{block_id}'] = v
-            # ------------------------------------------------
+                for k, v in engine_debug_data.items():
+                    debug[f"engine_{k}"] = v
         else:
             x = engine_output
-        debug['final_out'] = x # Store the tensor output regardless
+
 
         cache = (keys, values) if use_cache else None
         return x, cache, debug
 
-  
 
 
 class LLaMA(nn.Module):

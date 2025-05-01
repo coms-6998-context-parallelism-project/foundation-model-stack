@@ -24,7 +24,7 @@ TEST_ATTN_TYPE="ring"     # The implementation to test against the baseline
 # --- Default Paths (relative to repo root) ---
 # !!! ADJUST THESE PATHS to match your repository structure !!!
 DEFAULT_MODEL_REL_PATH="llama-hf" # Updated path
-DEFAULT_TOKENIZER_REL_PATH="llama-hf/tokenizer.model" # Updated path, assuming tokenizer is inside llama-hf
+DEFAULT_TOKENIZER_REL_PATH="llama-hf" # Updated path, assuming tokenizer is inside llama-hf
 
 # --- Set Current Paths ---
 if [[ "$RUN_LOCATION" == "insomnia" ]]; then

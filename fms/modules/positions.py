@@ -2,6 +2,9 @@ import math
 from typing import MutableMapping, Optional, Tuple
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from fms import distributed # Import for rank_and_world in fallback
 
 
 class PositionEncoder:
@@ -134,6 +137,9 @@ class RotaryEmbedding(PositionEncoder):
         self.ntk_scaling = ntk_scaling
         self.max_seq_len = max_seq_len
 
+        # --- Prompt 17: Flag to bypass RoPE ---
+        self.bypass_rope = False # Set to True to temporarily disable RoPE
+
     def _alpha(self, seq_len) -> int:
         if not self.ntk_scaling:
             return 1
@@ -159,7 +165,7 @@ class RotaryEmbedding(PositionEncoder):
         # `2**i` where i is the ratio of actual vs initial max seq len. (i.e. 2,
         # 4, 8, ... as needed)
         alpha = self._alpha(max_seq_len)
-        dev_idx = device.index
+        dev_idx = device.index if device.type == 'cuda' else 0 # Handle CPU case
 
         if dev_idx not in self.cached_freqs:
             self.cached_freqs[dev_idx] = {}
@@ -218,70 +224,164 @@ class RotaryEmbedding(PositionEncoder):
         return cur_freqs.view(*shape, 2)
 
     def adjusted_qk(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        past_kv_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache=False,
+        self, q, k, position_ids=None, past_kv_state=None, use_cache=False, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Args
-        ----
-        q : torch.Tensor
-            Embedded query tensor, expected size is B x S x H x Eh
-        k : torch.Tensor
-            Embedded query tensor, expected size is B x S x H x Eh
-        position_ids : Optional[torch.LongTensor]
-            The position of each of the tokens encoded in q and k. This is important in
-            kv-caching and left-padding situations, for which the rotation to be applied might
-            not always be the pre-cached position 0...S. For kv-caching without dynamic batching
-            or variable per-row left padding position_ids is shared for all the batch.
+        --- Prompt 17: Check bypass flag ---
         """
+        if self.bypass_rope:
+            return q, k
+        """
+        Applies rotary position embedding to query and key tensors.
+
+        Expects input tensors q, k to have shape [batch_size, seq_len, nheads, head_dim].
+
+        Args:
+            q: Query tensor.
+            k: Key tensor.
+            position_ids: Positions of tokens in the sequence, shape [batch_size, seq_len].
+                          MUST represent GLOBAL positions if used in Ring Attention context.
+                          If None, attempts to calculate based on seq_len and cache.
+            past_kv_state: Optional tuple containing past keys and values for caching.
+            use_cache: Flag indicating if caching is enabled.
+
+        Returns:
+            Tuple of rotated query and key tensors.
+        """
+        # Debug: Print input arguments and shapes
+        rank, _ = distributed.rank_and_world() # Use default group
+        # print(f"RotaryEmbedding.adjusted_qk: q_shape={q.shape}, k_shape={k.shape}, has_pos_ids={position_ids is not None}") # Minimal debug
+        # Input validation: Ensure expected shape [B, S, H, D]
         assert len(q.size()) == 4
         assert len(k.size()) == 4
+        batch_size = q.size(0)
+        # Allow different seq lengths for Q and K, common in ring attention cross-blocks
+        # assert q.size(1) == k.size(1), f"Seq len mismatch: q={q.size(1)}, k={k.size(1)}"
 
+        # Compute position_ids if not provided (Fallback for standard attention)
         seq_len = max(k.size(1), q.size(1))
+        q_seq_len = q.size(1) # Store original q_seq_len for clarity
         if position_ids is None:
-            # Compute position_ids based on cache config
-            position_ids = torch.arange(
-                0, seq_len, dtype=torch.long, device=q.device
-            ).repeat(k.size(0), 1)
-            if use_cache and past_kv_state is not None and past_kv_state[0].numel() > 0:
-                position_ids += past_kv_state[0].size(2)
+            # print(f"[DEBUG RoPE rank{rank}] position_ids is None, entering fallback logic.", flush=True) # Removed
+            # Fallback for standard attention (non-ring)
+            # Check if we are in decoding phase (use_cache=True and past state exists)
+            cache_len = -1 # Initialize cache_len
+            is_decode_phase = use_cache and past_kv_state is not None and past_kv_state[0].numel() > 0
+            if is_decode_phase:
+                # Single token decoding: position is the cache length
+                try:
+                    # Assuming cache shape [B, H, cache_len, D]
+                    cache_len = past_kv_state[0].size(2)
+                    position_ids = torch.full((q.size(0), 1), cache_len, dtype=torch.long, device=q.device)
+                    # --- Prompt 15: Check fallback decode position_ids ---
+                    assert position_ids.shape == (batch_size, 1), f"Fallback decode position_ids shape mismatch: expected ({batch_size}, 1), got {position_ids.shape}"
+                    assert position_ids[0, 0].item() == cache_len, f"Fallback decode position_ids value mismatch: expected {cache_len}, got {position_ids[0, 0].item()}"
+                    # print(f"[DEBUG RoPE rank{rank}] Fallback: Decode phase. cache_len={cache_len}. Calculated position_ids={position_ids.flatten().tolist()}", flush=True) # Removed
+                except IndexError:
+                     # print(f"[WARN RoPE rank{rank}] Fallback failed to get cache length. Shape: {past_kv_state[0].shape}", flush=True) # Removed
+                     # Fallback further to just sequence length (likely incorrect for decode)
+                     position_ids = torch.arange(0, q_seq_len, dtype=torch.long, device=q.device).unsqueeze(0)
+                     # --- Prompt 15: Check fallback decode (error case) position_ids ---
+                     # This case is less critical as it's likely wrong anyway, but check shape
+                     assert position_ids.shape[1] == q_seq_len, f"Fallback decode (error) position_ids seq len mismatch: expected {q_seq_len}, got {position_ids.shape[1]}"
+                     # print(f"[WARN RoPE rank{rank}] Fallback: Decode phase (IndexError). Using arange({q_seq_len}). Calculated position_ids={position_ids.flatten().tolist()}", flush=True) # Removed
+            else:
+                # Prefill phase: positions are 0 to seq_len-1
+                # Note: This simple arange doesn't account for left-padding.
+                # The caller should ideally provide position_ids computed correctly for padding.
+                position_ids = torch.arange(0, q_seq_len, dtype=torch.long, device=q.device).unsqueeze(0)
+                # --- Prompt 15: Check fallback prefill position_ids ---
+                assert position_ids.shape == (1, q_seq_len), f"Fallback prefill position_ids shape mismatch: expected (1, {q_seq_len}), got {position_ids.shape}"
+                if q_seq_len > 0:
+                    expected_vals = torch.arange(0, q_seq_len, device=q.device)
+                    assert torch.equal(position_ids.squeeze(0), expected_vals), f"Fallback prefill position_ids value mismatch: expected {expected_vals.tolist()}, got {position_ids.squeeze(0).tolist()}"
+                # print(f"[DEBUG RoPE rank{rank}] Fallback: Prefill phase. Using arange({q_seq_len}). Calculated position_ids={position_ids.flatten().tolist()}", flush=True) # Removed
+
+            # Expand batch dimension if needed (should match q batch size)
+            if position_ids.size(0) != q.size(0):
+                 position_ids = position_ids.expand(q.size(0), -1)
+        else:
+            pass # Removed print
+            # print(f"[DEBUG RoPE rank{rank}] Received position_ids (shape {position_ids.shape}): {position_ids.flatten().tolist()}", flush=True) # Removed
 
         if self.partial_rope != 1.0:
             q_rope = q[..., : self.dim]
             k_rope = k[..., : self.dim]
         else:
-            q_rope = q
-            k_rope = k
-        q_ = q_rope.float().view(*q.size()[:-1], -1, 2)  # B L H D/2 2
-        k_ = k_rope.float().view(*k.size()[:-1], -1, 2)  # B L H D/2 2
+            q_rope = q # B S H D
+            k_rope = k # B S H D
 
-        # the max start position should be based on the max first position of each sequence
-        max_start_pos = torch.max(position_ids[:, 0])
-        alpha = self.compute_freqs_cis(q.device, max_start_pos + seq_len)
-        freqs = self.cached_freqs[q.device.index][alpha][position_ids]
+        # Cast the part to be rotated to float32 for calculation stability
+        orig_dtype = q_rope.dtype # Store original dtype
+        # Shape: [B, S, H, D_rope/2, 2]
+        q_ = q_rope.float().view(*q_rope.shape[:-1], -1, 2)
+        k_ = k_rope.float().view(*k_rope.shape[:-1], -1, 2)
 
-        freqs = freqs.float()  # 1 L D/2 2 2
-        q_out = (
-            freqs[:, -q.size(1) :, None, :, :, :]
-            .mul(q_.unsqueeze(-2))
-            .sum(5)
-            .flatten(3)
-        ).type_as(q)
-        k_out = (
-            freqs[:, -k.size(1) :, None, :, :, :]
-            .mul(k_.unsqueeze(-2))
-            .sum(5)
-            .flatten(3)
-        ).type_as(k)
+        # Fetch cached frequencies
+        # Ensure frequencies are computed up to the max position needed.
+        max_start_pos = torch.max(position_ids[:, 0]) if position_ids.numel() > 0 else 0
+        # Use max position ID to determine required cache length
+        max_pos_id_needed = torch.max(position_ids).item() if position_ids.numel() > 0 else 0
+        # --- Prompt 18: Print max position needed ---
+        # print(f"[DEBUG RoPE rank{rank}] Max position ID needed: {max_pos_id_needed}", flush=True) # Keep commented for now
+        alpha = self.compute_freqs_cis(q.device, max_pos_id_needed + 1)
+        # --- Prompt 18: Print cache size after computation ---
+        dev_idx = q.device.index if q.device.type == 'cuda' else 0 # Handle CPU case
+        # print(f"[DEBUG RoPE rank{rank}] Max seq len cached for device {dev_idx}: {self.max_seq_len_cached.get(dev_idx, 0)}", flush=True) # Keep commented for now
+        assert self.max_seq_len_cached.get(dev_idx, 0) > max_pos_id_needed, \
+            f"RoPE cache size insufficient: max needed={max_pos_id_needed}, cache size={self.max_seq_len_cached.get(dev_idx, 0)}"
+        # print(f"[DEBUG RoPE rank{rank}] Using alpha={alpha}. Cache size for alpha: {self.cached_freqs.get(q.device.index, {}).get(alpha, torch.empty(0)).shape[0]}", flush=True) # Less noisy
+
+        # Directly index cache with the provided (global) position_ids
+        try:
+            freqs = self.cached_freqs[dev_idx][alpha][position_ids].float() # Shape [B, S_pos, D/2, 2, 2]
+            # --- Prompt 16: Check frequency indexing shape ---
+            assert freqs.size(0) == batch_size, f"Freqs batch size mismatch: expected {batch_size}, got {freqs.size(0)}"
+            assert freqs.size(1) == position_ids.size(1), f"Freqs seq len mismatch: expected {position_ids.size(1)} (from position_ids), got {freqs.size(1)}"
+            # print(f"[DEBUG RoPE rank{rank}] Successfully indexed freqs cache. freqs.shape={freqs.shape}", flush=True) # Removed
+        except IndexError as e:
+            print(f"[ERROR RoPE rank{rank}] Failed to index freqs cache. Max requested pos: {max_pos_id_needed}, Cache size: {self.cached_freqs[dev_idx][alpha].shape[0]}. Error: {e}", flush=True) # Keep critical error
+            # Fallback or re-raise depending on desired behavior
+            raise e
+
+        freqs = freqs.float()
+
+        # Apply rotation (simulated complex multiplication) in float32
+        q_len = q.size(1)
+        k_len = k.size(1)
+        # Assume freqs has shape [B, S_pos, D/2, 2, 2] where S_pos >= max(q_len, k_len)
+        # Slice directly based on Q and K lengths.
+        # Note: This slicing assumes position_ids correspond 1:1 with the sequence dimension.
+        # If position_ids are arbitrary (e.g., due to padding or complex caching), this might be wrong.
+        freqs_q = freqs[:, :q_len, ...] # [B, q_len, D/2, 2, 2]
+        freqs_k = freqs[:, :k_len, ...] # [B, k_len, D/2, 2, 2]
+        # --- Prompt 16: Check sliced frequency shape ---
+        assert freqs_q.size(1) == q_len, f"Sliced freqs_q seq len mismatch: expected {q_len}, got {freqs_q.size(1)}"
+        assert freqs_k.size(1) == k_len, f"Sliced freqs_k seq len mismatch: expected {k_len}, got {freqs_k.size(1)}"
+        # print(f"[DEBUG RoPE rank{rank}] Sliced freqs_q.shape={freqs_q.shape}, freqs_k.shape={freqs_k.shape}", flush=True) # Removed
+
+        # --- Use Alternative RoPE Math ---
+        # Original FMS math commented out:
+        # freqs_q_reshaped = freqs_q.unsqueeze(2) # [B, q_len, 1, D/2, 2, 2]
+        # freqs_k_reshaped = freqs_k.unsqueeze(2) # [B, k_len, 1, D/2, 2, 2]
+        # q_rotated_float = (freqs_q_reshaped * q_.unsqueeze(-1)).sum(-1)
+        # k_rotated_float = (freqs_k_reshaped * k_.unsqueeze(-1)).sum(-1)
+
+        # Apply Alternative math (using FMS's freqs_q/freqs_k slicing)
+        # Note: Alternative used unsqueeze(-2) and sum(5). Adjusting for FMS tensor shapes.
+        q_rotated_float = (freqs_q.unsqueeze(2) * q_.unsqueeze(-2)).sum(5) # [B,S,H,D/2,2]
+        k_rotated_float = (freqs_k.unsqueeze(2) * k_.unsqueeze(-2)).sum(5) # [B,S,H,D/2,2]
+
+        # Flatten the last two dimensions: [B, S, H, D_rope]
+        q_rotated_float = q_rotated_float.flatten(-2)
+        k_rotated_float = k_rotated_float.flatten(-2)
+
+        # Cast back to the original input type (e.g., fp16)
+        q_out = q_rotated_float.to(orig_dtype)
+        k_out = k_rotated_float.to(orig_dtype)
 
         if self.partial_rope != 1.0:
-            q_out = torch.cat([q_out.view_as(q_rope), q[..., self.dim :]], dim=-1)
-            k_out = torch.cat([k_out.view_as(k_rope), k[..., self.dim :]], dim=-1)
-        else:
-            q_out = q_out.view_as(q_rope)
-            k_out = k_out.view_as(k_rope)
+            # Ensure the non-rotated part has the same type before concatenating
+            q_out = torch.cat([q_out, q[..., self.dim :].type_as(q_out)], dim=-1)
+            k_out = torch.cat([k_out, k[..., self.dim :].type_as(k_out)], dim=-1)
         return q_out, k_out

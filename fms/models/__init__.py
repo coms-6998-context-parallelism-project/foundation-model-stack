@@ -127,9 +127,10 @@ def __maybe_infer_model_variant(
             source = "hf"
             for kwarg in kwargs:
                 if kwarg in extra_kwargs:
-                    logger.warning(
-                        f"ignoring {kwarg} as the pretrained model config overrides it"
-                    )
+                    pass # Removed logger warning
+                    # logger.warning(
+                        # f"ignoring {kwarg} as the pretrained model config overrides it"
+                    # )
                 else:
                     extra_kwargs[kwarg] = kwargs[kwarg]
         else:
@@ -401,16 +402,16 @@ def get_model(
 
     if "distributed_strategy" not in extra_args:
         if distributed_strategy == "tp":
-            print("using tensor parallel")
+            # print("using tensor parallel") # Removed
             extra_args["distributed_strategy"] = TensorParallelStrategy(group)
         elif distributed_strategy == "mp":
-            print("using model parallel")
+            # print("using model parallel") # Removed
             devices = [i for i in range(torch.cuda.device_count())]
             extra_args["distributed_strategy"] = UniformModelParallelStrategy(
                 devices, _guess_num_layers(lazy_sd)
             )
         elif distributed_strategy == "ring": # Add ring strategy handling
-            print("using ring attention strategy")
+            # print("using ring attention strategy") # Removed
             block_size = extra_args.get("ring_block_size", 1024) # Default block size if not provided
             extra_args["distributed_strategy"] = RingAttentionStrategy(block_size=block_size, group=group)
 

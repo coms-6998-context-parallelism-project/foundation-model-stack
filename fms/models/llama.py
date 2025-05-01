@@ -1,18 +1,23 @@
 import logging
 import re
+import math # Import math if needed by LLaMARing
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F # Import F if needed by LLaMARing
+import torch.distributed as dist # Import dist if needed by LLaMARing
 
 from fms import models
 from fms.distributed.strategy import (
     DistributedStrategy,
     NoOpStrategy,
-    RingAttentionStrategy, # Import RingAttentionStrategy if needed by LLaMARing
+    RingAttentionStrategy, # Import RingAttentionStrategy
     TensorParallelStrategy,
 )
+# Import RingAttentionEngine if LLaMARingBlock uses it
+from fms.models.attentionhelper import RingAttentionEngine # Make sure this is imported
 from fms.modules.attention import MultiHeadAttention
 from fms.modules.embedding import WordEmbedding
 from fms.modules.feedforward import GatedLinearUnit
@@ -54,12 +59,15 @@ class LLaMAConfig(ModelConfig):
     rope_theta: float = 10_000.0
     linear_config: Optional[Mapping[str, Any]] = None
     fused_weights: bool = True
+    # Add ring_attn_block_size to config (if needed by RingAttentionStrategy)
+    # ring_attn_block_size: int = 1024 # Example
 
 
 class LLaMABlock(nn.Module):
-    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
+    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding, distributed_strategy: DistributedStrategy):
         super(LLaMABlock, self).__init__()
         self.config = config
+        self.distributed_strategy = distributed_strategy # Store the strategy
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
 
@@ -117,18 +125,109 @@ class LLaMABlock(nn.Module):
         x,
         *,
         mask=None,
+        position_ids=None, # Accept position_ids directly
+        past_key_value_state=None,
+        use_cache=False,
+        is_causal_mask=False,
+        attn_algorithm=None, # Standard MHA args
+        # Ring-specific args (will be None if not ring)
+        q_global_offset=None,
+        global_seq_len=None
+    ):
+        if attn_algorithm == "ring" and isinstance(self.distributed_strategy, RingAttentionStrategy):
+
+            strategy = self.distributed_strategy
+            ring_attention_group = strategy.group
+            if ring_attention_group is None:
+                raise RuntimeError("Ring Attention algorithm requested but no ring_attention_group was provided to the LLaMABlock.")
+            if q_global_offset is None or global_seq_len is None:
+                raise ValueError("q_global_offset and global_seq_len must be provided when attn_algorithm='ring'")
+            if use_cache:
+                logger.warning("KV caching is not yet supported with Ring Attention.")
+                use_cache = False
+
+            x_ln = self.ln(x)
+            B, T, _ = x_ln.shape # T here is the strategy_block_size
+            q_proj, k_proj, v_proj = self.attn.in_proj(q=x_ln, k=x_ln, v=x_ln)
+
+            # Reshape QKV for attention (B, H, T, D)
+            queries = q_proj.view(B, T, self.attn.nheads, self.attn.emb_kq_per_head).transpose(1, 2)
+            keys = k_proj.view(B, T, self.attn.kvheads, self.attn.emb_kq_per_head).transpose(1, 2)
+            values = v_proj.view(B, T, self.attn.kvheads, self.attn.emb_v_per_head).transpose(1, 2)
+
+            # --- Apply RoPE ---
+            # Use the position_ids passed directly, which _helper should have calculated globally and sharded for ring
+            if position_ids is None:
+                 # This should ideally not happen if _helper calculates it, but as a fallback:
+                 global_position_ids = torch.arange(q_global_offset, q_global_offset + T, device=x.device)
+                 rope_position_ids = global_position_ids.unsqueeze(0).expand(B, -1)
+                 # logger.warning("LLaMABlock (Ring Path) received None position_ids, calculating fallback global IDs.") # Removed
+
+            # Transpose q/k to shape [B, T_local, H, D] before RoPE call
+            queries_rope_in = queries.transpose(1, 2) # [B, H, T, D] -> [B, T, H, D]
+            keys_rope_in = keys.transpose(1, 2) # [B, H, T, D] -> [B, T, H, D]
+
+            # Apply RoPE (adjusted_qk expects [B, T, H, D])
+            queries_rotated, keys_rotated = self.attn.position_encoder.adjusted_qk(
+                queries_rope_in, keys_rope_in, position_ids, use_cache=False # Pass position_ids directly
+            )
+
+            # Transpose back for RingAttentionEngine [B, T, H, D] -> [B, H, T, D]
+            queries = queries_rotated.transpose(1, 2)
+            keys = keys_rotated.transpose(1, 2)
+            # --- End RoPE Application ---
+
+            # === Expand for GQA ===
+            expansion = self.attn.nheads // self.attn.kvheads
+            # Apply expansion after RoPE and transpose back
+            keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
+            values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
+
+            engine_is_causal = is_causal_mask and mask is None
+
+            engine = RingAttentionEngine(
+                strategy_block_size=strategy.block_size,
+                attn=self.attn,
+                ff=self.ff_sub_layer,
+                ff_norm=self.ff_ln,
+                is_causal=engine_is_causal,
+                group=ring_attention_group
+             )
+
+            x_out = engine.forward_full(
+                q_shard=queries, k_shard=keys_e, v_shard=values_e,
+                mask_global=mask, # Pass the potentially global mask
+                x_shard=x, # Pass original input x for residual connection inside engine
+                q_global_offset=q_global_offset,
+                global_seq_len=global_seq_len
+            )
+            # Ring attention engine now returns the local block, gathering happens outside
+            return x_out # No cache returned for ring attention yet
+        else:
+            # Standard Attention Path (Original LLaMABlock logic)
+            return self.forward_standard(
+                x,
+                mask=mask,
+                position_ids=position_ids, # Pass position_ids directly
+                past_key_value_state=past_key_value_state,
+                use_cache=use_cache,
+                is_causal_mask=is_causal_mask,
+                attn_algorithm=attn_algorithm,
+            )
+
+    # Standard attention logic (original forward method)
+    def forward_standard(
+        self,
+        x,
+        *,
+        mask=None,
         position_ids=None,
         past_key_value_state=None,
         use_cache=False,
         is_causal_mask=False,
         attn_algorithm=None,
     ):
-        # if the cache is not empty, we need to get the kv cache for self and cross attention
         self_attn_past_key_value = past_key_value_state
-        # if past_key_value_state is not None:
-        #     self_attn_past_key_value = past_key_value_state[:2]
-        # else:
-        #     self_attn_past_key_value = None
 
         # first we do MHA and Add&Norm
         residual = x
@@ -136,7 +235,7 @@ class LLaMABlock(nn.Module):
         x = self.attn(
             q=x,
             mask=mask,
-            position_ids=position_ids,
+            position_ids=position_ids, # Use the passed-in position_ids
             attn_algorithm=attn_algorithm,
             past_key_value_state=self_attn_past_key_value,
             use_cache=use_cache,
@@ -201,11 +300,11 @@ class LLaMA(nn.Module):
             or not self.config.tie_heads
         ):
             self.shared = self.distributed_strategy.distribute_module(shared)
-        else:
-            logger.warning(
-                "You're using TP on a model with tied weights between head and embedding. "
-                "The tied weights won't be sharded, which can result in unexpected OOMs."
-            )
+        # else: # Removed logger warning
+            # logger.warning(
+                # "You're using TP on a model with tied weights between head and embedding. "
+                # "The tied weights won't be sharded, which can result in unexpected OOMs."
+            # )
             self.shared = shared
 
         self.rot_emb = RotaryEmbedding(
@@ -223,7 +322,8 @@ class LLaMA(nn.Module):
 
         layers = []
         for i in range(self.config.nlayers):
-            block: nn.Module = LLaMABlock(self.config, self.rot_emb)
+            # Pass distributed_strategy to the block
+            block: nn.Module = LLaMABlock(self.config, self.rot_emb, self.distributed_strategy)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
@@ -342,18 +442,52 @@ class LLaMA(nn.Module):
         use_cache=False,
         attn_algorithm=None,
     ):
-        # Embed the given vocabulary indices using the given attention mask, with pre-/post-norm and dropout as specified
-        # x_in: batch_size x seq_len
-        # mask: batch_size x seq_len x seq_len
-        # bias: nheads x seq_len x seq_len
         if past_key_value_states is None or len(past_key_value_states) == 0:
             past_key_value_states = [None for _ in range(len(self.layers))]
 
         qlen = x_in.size(1)
         klen = x_in.size(1)
 
+        # --- Explicit Position ID Calculation (Handles Padding and Cache) ---
+        # Calculate position_ids if not provided by the caller.
+        # This handles prefill and decode (with or without cache).
+        if position_ids is None:
+            # If position_ids are not provided, we assume it's a prefill scenario
+            # or a single-token generation at the very start (klen=1).
+            # The logic here calculates positions based on non-padding tokens.
+            # For single-token generation (qlen=1) *after* the first token,
+            # position_ids MUST be provided by the caller (e.g., the generate function).
+            is_decode_phase_with_cache = use_cache and past_key_value_states[0] is not None and past_key_value_states[0][0].numel() > 0 # Check if cache exists and is populated
+
+            if is_decode_phase_with_cache and qlen == 1:
+                # Decode phase with cache: position is the current cache length.
+                # Assuming cache shape [B, H, cache_len, D]
+                try:
+                    cache_len = past_key_value_states[0][0].size(2)
+                    position_ids = torch.full((x_in.size(0), 1), cache_len, dtype=torch.long, device=x_in.device)
+                except (IndexError, TypeError): # Handle potential errors if cache is weird
+                    # logger.warning("Failed to get cache length for position_ids during decode, falling back to calculating from input.") # Removed
+                    # Fallback to calculating based on input length if cache access fails
+                    is_pad = x_in == self.config.pad_id if self.config.pad_id is not None else torch.zeros_like(x_in, dtype=torch.bool)
+                    position_ids = (~is_pad).cumsum(dim=1) - 1
+                    position_ids = position_ids.clamp(min=0)
+            else:
+                # Prefill phase (or single-token generation at the very start, where klen=1): Calculate positions respecting padding.
+                # Create boolean mask for non-padding tokens
+                is_pad = x_in == self.config.pad_id if self.config.pad_id is not None else torch.zeros_like(x_in, dtype=torch.bool)
+                # Calculate cumulative sum of non-padding tokens to get positions
+                position_ids = (~is_pad).cumsum(dim=1) - 1
+                # Clamp positions to be non-negative (handles leading pads)
+                position_ids = position_ids.clamp(min=0)
+            # Ensure position_ids has the correct batch dimension (it should already if calculated from x_in)
+            if position_ids.size(0) != x_in.size(0):
+                # This expand might be problematic if batch size > 1 and padding differs per item.
+                # Consider calculating per batch item if padding varies.
+                position_ids = position_ids.expand(x_in.size(0), -1)
+        # --- End Explicit Position ID Calculation ---
+
         # if we are using the cache, the key length needs to be extended with the past keys length
-        if use_cache and past_key_value_states[0] is not None:
+        if use_cache and past_key_value_states[0] is not None and past_key_value_states[0][0].numel() > 0:
             klen += past_key_value_states[0][0].size(-2)
 
         # if mask is none, we need to specify causal mask
@@ -367,6 +501,29 @@ class LLaMA(nn.Module):
         else:
             is_causal_mask = False
 
+        # --- Ring Attention Strategy: Shard Input ---
+        is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
+        original_global_seq_len = klen # Default if not ring
+        layer_kwargs = {} # Initialize empty kwargs
+        if is_ring_strategy:
+            # shard_input now handles global padding and returns the original length
+            x_in, original_global_seq_len = self.distributed_strategy.shard_input(x_in)
+            # The compute_global_seq_len is the padded length used by the engine
+            compute_global_seq_len = self.distributed_strategy.world_size * self.distributed_strategy.block_size
+            # q_global_offset is the offset in the PADDED sequence
+            q_global_offset = self.distributed_strategy.rank * self.distributed_strategy.block_size
+
+            # Shard the padding-aware position_ids calculated earlier.
+            # !!! CRITICAL ASSUMPTION: RingAttentionStrategy.shard_tensor correctly shards this tensor !!!
+            # It must handle the potentially non-contiguous nature of position_ids due to padding.
+            position_ids, _ = self.distributed_strategy.shard_tensor(position_ids, dim=1) # Shard along sequence dim, overwrite position_ids
+            # Prepare kwargs specific to ring attention layers
+            layer_kwargs = {"q_global_offset": q_global_offset, "global_seq_len": compute_global_seq_len}
+
+        else:
+            # For non-ring strategy, original_global_seq_len is just klen
+            compute_global_seq_len = original_global_seq_len
+
         x_in = self.shared(x_in)
 
         # this is the output cache for all the decoder layers
@@ -376,17 +533,22 @@ class LLaMA(nn.Module):
             output = layer(
                 x=x_in,
                 mask=mask,
-                position_ids=position_ids,
+                position_ids=position_ids, # Pass the calculated/sharded position_ids directly
                 past_key_value_state=past_key_value_states[i],
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
+                **layer_kwargs, # Unpack ring-specific kwargs here
             )
 
             if use_cache:
-                x_in, present_key_value_state = output
-                present_key_value_states.append(present_key_value_state)
-
+                # Ring attention might not return cache
+                if isinstance(output, tuple):
+                    x_in, present_key_value_state = output
+                    present_key_value_states.append(present_key_value_state)
+                else:
+                    x_in = output
+                    present_key_value_states.append(None) # Append None if no cache
             else:
                 x_in = output
 
@@ -395,7 +557,19 @@ class LLaMA(nn.Module):
         if self.config.p_dropout:
             dec_out = self.dropout(dec_out)
 
+        # --- Ring Attention Strategy: Gather Output ---
+        if is_ring_strategy:
+            # Gather along the sequence dimension
+            dec_out_gathered = self.distributed_strategy.gather_output(dec_out) # dec_out here is the local shard output
+            # Truncate output back to original length if padding was added
+            if dec_out_gathered.shape[self.distributed_strategy.dim] != original_global_seq_len:
+                # Slice using the correct dimension from the strategy
+                dec_out = dec_out_gathered.narrow(self.distributed_strategy.dim, 0, original_global_seq_len)
+            else:
+                dec_out = dec_out_gathered # No truncation needed if lengths match
+
         return dec_out, present_key_value_states
+
 
     def forward(
         self,
@@ -407,6 +581,7 @@ class LLaMA(nn.Module):
         only_last_token: bool = False,
         attn_algorithm: Optional[str] = None,
     ):
+        # Pass attn_algorithm down to _helper
         output, cache = self._helper(
             x, mask, position_ids, past_key_value_states, use_cache, attn_algorithm
         )
@@ -419,205 +594,6 @@ class LLaMA(nn.Module):
             return preds, cache
         else:
             return preds
-
-
-# --- Ring Attention Variant ---
-# Define Config, Block, and Model classes specifically for Ring Attention LLaMA
-# This keeps the original LLaMA implementation separate and clean.
-
-@dataclass
-class LLaMARingConfig(LLaMAConfig):
-    """
-    Configuration for LLaMA model using Ring Attention.
-    Inherits from LLaMAConfig and can add ring-specific parameters if needed.
-    """
-    # Example: Add ring-specific parameters if the implementation requires them
-    # ring_attn_block_size: int = 1024
-    pass
-
-# Placeholder/Assumption: A RingAttention module exists or is configured within MHA
-# If MultiHeadAttention itself needs modification for ring, that's a different approach.
-# Assuming here that the block uses a potentially different attention call signature or module.
-
-class LLaMARingBlock(nn.Module):
-    """LLaMA Block adapted for Ring Attention"""
-    def __init__(self, config: LLaMARingConfig, rotary_emb: RotaryEmbedding):
-        super(LLaMARingBlock, self).__init__()
-        self.config = config
-        emb_kq = self.config.emb_dim // self.config.nheads
-        emb_v = self.config.emb_dim // self.config.nheads
-
-        self.ln = LayerNormParameterized(
-            self.config.emb_dim,
-            elementwise_scale=True,
-            elementwise_shift=False,
-            use_mean=False,
-            eps=self.config.norm_eps,
-            use_high_precision_pow=True,
-        )
-        self.ff_ln = LayerNormParameterized(
-            self.config.emb_dim,
-            elementwise_scale=True,
-            elementwise_shift=False,
-            use_mean=False,
-            eps=self.config.norm_eps,
-            use_high_precision_pow=True,
-        )
-
-        if self.config.kvheads == 0:
-            kvheads = self.config.nheads
-        else:
-            kvheads = self.config.kvheads
-            assert self.config.nheads % self.config.kvheads == 0
-
-        # NOTE: This assumes MultiHeadAttention can handle ring attention logic,
-        # potentially via attn_algorithm or internal checks based on strategy.
-        # If a completely separate RingAttention module is used, instantiate that here.
-        self.attn = MultiHeadAttention(
-            self.config.emb_dim,
-            emb_kq,
-            emb_v,
-            self.config.nheads,
-            kvheads,
-            p_dropout=self.config.p_dropout,
-            use_bias=self.config.attn_bias,
-            position_encoder=rotary_emb,
-            fused=self.config.fused_weights,
-            linear_config=self.config.linear_config,
-            # Add any ring-specific parameters if MHA supports them
-        )
-        self.ff_sub_layer = GatedLinearUnit(
-            self.config.emb_dim,
-            hidden_grow_factor=self.config.hidden_grow_factor,
-            multiple_of=self.config.multiple_of,
-            activation_fn=str_to_activation(self.config.activation_fn),
-            p_dropout=self.config.p_dropout,
-            use_bias=self.config.mlp_bias,
-            fused=self.config.fused_weights,
-            linear_config=self.config.linear_config,
-        )
-
-        if self.config.p_dropout != 0:
-            self.dropout = nn.Dropout(self.config.p_dropout)
-
-    def forward(
-        self,
-        x,
-        *,
-        mask=None, # Ring Attention might handle masking differently internally
-        position_ids=None,
-        past_key_value_state=None, # Ring Attention might not use KV caching
-        use_cache=False, # Ring Attention might not use KV caching
-        is_causal_mask=False, # Ring Attention implies causality differently
-        attn_algorithm=None, # Could be used to trigger ring attention?
-    ):
-        # Ring attention might modify the input/output or how attention is called
-        # This is a simplified placeholder assuming similar structure to LLaMABlock
-        residual = x
-        x = self.ln(x)
-
-        # Adapt the attention call if needed for ring attention specifics
-        # For example, ring attention might not need past_key_value_state or use_cache
-        attn_out = self.attn(
-            q=x,
-            # k=x, v=x, # Often implicit for self-attention
-            mask=mask, # Ring might handle masking internally based on rank/world_size
-            position_ids=position_ids,
-            attn_algorithm=attn_algorithm, # Potentially set to 'ring'
-            past_key_value_state=past_key_value_state, # May be ignored
-            use_cache=use_cache, # May be ignored
-            is_self=True,
-            is_causal_mask=is_causal_mask, # May be ignored
-        )
-
-        # Ring attention might not return a cache
-        cache = None
-        if use_cache and isinstance(attn_out, tuple): # Check if cache is returned
-             x, cache = attn_out
-        else:
-             x = attn_out # Assume only hidden states are returned
-
-        if self.config.p_dropout != 0:
-            x = self.dropout(x)
-        x = x + residual
-
-        residual = x
-        x = self.ff_ln(x)
-        x = self.ff_sub_layer(x)
-        if self.config.p_dropout != 0:
-            x = self.dropout(x)
-        x = x + residual
-
-        if use_cache:
-            return (x, cache)
-        else:
-            return x
-
-
-class LLaMARing(LLaMA):
-    """
-    LLaMA model variant using Ring Attention.
-    Inherits from LLaMA and overrides parts to use LLaMARingConfig and LLaMARingBlock.
-    Assumes the distributed strategy passed might be RingAttentionStrategy.
-    """
-    def __init__(
-        self,
-        config: Optional[LLaMARingConfig] = None,
-        distributed_strategy: DistributedStrategy = NoOpStrategy,
-        **kwargs,
-    ):
-        # We need to call nn.Module's init first, then set attributes.
-        # super(LLaMA, self).__init__() would skip LLaMA's __init__ if we inherit LLaMA directly.
-        # Let's re-implement the relevant parts of LLaMA.__init__ here.
-        nn.Module.__init__(self) # Call grandparent's init
-
-        if config is not None:
-            self.config = config
-        else:
-            self.config = LLaMARingConfig() # Use Ring config default
-        self.config = self.config.updated(**kwargs)
-        self.distributed_strategy = distributed_strategy
-
-        self.width = self.config.emb_dim
-        self.pad_id = self.config.pad_id
-        self.max_expected_seq_len = self.config.max_expected_seq_len
-
-        # Embedding setup (same as LLaMA, distributed according to strategy)
-        shared = WordEmbedding(...) # Same as in LLaMA
-        self.shared = self.distributed_strategy.distribute_module(shared)
-
-        # Rotary Embedding setup (same as LLaMA)
-        self.rot_emb = RotaryEmbedding(...) # Same as in LLaMA
-
-        # Layer setup using LLaMARingBlock
-        layers = []
-        for i in range(self.config.nlayers):
-            block: nn.Module = LLaMARingBlock(self.config, self.rot_emb) # Use Ring Block
-            block = self.distributed_strategy.distribute_layer(block, i)
-            layers.append(block)
-        self.layers = nn.ModuleList(layers)
-
-        # Decoder Norm setup (same as LLaMA)
-        dec_norm = LayerNormParameterized(...) # Same as in LLaMA
-        self.dec_norm = self.distributed_strategy.distribute_module(dec_norm, final_layers=True)
-
-        # Dropout setup (same as LLaMA)
-        if self.config.p_dropout:
-            self.dropout = nn.Dropout(self.config.p_dropout)
-
-    # Override methods that need to refer to LLaMARingConfig or specific ring logic
-    def get_config(self) -> LLaMARingConfig:
-        return self.config
-
-    @classmethod
-    def from_config(cls, config: LLaMARingConfig) -> "LLaMARing":
-        return cls(config)
-
-    # reset_parameters, post_init, _helper, forward might need adjustments
-    # based on the specifics of Ring Attention (e.g., caching, masking).
-    # For now, assume they can be inherited or are similar enough. If RingAttentionStrategy
-    # requires specific handling (like sharding/gathering inputs/outputs), the main
-    # forward pass might need to incorporate calls to strategy.shard_input/gather_output.
 
 
 # Register common LLaMA variants with the model registration API
@@ -696,18 +672,6 @@ def _llama_factory_factory(config):
     return factory
 
 
-# Factory for Ring Attention Variants
-def _llama_ring_factory_factory(config):
-    def factory(**kwargs):
-        # If RingAttentionStrategy needs to be explicitly passed:
-        # if 'distributed_strategy' not in kwargs or isinstance(kwargs['distributed_strategy'], NoOpStrategy):
-        #    # Assuming block_size needs to be configured, e.g., from config
-        #    block_size = getattr(config, 'ring_attn_block_size', 1024)
-        #    kwargs['distributed_strategy'] = RingAttentionStrategy(block_size=block_size)
-        return LLaMARing(config, **kwargs) # Use the Ring model class
-    return factory
-
-
 models.register_model(
     _architecture_name, "micro", _llama_factory_factory(_micro_char_config)
 )
@@ -741,12 +705,6 @@ models.register_model(
     _llama_factory_factory((_granite_8b_code_config)),
 )
 
-# Register Ring Variants
-_7b_ring_config = LLaMARingConfig() # Adjust params if needed
-_13b_ring_config = LLaMARingConfig(emb_dim=5120, nheads=40, nlayers=40) # Adjust params if needed
-
-models.register_model(_architecture_name, "7b_ring", _llama_ring_factory_factory(_7b_ring_config))
-models.register_model(_architecture_name, "13b_ring", _llama_ring_factory_factory(_13b_ring_config))
 
 # Create all the pieces to generate adapters for different checkpoints
 serialization.register_adapter_step(
@@ -879,7 +837,7 @@ def _hf_to_fms_rope(
         if model_config.linear_config:
             linear_type = model_config.linear_config["linear_type"]
     else:
-        logger.warning("Missing model_config, assuming defaults for head_size")
+        # logger.warning("Missing model_config, assuming defaults for head_size") # Removed
         head_size = 128  # Good default for most models
         linear_type = "torch_linear"
 
@@ -942,5 +900,9 @@ serialization.register_adapter(
 
 # Add ring-specific adapters if loading checkpoints requires different name mapping or steps
 # Example:
-# serialization.register_adapter_step("llama", "hf_ring_to_fms_names", _hf_ring_to_fms_names) # Define this function if needed
-# serialization.register_adapter("llama", "hf_ring", ["hf_ring_to_fms_names", "hf_to_fms_rope", "weight_fusion"])
+# def _hf_ring_to_fms_names(input_sd: Mapping[str, Any], **kwargs) -> Mapping[str, Any]:
+#     # Implement name mapping specific to ring checkpoints if needed
+#     # Could potentially reuse _hf_to_fms_names if names are identical
+#     return _hf_to_fms_names(input_sd, **kwargs)
+# serialization.register_adapter_step("llama", "hf_ring_to_fms_names", _hf_ring_to_fms_names)
+# serialization.register_adapter("llama", "hf_ring", ["hf_ring_to_fms_names", "hf_to_fms_rope", "hf_gptq_fusion_check", "weight_fusion"])

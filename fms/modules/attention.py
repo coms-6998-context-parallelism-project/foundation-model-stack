@@ -346,6 +346,11 @@ class MultiHeadAttention(nn.Module):
         is_self: bool
             if True, this will perform self attention, otherwise this will perform cross attention. Note: This will
             only be used in the case that use_cache=True. This may be removed in future
+        is_causal_mask: bool
+            If True, assumes causal attention masking (lower triangular).
+
+        attn_algorithm: str | None
+            Optional string specifying which low-level attention implementation to use.
 
         Returns
         -------
@@ -357,6 +362,10 @@ class MultiHeadAttention(nn.Module):
         # q, k, v: batch_size x seq_len x emb_dim
         # mask: batch_size x seq_len x seq_len
         batch_size, q_len, _ = q.size()
+
+        # Debug: Print input position_ids and cache status
+        rank, _ = distributed.rank_and_world() # Use default group
+        # print(f"[DEBUG MHA rank{rank}] forward called. q_len={q_len}, use_cache={use_cache}, is_self={is_self}", flush=True) # Less noisy
 
         # if this is self attention, we always recompute
         # cross attention only gets computed when a cache does not exist
@@ -377,6 +386,7 @@ class MultiHeadAttention(nn.Module):
             # You want to apply rotary embeddings pre-cache
             if self.position_encoder is not None:
                 queries, keys = self.position_encoder.adjusted_qk(
+                    # Pass position_ids explicitly here
                     queries, keys, position_ids, past_key_value_state, use_cache
                 )
 
@@ -390,12 +400,15 @@ class MultiHeadAttention(nn.Module):
             and past_key_value_state is not None
             and past_key_value_state[0].numel() > 0
         ):
+            # Debug: Print cache concatenation info
+            # print(f"[DEBUG MHA rank{rank}] Using cache. Past K shape: {past_key_value_state[0].shape}, Past V shape: {past_key_value_state[1].shape}", flush=True) # Less noisy
             if is_self:
                 keys = torch.cat((past_key_value_state[0], keys), dim=2)
                 values = torch.cat((past_key_value_state[1], values), dim=2)
             else:
                 keys = past_key_value_state[0]
                 values = past_key_value_state[1]
+            # print(f"[DEBUG MHA rank{rank}] After cache concat. New K shape: {keys.shape}, New V shape: {values.shape}", flush=True) # Less noisy
 
         # Merge rel pos bias and mask into single float mask
         if mask is not None:
@@ -403,12 +416,15 @@ class MultiHeadAttention(nn.Module):
             # we need to create the nheads dimension
             while len(mask.size()) != 4:  # expects bs (x nheads) x q_len x kv_len
                 mask = mask.unsqueeze(1)
+            # print(f"[DEBUG MHA rank{rank}] Input mask shape (unsqueezed): {mask.shape}", flush=True) # Less noisy
 
         if self.position_encoder is not None:
             attn_mask: Optional[Tensor] = self.position_encoder.adjusted_mask(
                 mask, queries, keys, past_key_value_state, use_cache
             )
+            # print(f"[DEBUG MHA rank{rank}] Mask adjusted by PositionEncoder. New mask shape: {'None' if attn_mask is None else attn_mask.shape}", flush=True) # Less noisy
         else:
+            # print(f"[DEBUG MHA rank{rank}] No PositionEncoder mask adjustment.", flush=True) # Removed
             attn_mask = mask
 
         # Expand kv so black-box attn will work
@@ -422,6 +438,7 @@ class MultiHeadAttention(nn.Module):
         else:
             keys_e = keys
             values_e = values
+        # print(f"[DEBUG MHA rank{rank}] Expanded K shape: {keys_e.shape}, Expanded V shape: {values_e.shape}", flush=True) # Less noisy
 
         if attn_algorithm:
             # Pick which fused attn kernels will run.
@@ -432,9 +449,11 @@ class MultiHeadAttention(nn.Module):
             torch.backends.cuda.enable_flash_sdp(use_flash)
             torch.backends.cuda.enable_mem_efficient_sdp(use_mem_efficient)
             torch.backends.cuda.enable_math_sdp(use_math)
+            # print(f"[DEBUG MHA rank{rank}] Using attn_algorithm: {attn_algorithm}", flush=True) # Less noisy
 
         if attn_mask is not None and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(dtype=queries.dtype)
+            # print(f"[DEBUG MHA rank{rank}] Converted attn_mask to dtype: {queries.dtype}", flush=True) # Less noisy
 
         attn = F.scaled_dot_product_attention(
             queries,
@@ -445,6 +464,7 @@ class MultiHeadAttention(nn.Module):
             is_causal=is_causal_mask,
             scale=self.scale_factor,
         )
+        # print(f"[DEBUG MHA rank{rank}] Scaled dot product attention complete. Output shape: {attn.shape}", flush=True) # Less noisy
 
         if attn_algorithm:
             torch.backends.cuda.enable_flash_sdp(self.previous_flash)
@@ -463,8 +483,10 @@ class MultiHeadAttention(nn.Module):
         out = self.dense(attn)
 
         # if use_cache=True, we return the hidden_state as well as the kv cache
+        # Debug: Print output shapes
+        # print(f"[DEBUG MHA rank{rank}] Dense output shape: {out.shape}", flush=True) # Less noisy
         if use_cache:
-            return out, (keys, values)
+            return out, (keys, values) # Return the potentially concatenated keys/values
         else:
             return out
 

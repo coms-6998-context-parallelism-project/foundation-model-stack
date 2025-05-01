@@ -55,7 +55,6 @@ class RingAttentionEngine:
         global_seq_len is the total sequence length across all ranks.
         Returns the computed output shard for the current rank (size strategy_block_size).
         """
-        # print(f"[RING DEBUG][rank{self.rank}] RingAttentionEngine.forward_full: ENTERED.", flush=True)
         T_q_local = q_shard.shape[2]
         if T_q_local == 0: return torch.empty_like(x_shard)
 
@@ -89,7 +88,6 @@ class RingAttentionEngine:
         # 3. Second pass: Compute numerator and denominator sums
         final_num, final_den = self._compute_sums(block_data, final_max_score, initial_num, initial_den, global_seq_len)
         dist.barrier(self.group) # Ensure all ranks have computed their sums
-        # print(f"[RING DEBUG][rank{self.rank}] Exited barrier after compute_sums.", flush=True) # Removed for cleanup
 
         # 4. Compute local output block
         output_block = self.compute_block_output(x_block, final_num, final_den)
@@ -130,7 +128,7 @@ class RingAttentionEngine:
             # The tensor we receive originated from the rank `(current_k_rank - 1 + world_size) % world_size`
             # However, it's simpler to think about which rank *sent* it to us: self.prev_rank
             # The length depends on which rank's data is currently at self.prev_rank
-            incoming_rank_origin = (self.rank - 1 - i + args.world_size) % args.world_size
+            # incoming_rank_origin = (self.rank - 1 - i + args.world_size) % args.world_size # Removed unused variable
             # expected_recv_len is always strategy_block_size now
 
             # Slice the received buffer if necessary (only needed if shapes differ)
@@ -249,21 +247,15 @@ class RingAttentionEngine:
         recv_v_buf_c = recv_v_buf.contiguous() # Ensure contiguous for recv (already sliced)
 
         if self.rank % 2 == 0:
-            # print(f"[rank{self.rank}] Sending K/V to {self.next_rank}...", flush=True)
             dist.send(send_k_c, self.next_rank, group=self.group)
             dist.send(send_v_c, self.next_rank, group=self.group)
-            # print(f"[rank{self.rank}] Sent K/V to {self.next_rank}. Receiving K/V from {self.prev_rank}...", flush=True)
             dist.recv(recv_k_buf_c, self.prev_rank, group=self.group)
             dist.recv(recv_v_buf_c, self.prev_rank, group=self.group)
-            # print(f"[rank{self.rank}] Received K/V from {self.prev_rank}.", flush=True)
         else:
-            # print(f"[rank{self.rank}] Receiving K/V from {self.prev_rank}...", flush=True)
             dist.recv(recv_k_buf_c, self.prev_rank, group=self.group)
             dist.recv(recv_v_buf_c, self.prev_rank, group=self.group)
-            # print(f"[rank{self.rank}] Received K/V from {self.prev_rank}. Sending K/V to {self.next_rank}...", flush=True)
             dist.send(send_k_c, self.next_rank, group=self.group)
             dist.send(send_v_c, self.next_rank, group=self.group)
-            # print(f"[rank{self.rank}] Sent K/V to {self.next_rank}.", flush=True)
 
         return recv_k_buf, recv_v_buf
 
@@ -333,7 +325,6 @@ class RingAttentionEngine:
 
         # Check for NaNs/Infs, specifically positive infinity as -inf is expected from masking
         # It's okay if attn_scores has -inf from masking
-        # print(f"[rank{self.rank}] update_totals: After raw_attention. Before stable_scores", flush=True)
         # Subtracting max score for stability. Ensure max_score isn't -inf where attn_scores is also -inf.
         # Replace -inf in final_max_score with a large negative number where attn_scores is also -inf to avoid inf - inf = nan
         safe_max_score = torch.where(final_max_score == -torch.inf, torch.finfo(final_max_score.dtype).min, final_max_score)
@@ -345,18 +336,18 @@ class RingAttentionEngine:
 
         exp_scores = torch.exp(stable_scores)
         # Check for NaNs/Infs after exponentiation (should ideally be only positive numbers or zero)
-        if torch.isnan(exp_scores).any():
-            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in exp_scores!", flush=True)
-        if (exp_scores == torch.inf).any():
-            print(f"[rank{self.rank}] WARNING: Positive Infs found in exp_scores!", flush=True)
+        # if torch.isnan(exp_scores).any():
+            # print(f"[rank{self.rank}] WARNING: NaNs/Infs found in exp_scores!", flush=True) # Removed
+        # if (exp_scores == torch.inf).any():
+            # print(f"[rank{self.rank}] WARNING: Positive Infs found in exp_scores!", flush=True) # Removed
 
         num_update = torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
         den_update = exp_scores.sum(dim=-1, keepdim=True)
 
         # Check for NaNs/Infs in updates before adding
-        if torch.isnan(num_update).any() or (num_update == torch.inf).any():
-            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in num_update!", flush=True)
-        if torch.isnan(den_update).any() or (den_update == torch.inf).any():
-            print(f"[rank{self.rank}] WARNING: NaNs/Infs found in den_update!", flush=True)
+        # if torch.isnan(num_update).any() or (num_update == torch.inf).any():
+            # print(f"[rank{self.rank}] WARNING: NaNs/Infs found in num_update!", flush=True) # Removed
+        # if torch.isnan(den_update).any() or (den_update == torch.inf).any():
+            # print(f"[rank{self.rank}] WARNING: NaNs/Infs found in den_update!", flush=True) # Removed
         # Cast back to original dtype before returning
         return (current_num + num_update).to(orig_dtype), (current_den + den_update).to(orig_dtype)

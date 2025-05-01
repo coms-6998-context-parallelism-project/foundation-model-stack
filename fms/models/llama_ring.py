@@ -327,11 +327,11 @@ class LLaMA(nn.Module):
             or not self.config.tie_heads
         ):
             self.shared = self.distributed_strategy.distribute_module(shared)
-        else:
-            logger.warning(
-                "You're using TP on a model with tied weights between head and embedding. "
-                "The tied weights won't be sharded, which can result in unexpected OOMs."
-            )
+        # else: # Already removed
+            # logger.warning(
+                # "You're using TP on a model with tied weights between head and embedding. "
+                # "The tied weights won't be sharded, which can result in unexpected OOMs."
+            # )
             self.shared = shared
 
         self.rot_emb = RotaryEmbedding(

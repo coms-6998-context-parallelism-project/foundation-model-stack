@@ -111,7 +111,7 @@ def __maybe_infer_model_variant(
         elif is_hf_configured and variant is not None:
             model_path_or_variant = variant
 
-        logger.info(f"inferring model configuration from {model_path_or_variant}")
+        # logger.info(f"inferring model configuration from {model_path_or_variant}") # Removed
 
         extra_kwargs = _infer_model_configuration(
             model_path_or_variant,
@@ -127,9 +127,10 @@ def __maybe_infer_model_variant(
             source = "hf"
             for kwarg in kwargs:
                 if kwarg in extra_kwargs:
-                    logger.warning(
-                        f"ignoring {kwarg} as the pretrained model config overrides it"
-                    )
+                    pass # Removed logger warning
+                    # logger.warning(
+                        # f"ignoring {kwarg} as the pretrained model config overrides it"
+                    # )
                 else:
                     extra_kwargs[kwarg] = kwargs[kwarg]
         else:
@@ -401,16 +402,16 @@ def get_model(
 
     if "distributed_strategy" not in extra_args:
         if distributed_strategy == "tp":
-            print("using tensor parallel")
+            # print("using tensor parallel") # Already removed
             extra_args["distributed_strategy"] = TensorParallelStrategy(group)
         elif distributed_strategy == "mp":
-            print("using model parallel")
+            # print("using model parallel") # Already removed
             devices = [i for i in range(torch.cuda.device_count())]
             extra_args["distributed_strategy"] = UniformModelParallelStrategy(
                 devices, _guess_num_layers(lazy_sd)
             )
     elif distributed_strategy == "ring": # Use the ring_block_size from kwargs here
-        print("using ring attention strategy")
+        # print("using ring attention strategy") # Already removed
         block_size = extra_args.get("ring_block_size", 32) # Default to 32 if not provided
         # Fetch block_size from kwargs, default to 1024 if not provided
         block_size = extra_args.get("ring_attn_block_size", 32)

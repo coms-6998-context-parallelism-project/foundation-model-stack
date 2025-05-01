@@ -163,18 +163,18 @@ if world_size > 1:
     # Fix until PT 2.3
     torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
 
-print("loading model")
+# print("loading model") # Removed
 model = models.get_model(args.architecture, args.variant, device_type=args.device_type)
 
 if args.unfuse_weights:
-    print("unfusing weights")
+    # print("unfusing weights") # Removed
     model = fusion.apply_unfuse_weights(model)
 
 tokenizer = tokenizers.get_tokenizer(args.tokenizer)
 
 model.eval()
 torch.set_grad_enabled(False)
-print(f"loading complete on rank {local_rank}")
+# print(f"loading complete on rank {local_rank}") # Removed
 
 SEQ_LEN = args.seq_len
 BATCH_SIZE = args.batch_size
@@ -271,8 +271,8 @@ def log_result(result):
     if local_rank == 0:
         median = statistics.median(result)
         per_token = median / MAX_NEW_TOKENS
-        ms = per_token * 1000
-        print(f"\t{ms:0.2f} ms per token")
+        ms = per_token * 1000 # Keep this calculation, but remove the print
+        # print(f"\t{ms:0.2f} ms per token") # Removed
 
 
 def bench_one(use_cache):
@@ -308,12 +308,12 @@ if not args.skip_eager_runs:
     if not args.skip_e2e_runs:
         print0("End-to-end sequence generation")
         if not args.skip_kvcache_runs:
-            bench_end_to_end(True, e2e_expected_cache)
+            bench_end_to_end(True, e2e_expected_cache) # Removed print from inside function
         if not args.skip_nokvcache_runs:
-            bench_end_to_end(False, e2e_expected_nocache)
+            bench_end_to_end(False, e2e_expected_nocache) # Removed print from inside function
 
 if not args.skip_compile_runs:
-    print0("Compiling model...")
+    # print0("Compiling model...") # Removed
 
     # This is to prevent a bug in PT 2.1 that has been fixed in PT 2.2 nightlies
     torch._inductor.config.joint_graph_constant_folding = False
@@ -323,20 +323,20 @@ if not args.skip_compile_runs:
     # `RuntimeError: Expected curr_block->ptr == block_state.ptr to be true, but got false.`
     model = torch.compile(model, dynamic=True, mode=args.compile_mode)
 
-    print0()
-    print0("Compiled results:")
-    print0("==========")
+    # print0() # Removed
+    # print0("Compiled results:") # Removed
+    # print0("==========") # Removed
 
     if not args.skip_single_token_runs:
         # Warmup. Especially with torch.compile, first inference pass can be slow.
-        print(f"Warming up the compiled model for single token in rank {local_rank}")
+        # print(f"Warming up the compiled model for single token in rank {local_rank}") # Removed
         # Activate dynamo logs to ensure some output during compilation
         torch._logging.set_logs(dynamo=logging.INFO)
         if not args.skip_kvcache_runs:
             one_token(model, True)
         if not args.skip_nokvcache_runs:
             one_token(model, False)
-        print(f"Model has warmed up in rank {local_rank}")
+        # print(f"Model has warmed up in rank {local_rank}") # Removed
 
         # These get much better results with mode='reduce-overhead' but can lead to
         # some memory issues
@@ -347,13 +347,13 @@ if not args.skip_compile_runs:
             bench_one(False)
 
     if not args.skip_e2e_runs:
-        print0()
-        print(f"Warming up the compiled model e2e in rank {local_rank}")
+        # print0() # Removed
+        # print(f"Warming up the compiled model e2e in rank {local_rank}") # Removed
         if not args.skip_kvcache_runs:
             end_to_end(model, True, e2e_expected_cache)
         if not args.skip_nokvcache_runs:
             end_to_end(model, False, e2e_expected_nocache)
-        print(f"Model has warmed up e2e in rank {local_rank}")
+        # print(f"Model has warmed up e2e in rank {local_rank}") # Removed
 
         print0("(Compiled) End-to-end sequence generation")
         if not args.skip_kvcache_runs:

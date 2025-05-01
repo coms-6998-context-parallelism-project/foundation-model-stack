@@ -21,6 +21,11 @@ LOCAL_REPO_DIR="/Users/sadigulcelik/Documents/CompSci/HPML-2025-Spring/FMSwrappe
 BASELINE_ATTN_TYPE="sdpa" # The reference implementation
 TEST_ATTN_TYPE="ring"     # The implementation to test against the baseline
 
+# --- Default Paths (relative to repo root) ---
+# !!! ADJUST THESE PATHS to match your repository structure !!!
+DEFAULT_MODEL_REL_PATH="llama-hf" # Updated path
+DEFAULT_TOKENIZER_REL_PATH="llama-hf/tokenizer.model" # Updated path, assuming tokenizer is inside llama-hf
+
 # --- Set Current Paths ---
 if [[ "$RUN_LOCATION" == "insomnia" ]]; then
   CURRENT_REPO_DIR="$INSOMNIA_REPO_DIR"
@@ -29,6 +34,10 @@ else
   CURRENT_REPO_DIR="$LOCAL_REPO_DIR"
   PYTHON_SCRIPT_PATH="${CURRENT_REPO_DIR}/scripts/benchmark_attn.py"
 fi
+
+# Construct absolute default paths
+DEFAULT_MODEL_ABS_PATH="${CURRENT_REPO_DIR}/${DEFAULT_MODEL_REL_PATH}"
+DEFAULT_TOKENIZER_ABS_PATH="${CURRENT_REPO_DIR}/${DEFAULT_TOKENIZER_REL_PATH}"
 
 echo "[INFO] Navigating to repository: $CURRENT_REPO_DIR"
 cd "$CURRENT_REPO_DIR" || { echo "[ERROR] Failed to cd to repo"; exit 1; }
@@ -46,6 +55,33 @@ else
   rm -f benchmark_local_cpu_*.out # Clean up previous local formats
 fi
 
+# --- Cleanup Function ---
+cleanup() {
+    echo "" # Newline after Ctrl+C
+    echo "[INFO] Cleaning up..."
+    if [[ "$RUN_LOCATION" == "insomnia" ]] && [[ -n "$job_id" ]]; then
+        echo "[INFO] Attempting to cancel Slurm job $job_id..."
+        scancel "$job_id"
+    elif [[ "$RUN_LOCATION" == "local" ]] && [[ -n "$pid" ]]; then
+        echo "[INFO] Attempting to kill local process $pid..."
+        kill "$pid" 2>/dev/null # Suppress "No such process" error if already finished
+    fi
+    echo "[INFO] Exiting."
+    exit 130 # Standard exit code for Ctrl+C
+}
+
+trap cleanup SIGINT SIGTERM # Call cleanup function on Ctrl+C or termination
+
+# --- Prepare Arguments ---
+script_args=()
+if [[ $# -gt 0 ]]; then
+  echo "[INFO] Using user-provided arguments: $@"
+  script_args=("$@")
+else
+  echo "[INFO] No arguments provided, using default model/tokenizer paths."
+  script_args=(--model_path "$DEFAULT_MODEL_ABS_PATH" --tokenizer "$DEFAULT_TOKENIZER_ABS_PATH")
+fi
+
 if [[ "$RUN_LOCATION" == "insomnia" ]]; then
   # --- Insomnia/Slurm Execution ---
   echo "[INFO] Submitting Slurm benchmark job to compare $BASELINE_ATTN_TYPE (baseline) vs $TEST_ATTN_TYPE"
@@ -55,7 +91,7 @@ if [[ "$RUN_LOCATION" == "insomnia" ]]; then
     # The Slurm script will pass these directly to the python script.
     output=$(sbatch "$SLURM_SCRIPT_PATH" \
                --attn_types_to_compare "$BASELINE_ATTN_TYPE" "$TEST_ATTN_TYPE" \
-               "$@" 2>&1) # Pass along other args like --max_new_tokens
+               "${script_args[@]}" 2>&1) # Pass constructed args
     echo "[INFO] sbatch output: $output"
     job_id=$(echo "$output" | grep -oP 'Submitted batch job \K[0-9]+')
     if [[ -n "$job_id" ]]; then
@@ -94,8 +130,8 @@ else
       # e.g., --dtype fp32 might be needed for CPU
       "--dtype" "fp32"
   )
-  # Add user-provided arguments
-  python_command+=("$@")
+  # Add constructed arguments (defaults or user-provided)
+  python_command+=("${script_args[@]}")
 
   echo "[INFO] Executing: ${python_command[*]} > $output_file 2>&1 &"
   # Execute in background, redirect stdout/stderr
@@ -116,12 +152,9 @@ for i in $(seq 1 $max_wait_loops); do
     # Check if the process/job is still running before tailing indefinitely
     # For local, check PID; for Slurm, check job ID (optional, tail -f might be enough)
     echo "[INFO] Tailing output file. Check for 'Comparison Successful' or 'MISMATCH DETECTED'."
-    tail -f "$output_file"
-    # Wait for the background process to finish if running locally, after tail is interrupted (Ctrl+C)
-    if [[ "$RUN_LOCATION" == "local" ]]; then
-        wait $pid
-        echo "[INFO] Local process $pid finished with exit code $?."
-    fi
+    # tail -f will block here until interrupted (Ctrl+C) or the file is removed/rotated
+    # The trap handler will take over on interruption.
+    tail -f "$output_file" & wait $! # Wait specifically for tail to finish/be interrupted
     exit 0 # Exit successfully after finding and tailing the file
   fi
   echo -n "." # Progress indicator

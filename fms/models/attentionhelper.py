@@ -332,7 +332,7 @@ class RingAttentionEngine:
         # Replace potential NaN from (-inf - (-inf)) with -inf before exp
         stable_scores = torch.nan_to_num(stable_scores, nan=-torch.inf)
 
-        stable_scores = torch.clamp(stable_scores, max=80.0, min = -80.0)
+        stable_scores = torch.clamp(stable_scores, max=10.0, min = -10.0)
 
         exp_scores = torch.exp(stable_scores)
         # Check for NaNs/Infs after exponentiation (should ideally be only positive numbers or zero)

@@ -172,6 +172,7 @@ class LLaMA(nn.Module):
         distributed_strategy: DistributedStrategy = NoOpStrategy,
         **kwargs,
     ):
+        print(distributed_strategy)
         super(LLaMA, self).__init__()
         if config is not None:
             self.config = config

@@ -4,7 +4,7 @@ from typing import List
 
 import torch
 import torch.distributed
-from torch import nn
+from torch import nn, Tensor, distributed as dist
 
 from fms.utils import tp_wrapping
 
@@ -159,3 +159,79 @@ class TensorParallelStrategy(DistributedStrategy):
 
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
         return tp_wrapping.apply_tp(block, self.group)
+
+
+class RingAttentionStrategy(DistributedStrategy):
+
+    """
+    A strategy placeholder for Ring Attention.
+
+    This strategy itself doesn't modify the model structure significantly during
+    distribution (like TP or MP do). Instead, it primarily serves as a signal
+    and potentially holds configuration (like the process group) needed by the
+    attention mechanism's forward pass to implement the ring communication logic.
+
+    The actual sequence partitioning, communication, and computation logic for
+    ring attention should be implemented within the attention module's forward method.
+    """
+
+    def __init__(self, group=None, from_meta=False):
+        super().__init__(from_meta)
+        assert torch.distributed.is_initialized(), "RingAttentionStrategy requires an initialized process group"
+        self.group = group if group is not None else torch.distributed.GroupMember.WORLD
+        self.rank = self.group.rank()
+        # world_size needs to be stored for sharding/gathering logic
+        self.world_size = self.group.size()
+
+    def _distribute_module(
+        self, module: nn.Module, final_layers: bool = False
+    ) -> nn.Module:
+        # Ring attention typically requires the module to be replicated on each device.
+        # We assume the underlying setup (e.g., FSDP, manual placement) handles this.
+        # This strategy doesn't add further sharding like TP.
+        return module
+
+    def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
+        # Similar to _distribute_module, assume replication is handled elsewhere.
+        return block
+
+    def shard_input(self, x: Tensor) -> Tensor:
+        """
+        Shards the input tensor `x` along the sequence dimension for the current rank.
+        Assumes x has shape [batch_size, seq_len, emb_dim].
+        """
+        # If world size is 1, or sequence length is 1 (decode step), no sharding needed/possible
+        batch_size, seq_len = x.shape[:2]
+        if self.world_size == 1 or seq_len == 1:
+            return x
+        # Ensure sequence length is divisible by world size for simplicity
+        # TODO: Handle cases where seq_len is not divisible (e.g., padding)
+        if seq_len % self.world_size != 0:
+            raise ValueError(
+                f"Sequence length ({seq_len}) must be divisible by world size ({self.world_size}) for ring attention sharding."
+            )
+
+        local_seq_len = seq_len // self.world_size
+        # Split along dim 1 (sequence dimension) and select the chunk for the current rank
+        x_local = x.split(local_seq_len, dim=1)[self.rank]
+
+        # Return a contiguous view
+        return x_local.contiguous()
+
+    def gather_output(self, x_local: Tensor) -> Tensor:
+        """
+        Gathers the sharded output tensor `x_local` from all ranks along the sequence dimension.
+        Assumes x_local has shape [batch_size, local_seq_len, emb_dim].
+        """
+        # Check if world size is 1, no gather needed
+        if self.world_size == 1:
+            return x_local
+
+        # Prepare a list of tensors to receive gathered data
+        output_tensors = [torch.empty_like(x_local) for _ in range(self.world_size)]
+
+        # Perform all-gather operation
+        dist.all_gather(output_tensors, x_local.contiguous(), group=self.group)
+
+        # Concatenate along the sequence dimension (dim 1)
+        return torch.cat(output_tensors, dim=1)

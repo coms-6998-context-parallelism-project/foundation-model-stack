@@ -4,6 +4,7 @@ import time
 import os
 import atexit
 import torch
+from torch import distributed as dist # Import dist if needed by load_model
 from collections import defaultdict
 import functools # Needed for passing args to hooks easily
 
@@ -121,15 +122,31 @@ def load_model(args, attn_type):
     attn_algo = None
     group = None
     if attn_type == "ring":
-        if not dist.is_initialized():
+        # Only initialize distributed if running on GPU and not already initialized
+        if args.device_type == 'cuda' and not dist.is_initialized():
              print("Initializing process group for Ring Attention...")
-             dist.init_process_group() # Basic initialization, might need more config
-        group = dist.group.WORLD
-        distr_strat = "ring"
-        attn_algo = "ring"
-        print(f"Using distributed strategy: {distr_strat}, group size: {dist.get_world_size(group)}")
+             # Basic initialization, might need more config depending on Slurm setup
+             # Ensure backend is appropriate (nccl for GPU)
+             dist.init_process_group(backend='nccl' if torch.cuda.is_available() else 'gloo')
+             group = dist.group.WORLD
+             distr_strat = "ring"
+             attn_algo = "ring"
+             print(f"Using distributed strategy: {distr_strat}, group size: {dist.get_world_size(group)}")
+        elif args.device_type == 'cpu':
+             print("Warning: Ring attention requested on CPU. Distributed setup skipped. This may fail.")
+             distr_strat = None # Cannot use ring strategy on CPU
+             attn_algo = None # Cannot use ring algorithm on CPU
+        else: # Already initialized or GPU not used
+             group = dist.group.WORLD if dist.is_initialized() else None
+             distr_strat = "ring" if group else None
+             attn_algo = "ring" if group else None
+             if group:
+                 print(f"Using existing process group for Ring Attention. Size: {dist.get_world_size(group)}")
+             else:
+                 print("Warning: Ring attention requested but no process group available (not distributed?).")
+
     elif attn_type == "sdpa":
-        # Assuming sdpa runs on a single process/GPU
+        # Assuming sdpa runs on a single process/GPU or CPU
         distr_strat = None # Or NoOpStrategy if explicitly needed
         attn_algo = "sdpa" # Or None if sdpa is the default
         print(f"Using non-distributed setup for {attn_type}")
@@ -140,12 +157,31 @@ def load_model(args, attn_type):
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
     torch_dtype = dtype_map.get(args.dtype, None)
 
+    # Handle device placement for CPU vs GPU
+    if args.device_type == 'cuda':
+        if torch.cuda.is_available():
+            local_rank = int(os.getenv("LOCAL_RANK", 0))
+            device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
+        else:
+            print("Warning: CUDA device type requested but CUDA not available. Using CPU.")
+            device = torch.device("cpu")
+            args.device_type = 'cpu' # Correct the arg for downstream use
+            distr_strat = None # Force non-distributed on CPU
+            attn_algo = None if attn_type == 'ring' else attn_algo # Ring algo won't work
+    else: # cpu or mps
+        device = torch.device(args.device_type)
+        distr_strat = None # Force non-distributed on CPU/MPS
+        attn_algo = None if attn_type == 'ring' else attn_algo # Ring algo won't work
+
+    print(f"Loading model to device: {device}")
+
     model = get_model(
         args.architecture,
         args.variant,
         model_path=args.model_path,
         source=args.model_source,
-        device_type=args.device_type,
+        device_type=args.device_type, # Use potentially corrected device type
         distributed_strategy=distr_strat,
         group=group,
         data_type=torch_dtype,
@@ -156,6 +192,9 @@ def load_model(args, attn_type):
     # This might involve setting a config flag or modifying the model post-load
     # if get_model doesn't handle it directly via an argument.
     # Example (conceptual): model.config.attn_implementation = attn_type
+
+    # Move model to the correct device *after* loading
+    model.to(device)
 
     return model
 
@@ -175,46 +214,79 @@ def run_comparison_benchmark(args):
     print(f"Starting comparison: Baseline='{baseline_attn_type}', Test='{test_attn_type}'")
     print(f"Comparison tolerance: atol={ATOL}, rtol={RTOL}")
 
+    # Determine device based on args and availability
+    if args.device_type == 'cuda' and torch.cuda.is_available():
+        local_rank = int(os.getenv("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        print(f"Using CUDA device: {device}")
+    else:
+        if args.device_type == 'cuda':
+            print("Warning: CUDA requested but not available. Using CPU.")
+        device = torch.device("cpu")
+        args.device_type = 'cpu' # Ensure args reflect reality
+        print(f"Using CPU device: {device}")
+
+
     # Common setup
     tokenizer = load_tokenizer(args.tokenizer)
     # Use a fixed prompt for consistency
     prompt = args.prompt if args.prompt else "Once upon a time"
     print(f"Using prompt: '{prompt}'")
-    inputs = tokenizer(prompt, return_tensors="pt").to(args.device_type)
+    # Move inputs to the determined device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_ids = inputs.input_ids
     max_gen_len = args.max_new_tokens
+    use_cache = args.use_cache # Get cache setting from args
 
     # --- 1. Baseline Run ---
     print(f"\n--- Running Baseline: {baseline_attn_type} ---")
     # Note: Loading might need distributed setup depending on attn_type
-    model_baseline = load_model(args, baseline_attn_type)
+    model_baseline = load_model(args, baseline_attn_type) # load_model handles device placement
     model_baseline.eval()
 
     # Register hooks for baseline run
     hooks_baseline = []
     try:
-        num_layers = model_baseline.config.nlayers # Adapt if config structure differs
+        # Try to access nlayers, common in LLaMA-like configs
+        num_layers = model_baseline.config.nlayers
     except AttributeError:
-        print("Error: Could not determine number of layers from model_baseline.config.nlayers", file=sys.stderr)
-        sys.exit(1)
+        try:
+            # Fallback for configs using num_hidden_layers
+            num_layers = model_baseline.config.num_hidden_layers
+        except AttributeError:
+            print("Error: Could not determine number of layers from model_baseline.config (tried nlayers, num_hidden_layers)", file=sys.stderr)
+            sys.exit(1)
 
     print(f"Registering hooks for {num_layers} layers...")
     for i in range(num_layers):
         try:
             # Adjust path based on actual model structure (e.g., model.layers or model.base_model.layers)
-            layer = model_baseline.base_model.layers[i] if hasattr(model_baseline, 'base_model') else model_baseline.layers[i]
-            # Hook after attention module
-            hooks_baseline.append(
-                layer.attn.register_forward_hook( # Assuming attn is the attribute name
-                    get_comparison_hook(i, "attn_output", True, baseline_attn_type, test_attn_type)
+            # Common paths: model.layers (FMS Llama), model.base_model.layers (HF Llama)
+            layer = model_baseline.base_model.layers[i] if hasattr(model_baseline, 'base_model') and hasattr(model_baseline.base_model, 'layers') else model_baseline.layers[i]
+
+            # Determine attribute names for attention and MLP
+            # Common names: attn/self_attn, ff_sub_layer/mlp
+            attn_attr = 'self_attn' if hasattr(layer, 'self_attn') else 'attn'
+            mlp_attr = 'mlp' if hasattr(layer, 'mlp') else 'ff_sub_layer'
+
+            if not hasattr(layer, attn_attr):
+                print(f"Warning: Layer {i} does not have attribute '{attn_attr}'. Skipping attention hook.", file=sys.stderr)
+            else:
+                hooks_baseline.append(
+                    getattr(layer, attn_attr).register_forward_hook(
+                        get_comparison_hook(i, "attn_output", True, baseline_attn_type, test_attn_type)
+                    )
                 )
-            )
-            # Hook after MLP module
-            hooks_baseline.append(
-                layer.ff_sub_layer.register_forward_hook( # Assuming ff_sub_layer is the attribute name
-                     get_comparison_hook(i, "mlp_output", True, baseline_attn_type, test_attn_type)
+
+            if not hasattr(layer, mlp_attr):
+                 print(f"Warning: Layer {i} does not have attribute '{mlp_attr}'. Skipping MLP hook.", file=sys.stderr)
+            else:
+                hooks_baseline.append(
+                    getattr(layer, mlp_attr).register_forward_hook(
+                         get_comparison_hook(i, "mlp_output", True, baseline_attn_type, test_attn_type)
+                    )
                 )
-            )
             # Hook after the full layer (including residuals, norms)
             hooks_baseline.append(
                 layer.register_forward_hook(
@@ -238,18 +310,30 @@ def run_comparison_benchmark(args):
         for step in range(max_gen_len):
             current_token_idx = step # Set global index for hooks
             # Prepare inputs for the next step
-            # Note: Using use_cache=True is important for performance and correctness
-            # The prepare_inputs_for_generation method might not exist, adapt if needed
-            current_input_ids = generated_ids_baseline[:, -1:] if use_cache and past_key_values else generated_ids_baseline
+            # If using cache and past_key_values exist, only need the last token ID
+            current_input_ids = generated_ids_baseline[:, -1:] if use_cache and past_key_values is not None else generated_ids_baseline
 
             # Forward pass - hooks will capture data here
             # Pass attn_algorithm explicitly if needed by the model's forward
-            outputs = model_baseline(
-                current_input_ids,
-                past_key_value_states=past_key_values,
-                use_cache=args.use_cache,
-                attn_algorithm=baseline_attn_type if baseline_attn_type == 'ring' else None # Pass 'ring' if baseline is ring
-            )
+            # Handle potential differences in forward signature (e.g., past_key_value_states vs past_key_values)
+            try:
+                outputs = model_baseline(
+                    current_input_ids,
+                    past_key_value_states=past_key_values, # FMS style
+                    use_cache=use_cache,
+                    attn_algorithm=baseline_attn_type if baseline_attn_type == 'ring' else None # Pass 'ring' if baseline is ring
+                )
+            except TypeError as e:
+                 # Fallback for HF style signature
+                 if 'past_key_values' in str(e):
+                     outputs = model_baseline(
+                         current_input_ids,
+                         past_key_values=past_key_values, # HF style
+                         use_cache=use_cache,
+                         # attn_algorithm might not be supported in HF forward
+                     )
+                 else:
+                     raise e # Re-raise if it's a different TypeError
 
             # Check for unexpected errors during baseline hook execution
             if comparison_errors:
@@ -259,10 +343,17 @@ def run_comparison_benchmark(args):
                  for handle in hooks_baseline: handle.remove()
                  sys.exit(1)
 
-            # Process outputs (assuming standard output format)
-            logits = outputs[0] if isinstance(outputs, tuple) else outputs
-            if args.use_cache:
-                past_key_values = outputs[1] if isinstance(outputs, tuple) and len(outputs) > 1 else None
+            # Process outputs (handle both tuple and dict/dataclass outputs)
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+                if use_cache and len(outputs) > 1:
+                    past_key_values = outputs[1]
+            elif hasattr(outputs, 'logits'): # HF-style output object
+                logits = outputs.logits
+                if use_cache and hasattr(outputs, 'past_key_values'):
+                    past_key_values = outputs.past_key_values
+            else: # Assume raw logits tensor
+                logits = outputs
 
             # Get the next token
             next_token_logits = logits[:, -1, :]
@@ -292,7 +383,8 @@ def run_comparison_benchmark(args):
     # Clear baseline model from memory
     del model_baseline
     del past_key_values
-    torch.cuda.empty_cache()
+    if args.device_type == 'cuda':
+        torch.cuda.empty_cache()
 
     # --- 2. Test Run ---
     print(f"\n--- Running Test: {test_attn_type} ---")
@@ -304,8 +396,11 @@ def run_comparison_benchmark(args):
     try:
         num_layers_test = model_test.config.nlayers
     except AttributeError:
-        print("Error: Could not determine number of layers from model_test.config.nlayers", file=sys.stderr)
-        sys.exit(1)
+         try:
+            num_layers_test = model_test.config.num_hidden_layers
+         except AttributeError:
+            print("Error: Could not determine number of layers from model_test.config", file=sys.stderr)
+            sys.exit(1)
 
     if num_layers != num_layers_test:
          print(f"Error: Baseline ({num_layers}) and test ({num_layers_test}) models have different numbers of layers!", file=sys.stderr)
@@ -315,9 +410,14 @@ def run_comparison_benchmark(args):
     for i in range(num_layers):
         try:
             # Adjust path based on actual model structure
-            layer = model_test.base_model.layers[i] if hasattr(model_test, 'base_model') else model_test.layers[i]
-            hooks_test.append(layer.attn.register_forward_hook(get_comparison_hook(i, "attn_output", False, baseline_attn_type, test_attn_type)))
-            hooks_test.append(layer.ff_sub_layer.register_forward_hook(get_comparison_hook(i, "mlp_output", False, baseline_attn_type, test_attn_type)))
+            layer = model_test.base_model.layers[i] if hasattr(model_test, 'base_model') and hasattr(model_test.base_model, 'layers') else model_test.layers[i]
+            attn_attr = 'self_attn' if hasattr(layer, 'self_attn') else 'attn'
+            mlp_attr = 'mlp' if hasattr(layer, 'mlp') else 'ff_sub_layer'
+
+            if hasattr(layer, attn_attr):
+                hooks_test.append(getattr(layer, attn_attr).register_forward_hook(get_comparison_hook(i, "attn_output", False, baseline_attn_type, test_attn_type)))
+            if hasattr(layer, mlp_attr):
+                hooks_test.append(getattr(layer, mlp_attr).register_forward_hook(get_comparison_hook(i, "mlp_output", False, baseline_attn_type, test_attn_type)))
             hooks_test.append(layer.register_forward_hook(get_comparison_hook(i, "layer_output", False, baseline_attn_type, test_attn_type)))
         except Exception as e:
             print(f"Error registering hook for layer {i}: {e}", file=sys.stderr)
@@ -336,16 +436,25 @@ def run_comparison_benchmark(args):
     with torch.no_grad():
         for step in range(num_tokens_to_generate):
             current_token_idx = step # Set global index for hooks
-            current_input_ids = generated_ids_test[:, -1:] if use_cache and past_key_values else generated_ids_test
+            current_input_ids = generated_ids_test[:, -1:] if use_cache and past_key_values is not None else generated_ids_test
 
             # Forward pass - hooks will compare data here
             # Pass attn_algorithm explicitly if needed
-            outputs = model_test(
-                current_input_ids,
-                past_key_value_states=past_key_values,
-                use_cache=args.use_cache,
-                attn_algorithm=test_attn_type if test_attn_type == 'ring' else None # Pass 'ring' if test is ring
-            )
+            try:
+                outputs = model_test(
+                    current_input_ids,
+                    past_key_value_states=past_key_values, # FMS style
+                    use_cache=use_cache,
+                    attn_algorithm=test_attn_type if test_attn_type == 'ring' else None # Pass 'ring' if test is ring
+                )
+            except TypeError as e:
+                 if 'past_key_values' in str(e):
+                     outputs = model_test(
+                         current_input_ids,
+                         past_key_values=past_key_values, # HF style
+                         use_cache=use_cache,
+                     )
+                 else: raise e
 
             # Check for comparison errors *after* the forward pass for this token
             if comparison_errors:
@@ -358,9 +467,16 @@ def run_comparison_benchmark(args):
                 sys.exit(1) # Terminate on first detected error
 
             # Process outputs
-            logits = outputs[0] if isinstance(outputs, tuple) else outputs
-            if args.use_cache:
-                past_key_values = outputs[1] if isinstance(outputs, tuple) and len(outputs) > 1 else None
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+                if use_cache and len(outputs) > 1:
+                    past_key_values = outputs[1]
+            elif hasattr(outputs, 'logits'):
+                logits = outputs.logits
+                if use_cache and hasattr(outputs, 'past_key_values'):
+                    past_key_values = outputs.past_key_values
+            else:
+                logits = outputs
 
             # Get the next token
             next_token_logits = logits[:, -1, :]

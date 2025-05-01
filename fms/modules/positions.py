@@ -341,6 +341,7 @@ class RotaryEmbedding(PositionEncoder):
         # Directly index cache with the provided (global) position_ids
         try:
             freqs = self.cached_freqs[dev_idx][alpha][position_ids].float() # Shape [B, S_pos, D/2, 2, 2]
+            freqs = freqs.to(q_.device)
             # --- Prompt 16: Check frequency indexing shape ---
             assert freqs.size(0) == batch_size, f"Freqs batch size mismatch: expected {batch_size}, got {freqs.size(0)}"
             assert freqs.size(1) == position_ids.size(1), f"Freqs seq len mismatch: expected {position_ids.size(1)} (from position_ids), got {freqs.size(1)}"

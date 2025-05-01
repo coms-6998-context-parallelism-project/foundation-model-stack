@@ -436,7 +436,9 @@ def run_comparison_benchmark(args):
     if baseline_tokens_generated > 0:
         print(f"Baseline Time per token: {(baseline_duration * 1000) / baseline_tokens_generated:.2f}ms")
 
-    baseline_response = tokenizer.decode(generated_ids_baseline[0], skip_special_tokens=True)
+    # Decode using the two-step process
+    baseline_tokens = tokenizer.convert_ids_to_tokens(generated_ids_baseline[0].tolist())
+    baseline_response = tokenizer.convert_tokens_to_string(baseline_tokens)
     print(f"Baseline Response Length: {baseline_tokens_generated} tokens")
     if args.print_response: print(f"Baseline Response:\n{baseline_response}")
 
@@ -604,7 +606,9 @@ def run_comparison_benchmark(args):
         if test_tokens_generated > 0:
              print(f"Test Time per token: {(test_duration * 1000) / test_tokens_generated:.2f}ms")
 
-        test_response = tokenizer.decode(generated_ids_test[0], skip_special_tokens=True)
+        # Decode using the two-step process
+        test_tokens = tokenizer.convert_ids_to_tokens(generated_ids_test[0].tolist())
+        test_response = tokenizer.convert_tokens_to_string(test_tokens)
         print(f"Test Response Length: {test_tokens_generated} tokens")
         if args.print_response: print(f"Test Response:\n{test_response}")
 
@@ -664,4 +668,3 @@ if __name__ == "__main__":
     finally:
         # Ensure cancellation is attempted even if atexit fails or script is killed abruptly
         _cancel_slurm_job()
-

@@ -44,7 +44,19 @@ def get_comparison_hook(layer_idx, output_name, is_baseline_run, baseline_attn_t
         # We usually care about the main hidden_state tensor
         # Output might be a tuple (hidden_states, cache, ...) - adapt if needed
         try:
-            output_tensor = output[0] if isinstance(output, tuple) else output
+            # Handle cases where output might be the raw tensor or a tuple/list
+            if isinstance(output, (tuple, list)):
+                # Heuristic: find the first tensor that matches expected shape characteristics
+                # This might need refinement based on specific layer outputs
+                potential_tensors = [o for o in output if isinstance(o, torch.Tensor) and o.ndim >= 3]
+                if not potential_tensors:
+                    raise ValueError("No suitable tensor found in layer output tuple/list")
+                output_tensor = potential_tensors[0] # Take the first likely candidate
+            elif isinstance(output, torch.Tensor):
+                output_tensor = output
+            else:
+                 raise TypeError(f"Unexpected output type from layer: {type(output)}")
+
             output_tensor = output_tensor.detach() # Detach from graph
         except Exception as e:
             print(f"[Hook Error] Could not extract tensor from output at Layer {layer_idx}, Output '{output_name}'. Error: {e}", file=sys.stderr)
@@ -106,7 +118,7 @@ def get_comparison_hook(layer_idx, output_name, is_baseline_run, baseline_attn_t
 # --- Helper functions (assuming these exist or are adapted) ---
 def load_tokenizer(tokenizer_path):
     """Loads the tokenizer."""
-    # Replace with your actual tokenizer loading logic
+    # Use the FMS utility which should handle SentencePiece correctly
     return tokenizers.get_tokenizer(tokenizer_path)
 
 def load_model(args, attn_type):
@@ -123,11 +135,11 @@ def load_model(args, attn_type):
     group = None
     if attn_type == "ring":
         # Only initialize distributed if running on GPU and not already initialized
-        if args.device_type == 'cuda' and not dist.is_initialized():
+        if args.device_type == 'cuda' and torch.cuda.is_available() and not dist.is_initialized():
              print("Initializing process group for Ring Attention...")
              # Basic initialization, might need more config depending on Slurm setup
              # Ensure backend is appropriate (nccl for GPU)
-             dist.init_process_group(backend='nccl' if torch.cuda.is_available() else 'gloo')
+             dist.init_process_group(backend='nccl')
              group = dist.group.WORLD
              distr_strat = "ring"
              attn_algo = "ring"
@@ -136,14 +148,15 @@ def load_model(args, attn_type):
              print("Warning: Ring attention requested on CPU. Distributed setup skipped. This may fail.")
              distr_strat = None # Cannot use ring strategy on CPU
              attn_algo = None # Cannot use ring algorithm on CPU
-        else: # Already initialized or GPU not used
-             group = dist.group.WORLD if dist.is_initialized() else None
-             distr_strat = "ring" if group else None
-             attn_algo = "ring" if group else None
-             if group:
-                 print(f"Using existing process group for Ring Attention. Size: {dist.get_world_size(group)}")
-             else:
-                 print("Warning: Ring attention requested but no process group available (not distributed?).")
+        elif dist.is_initialized(): # Already initialized (e.g. via torchrun)
+             group = dist.group.WORLD
+             distr_strat = "ring"
+             attn_algo = "ring"
+             print(f"Using existing process group for Ring Attention. Size: {dist.get_world_size(group)}")
+        else: # GPU requested but not available, or not initialized for other reasons
+             print(f"Warning: Ring attention requested but cannot initialize distributed group (device: {args.device_type}, cuda_available: {torch.cuda.is_available()}, dist_init: {dist.is_initialized()}).")
+             distr_strat = None
+             attn_algo = None
 
     elif attn_type == "sdpa":
         # Assuming sdpa runs on a single process/GPU or CPU
@@ -176,6 +189,8 @@ def load_model(args, attn_type):
 
     print(f"Loading model to device: {device}")
 
+    # Pass attn_algorithm to get_model if it's used for selecting implementation during load
+    # Or handle it post-load if necessary
     model = get_model(
         args.architecture,
         args.variant,
@@ -185,13 +200,18 @@ def load_model(args, attn_type):
         distributed_strategy=distr_strat,
         group=group,
         data_type=torch_dtype,
-        # Pass attn_algorithm to get_model if it influences model structure/loading
-        # attn_algorithm=attn_algo, # This might not be needed if handled post-load
+        # attn_algorithm=attn_algo, # Pass if get_model uses it
     )
+
     # Crucially, ensure the loaded model uses the correct attention implementation.
     # This might involve setting a config flag or modifying the model post-load
     # if get_model doesn't handle it directly via an argument.
-    # Example (conceptual): model.config.attn_implementation = attn_type
+    # Example (conceptual, might need adjustment based on FMS model structure):
+    # if hasattr(model.config, 'attn_implementation'):
+    #    model.config.attn_implementation = attn_type
+    # Or maybe loop through layers:
+    # for layer in model.base_model.layers:
+    #    layer.attn.implementation = attn_type # Highly dependent on actual structure
 
     # Move model to the correct device *after* loading
     model.to(device)
@@ -233,11 +253,16 @@ def run_comparison_benchmark(args):
     # Use a fixed prompt for consistency
     prompt = args.prompt if args.prompt else "Once upon a time"
     print(f"Using prompt: '{prompt}'")
-    # Encode the prompt using the tokenizer's encode method
-    # Assuming the tokenizer has an 'encode' method that returns a list of IDs
-    encoded_prompt = tokenizer.encode(prompt)
-    inputs = torch.tensor([encoded_prompt], dtype=torch.long, device=device) # Create tensor manually
-    input_ids = inputs.input_ids
+    # --- Correct Tokenizer Usage ---
+    prompt_tokens = tokenizer.tokenize(prompt)
+    encoded_prompt = tokenizer.convert_tokens_to_ids(prompt_tokens)
+    # Add BOS token if tokenizer doesn't do it automatically
+    if tokenizer.bos_token_id is not None and encoded_prompt[0] != tokenizer.bos_token_id:
+        encoded_prompt.insert(0, tokenizer.bos_token_id)
+    # Create tensor and move to device
+    initial_input_ids = torch.tensor([encoded_prompt], dtype=torch.long, device=device)
+    # --- End Correct Tokenizer Usage ---
+
     max_gen_len = args.max_new_tokens
     use_cache = args.use_cache # Get cache setting from args
 
@@ -303,7 +328,7 @@ def run_comparison_benchmark(args):
 
     # Manual generation loop for baseline
     print(f"Generating baseline tokens (max {max_gen_len})...")
-    generated_ids_baseline = input_ids
+    generated_ids_baseline = initial_input_ids
     past_key_values = None
     baseline_outputs.clear() # Ensure clean state
     comparison_errors.clear() # Ensure clean state
@@ -311,9 +336,22 @@ def run_comparison_benchmark(args):
     with torch.no_grad():
         for step in range(max_gen_len):
             current_token_idx = step # Set global index for hooks
-            # Prepare inputs for the next step
-            # If using cache and past_key_values exist, only need the last token ID
-            current_input_ids = generated_ids_baseline[:, -1:] if use_cache and past_key_values is not None else generated_ids_baseline
+
+            # --- Calculate position_ids ---
+            current_seq_len = generated_ids_baseline.shape[1]
+            if use_cache and past_key_values is not None:
+                # Decode phase: position is the current total length - 1
+                current_input_ids = generated_ids_baseline[:, -1:]
+                # Position ID should be the index of the token we are *about* to generate
+                # which is the current length of the sequence *before* adding the new token.
+                # The cache length should reflect the length *before* this step.
+                cache_len = past_key_values[0][0].size(-2) # Assuming cache shape [B, H, S, D]
+                position_ids = torch.tensor([[cache_len]], dtype=torch.long, device=device)
+            else:
+                # Prefill phase: positions are 0 to current_seq_len - 1
+                current_input_ids = generated_ids_baseline
+                position_ids = torch.arange(0, current_seq_len, dtype=torch.long, device=device).unsqueeze(0)
+            # --- End position_ids calculation ---
 
             # Forward pass - hooks will capture data here
             # Pass attn_algorithm explicitly if needed by the model's forward
@@ -321,6 +359,7 @@ def run_comparison_benchmark(args):
             try:
                 outputs = model_baseline(
                     current_input_ids,
+                    position_ids=position_ids, # Pass calculated position_ids
                     past_key_value_states=past_key_values, # FMS style
                     use_cache=use_cache,
                     attn_algorithm=baseline_attn_type if baseline_attn_type == 'ring' else None # Pass 'ring' if baseline is ring
@@ -330,12 +369,19 @@ def run_comparison_benchmark(args):
                  if 'past_key_values' in str(e):
                      outputs = model_baseline(
                          current_input_ids,
+                         position_ids=position_ids, # Pass calculated position_ids
                          past_key_values=past_key_values, # HF style
                          use_cache=use_cache,
                          # attn_algorithm might not be supported in HF forward
                      )
                  else:
-                     raise e # Re-raise if it's a different TypeError
+                     # If it's not the past_key_values error, re-raise it
+                     print(f"TypeError during baseline forward: {e}", file=sys.stderr)
+                     raise e
+            except Exception as e:
+                 print(f"Unexpected error during baseline forward: {e}", file=sys.stderr)
+                 raise e
+
 
             # Check for unexpected errors during baseline hook execution
             if comparison_errors:
@@ -348,14 +394,26 @@ def run_comparison_benchmark(args):
             # Process outputs (handle both tuple and dict/dataclass outputs)
             if isinstance(outputs, tuple):
                 logits = outputs[0]
-                if use_cache and len(outputs) > 1:
+                if use_cache and len(outputs) > 1 and outputs[1] is not None:
                     past_key_values = outputs[1]
+                else:
+                    # Handle case where cache is expected but not returned (e.g., ring might not support it yet)
+                    if use_cache:
+                        # print(f"Warning: use_cache=True but baseline model did not return cache at step {step}.") # Optional warning
+                        past_key_values = None # Ensure cache is reset if not returned
             elif hasattr(outputs, 'logits'): # HF-style output object
                 logits = outputs.logits
-                if use_cache and hasattr(outputs, 'past_key_values'):
+                if use_cache and hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
                     past_key_values = outputs.past_key_values
+                else:
+                    if use_cache:
+                        # print(f"Warning: use_cache=True but baseline model did not return cache at step {step}.") # Optional warning
+                        past_key_values = None
             else: # Assume raw logits tensor
                 logits = outputs
+                if use_cache:
+                    # print(f"Warning: use_cache=True but baseline model did not return cache at step {step}.") # Optional warning
+                    past_key_values = None
 
             # Get the next token
             next_token_logits = logits[:, -1, :]
@@ -373,7 +431,7 @@ def run_comparison_benchmark(args):
         handle.remove()
     print("Baseline run complete.")
     baseline_duration = end_time_baseline - start_time_baseline
-    baseline_tokens_generated = generated_ids_baseline.shape[1] - input_ids.shape[1]
+    baseline_tokens_generated = generated_ids_baseline.shape[1] - initial_input_ids.shape[1]
     print(f"Baseline Duration: {baseline_duration:.3f}s")
     if baseline_tokens_generated > 0:
         print(f"Baseline Time per token: {(baseline_duration * 1000) / baseline_tokens_generated:.2f}ms")
@@ -384,7 +442,7 @@ def run_comparison_benchmark(args):
 
     # Clear baseline model from memory
     del model_baseline
-    del past_key_values
+    del past_key_values # Delete baseline cache
     if args.device_type == 'cuda':
         torch.cuda.empty_cache()
 
@@ -430,21 +488,32 @@ def run_comparison_benchmark(args):
     # Generate only as many tokens as the baseline did
     num_tokens_to_generate = baseline_tokens_generated
     print(f"Generating test tokens and comparing (up to {num_tokens_to_generate} tokens)...")
-    generated_ids_test = input_ids
-    past_key_values = None
+    generated_ids_test = initial_input_ids # Start from the same initial prompt
+    past_key_values = None # Reset cache for test run
     comparison_errors.clear() # Reset errors for test run
     start_time_test = time.perf_counter()
 
     with torch.no_grad():
         for step in range(num_tokens_to_generate):
             current_token_idx = step # Set global index for hooks
-            current_input_ids = generated_ids_test[:, -1:] if use_cache and past_key_values is not None else generated_ids_test
+
+            # --- Calculate position_ids (same logic as baseline) ---
+            current_seq_len = generated_ids_test.shape[1]
+            if use_cache and past_key_values is not None:
+                current_input_ids = generated_ids_test[:, -1:]
+                cache_len = past_key_values[0][0].size(-2)
+                position_ids = torch.tensor([[cache_len]], dtype=torch.long, device=device)
+            else:
+                current_input_ids = generated_ids_test
+                position_ids = torch.arange(0, current_seq_len, dtype=torch.long, device=device).unsqueeze(0)
+            # --- End position_ids calculation ---
 
             # Forward pass - hooks will compare data here
             # Pass attn_algorithm explicitly if needed
             try:
                 outputs = model_test(
                     current_input_ids,
+                    position_ids=position_ids, # Pass calculated position_ids
                     past_key_value_states=past_key_values, # FMS style
                     use_cache=use_cache,
                     attn_algorithm=test_attn_type if test_attn_type == 'ring' else None # Pass 'ring' if test is ring
@@ -453,10 +522,16 @@ def run_comparison_benchmark(args):
                  if 'past_key_values' in str(e):
                      outputs = model_test(
                          current_input_ids,
+                         position_ids=position_ids, # Pass calculated position_ids
                          past_key_values=past_key_values, # HF style
                          use_cache=use_cache,
                      )
-                 else: raise e
+                 else:
+                     print(f"TypeError during test forward: {e}", file=sys.stderr)
+                     raise e
+            except Exception as e:
+                 print(f"Unexpected error during test forward: {e}", file=sys.stderr)
+                 raise e
 
             # Check for comparison errors *after* the forward pass for this token
             if comparison_errors:
@@ -471,14 +546,19 @@ def run_comparison_benchmark(args):
             # Process outputs
             if isinstance(outputs, tuple):
                 logits = outputs[0]
-                if use_cache and len(outputs) > 1:
+                if use_cache and len(outputs) > 1 and outputs[1] is not None:
                     past_key_values = outputs[1]
+                else:
+                    if use_cache: past_key_values = None
             elif hasattr(outputs, 'logits'):
                 logits = outputs.logits
-                if use_cache and hasattr(outputs, 'past_key_values'):
+                if use_cache and hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
                     past_key_values = outputs.past_key_values
+                else:
+                    if use_cache: past_key_values = None
             else:
                 logits = outputs
+                if use_cache: past_key_values = None
 
             # Get the next token
             next_token_logits = logits[:, -1, :]
@@ -486,12 +566,18 @@ def run_comparison_benchmark(args):
             generated_ids_test = torch.cat([generated_ids_test, next_token], dim=-1)
 
             # Optional: Check if generated token matches baseline token at this step
-            baseline_next_token = generated_ids_baseline[:, input_ids.shape[1] + step]
-            if next_token.item() != baseline_next_token.item():
-                 print(f"\nWarning: Generated token mismatch at step {step}!")
-                 print(f"  Test generated: {next_token.item()} ('{tokenizer.decode(next_token[0])}')")
-                 print(f"  Baseline generated: {baseline_next_token.item()} ('{tokenizer.decode(baseline_next_token)}')")
-                 # This is often expected if intermediate values diverge even slightly
+            # Index into baseline needs to account for initial prompt length
+            baseline_next_token_idx = initial_input_ids.shape[1] + step
+            if baseline_next_token_idx < generated_ids_baseline.shape[1]:
+                baseline_next_token = generated_ids_baseline[:, baseline_next_token_idx]
+                if next_token.item() != baseline_next_token.item():
+                     print(f"\nWarning: Generated token mismatch at step {step}!")
+                     print(f"  Test generated: {next_token.item()} ('{tokenizer.decode(next_token[0])}')")
+                     print(f"  Baseline generated: {baseline_next_token.item()} ('{tokenizer.decode(baseline_next_token)}')")
+                     # This is often expected if intermediate values diverge even slightly
+            else:
+                 print(f"\nWarning: Baseline generation ended before test step {step}. Cannot compare generated token.")
+
 
             # Check for EOS (mainly to stop unnecessary generation if test finishes early)
             if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
@@ -513,7 +599,7 @@ def run_comparison_benchmark(args):
         print(f"'{baseline_attn_type}' and '{test_attn_type}' within tolerance (atol={ATOL}, rtol={RTOL}).")
 
         test_duration = end_time_test - start_time_test
-        test_tokens_generated = generated_ids_test.shape[1] - input_ids.shape[1]
+        test_tokens_generated = generated_ids_test.shape[1] - initial_input_ids.shape[1]
         print(f"Test Duration: {test_duration:.3f}s")
         if test_tokens_generated > 0:
              print(f"Test Time per token: {(test_duration * 1000) / test_tokens_generated:.2f}ms")
@@ -578,3 +664,4 @@ if __name__ == "__main__":
     finally:
         # Ensure cancellation is attempted even if atexit fails or script is killed abruptly
         _cancel_slurm_job()
+

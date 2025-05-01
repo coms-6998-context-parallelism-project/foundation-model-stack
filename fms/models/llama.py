@@ -162,6 +162,8 @@ class LLaMABlock(nn.Module):
                  global_position_ids = torch.arange(q_global_offset, q_global_offset + T, device=x.device)
                  rope_position_ids = global_position_ids.unsqueeze(0).expand(B, -1)
                  # logger.warning("LLaMABlock (Ring Path) received None position_ids, calculating fallback global IDs.") # Removed
+            else:
+                 rope_position_ids = position_ids # Use the sharded IDs passed in
 
             # Transpose q/k to shape [B, T_local, H, D] before RoPE call
             queries_rope_in = queries.transpose(1, 2) # [B, H, T, D] -> [B, T, H, D]
@@ -169,7 +171,7 @@ class LLaMABlock(nn.Module):
 
             # Apply RoPE (adjusted_qk expects [B, T, H, D])
             queries_rotated, keys_rotated = self.attn.position_encoder.adjusted_qk(
-                queries_rope_in, keys_rope_in, position_ids, use_cache=False # Pass position_ids directly
+                queries_rope_in, keys_rope_in, rope_position_ids, use_cache=False # Pass sharded position_ids
             )
 
             # Transpose back for RingAttentionEngine [B, T, H, D] -> [B, H, T, D]
@@ -505,6 +507,7 @@ class LLaMA(nn.Module):
         is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
         original_global_seq_len = klen # Default if not ring
         layer_kwargs = {} # Initialize empty kwargs
+        sharded_position_ids = position_ids # Default to original if not ring
         if is_ring_strategy:
             # shard_input now handles global padding and returns the original length
             x_in, original_global_seq_len = self.distributed_strategy.shard_input(x_in)
@@ -514,15 +517,18 @@ class LLaMA(nn.Module):
             q_global_offset = self.distributed_strategy.rank * self.distributed_strategy.block_size
 
             # Shard the padding-aware position_ids calculated earlier.
-            # !!! CRITICAL ASSUMPTION: RingAttentionStrategy.shard_tensor correctly shards this tensor !!!
-            # It must handle the potentially non-contiguous nature of position_ids due to padding.
-            position_ids, _ = self.distributed_strategy.shard_tensor(position_ids, dim=1) # Shard along sequence dim, overwrite position_ids
-            # Prepare kwargs specific to ring attention layers
+            # Slice the global position_ids to get the local shard for this rank.
+            start_idx = self.distributed_strategy.rank * self.distributed_strategy.block_size
+            end_idx = start_idx + self.distributed_strategy.block_size
+            sharded_position_ids = position_ids[:, start_idx:end_idx]
+            # Prepare kwargs specific to ring attention layers (excluding position_ids now)
             layer_kwargs = {"q_global_offset": q_global_offset, "global_seq_len": compute_global_seq_len}
 
         else:
             # For non-ring strategy, original_global_seq_len is just klen
             compute_global_seq_len = original_global_seq_len
+            # For non-ring, the position_ids passed down are the original (potentially padded) full sequence ones
+            # sharded_position_ids is already set to position_ids by default
 
         x_in = self.shared(x_in)
 
@@ -533,7 +539,7 @@ class LLaMA(nn.Module):
             output = layer(
                 x=x_in,
                 mask=mask,
-                position_ids=position_ids, # Pass the calculated/sharded position_ids directly
+                position_ids=sharded_position_ids, # Pass the correctly sliced/original position_ids
                 past_key_value_state=past_key_value_states[i],
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
@@ -837,7 +843,7 @@ def _hf_to_fms_rope(
         if model_config.linear_config:
             linear_type = model_config.linear_config["linear_type"]
     else:
-        # logger.warning("Missing model_config, assuming defaults for head_size") # Removed
+        # logger.warning("Missing model_config, assuming defaults for head_size") # Already removed
         head_size = 128  # Good default for most models
         linear_type = "torch_linear"
 

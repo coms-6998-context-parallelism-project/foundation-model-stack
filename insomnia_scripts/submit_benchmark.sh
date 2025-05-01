@@ -23,8 +23,8 @@ TEST_ATTN_TYPE="ring"     # The implementation to test against the baseline
 
 # --- Default Paths (relative to repo root) ---
 # !!! ADJUST THESE PATHS to match your repository structure !!!
-DEFAULT_MODEL_REL_PATH="llama-hf" # Updated path
-DEFAULT_TOKENIZER_REL_PATH="llama-hf" # Updated path, assuming tokenizer is inside llama-hf
+DEFAULT_MODEL_REL_PATH_LOCAL="llama-hf"
+DEFAULT_TOKENIZER_REL_PATH_LOCAL="llama-hf" # Assuming tokenizer path relative to repo locally
 
 # --- Set Current Paths ---
 if [[ "$RUN_LOCATION" == "insomnia" ]]; then
@@ -36,8 +36,14 @@ else
 fi
 
 # Construct absolute default paths
-DEFAULT_MODEL_ABS_PATH="${CURRENT_REPO_DIR}/${DEFAULT_MODEL_REL_PATH}"
-DEFAULT_TOKENIZER_ABS_PATH="${CURRENT_REPO_DIR}/${DEFAULT_TOKENIZER_REL_PATH}"
+if [[ "$RUN_LOCATION" == "insomnia" ]]; then
+  INSOMNIA_BASE_DIR="/insomnia001/depts/edu/COMSE6998/sg3790" # Base directory from pwd
+  DEFAULT_MODEL_ABS_PATH="${INSOMNIA_BASE_DIR}/llama-hf"
+  DEFAULT_TOKENIZER_ABS_PATH="${INSOMNIA_BASE_DIR}/llama-hf" # Assuming tokenizer path is the dir itself
+else
+  DEFAULT_MODEL_ABS_PATH="${CURRENT_REPO_DIR}/${DEFAULT_MODEL_REL_PATH_LOCAL}"
+  DEFAULT_TOKENIZER_ABS_PATH="${CURRENT_REPO_DIR}/${DEFAULT_TOKENIZER_REL_PATH_LOCAL}"
+fi
 
 echo "[INFO] Navigating to repository: $CURRENT_REPO_DIR"
 cd "$CURRENT_REPO_DIR" || { echo "[ERROR] Failed to cd to repo"; exit 1; }

@@ -130,6 +130,11 @@ parser.add_argument(
     default=None, # Default handled by model if None
     help="Block size to use for Ring Attention (if applicable)",
 )
+parser.add_argument(
+    "--print_response",
+    action="store_true",
+    help="Print the generated response text to stdout",
+)
 
 
 args = parser.parse_args()
@@ -262,8 +267,10 @@ def print_result(result):
         tokenizer.convert_ids_to_tokens(result)
     )
 
-    print(output_str)
-    print()
+    # Only print if the flag is set
+    if args.print_response:
+        print(output_str)
+        print()
 
 
 def infer(use_cache, do_sample):

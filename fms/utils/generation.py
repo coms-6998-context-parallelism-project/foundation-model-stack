@@ -265,12 +265,13 @@ def generate(
         # --- Ring Attention Length Check ---
         # Check if the next token would exceed the max length allowed by Ring Attention's fixed blocks
         strategy = getattr(model, "distributed_strategy", None)
-        # if isinstance(strategy, RingAttentionStrategy):
-        #     max_ring_len = strategy.world_size * strategy.block_size
-        #     if result.shape[1] >= max_ring_len:
-        #         rank, _ = distributed.rank_and_world(strategy.group)
-        #         # print(f"[rank{rank}] generate: Stopping generation. Sequence length {result.shape[1]} reached Ring Attention limit {max_ring_len}.") # Removed
-        #         break
+        if isinstance(strategy, RingAttentionStrategy):
+            # The max length the ring mechanism can handle due to fixed block sizes
+            max_ring_len = strategy.world_size * strategy.block_size
+            # Check if the *current* length already meets or exceeds the limit.
+            # The loop should break *before* trying to generate the token that would exceed the limit.
+            if result.shape[1] >= max_ring_len:
+                break
         # --- End Ring Attention Length Check ---
 
         input_ids = next_input[:, -max_seq_len:]
@@ -314,6 +315,14 @@ def generate(
         if "only_last_token" not in model_kwargs:
             logits = logits[:, -1, :]
 
+        # --- Debug Ring Attention Logits (Sampling/Argmax Input) ---
+        if isinstance(strategy, RingAttentionStrategy):
+            rank, _ = distributed.rank_and_world(strategy.group)
+            if rank == 0: # Only print from rank 0
+                top_probs, top_indices = torch.topk(F.softmax(logits.float(), dim=-1), 5)
+                # print(f"[DEBUG Ring Gen rank0] Iter {i} Logits (Top 5): Indices={top_indices.tolist()}, Probs={top_probs.tolist()}", flush=True) # Keep commented for now
+        # --- End Debug ---
+
         if do_sample:
             # get logits from last value in sequence nad scale
             logits = logits / temperature
@@ -338,6 +347,10 @@ def generate(
             eos_found = torch.logical_or(eos_found, next_val == eos_token_id)
             if torch.sum(eos_found) == input_ids.shape[0]:
                 break
+
+        # Check if we have reached the maximum sequence length (model's context window)
+        if result.shape[1] >= max_seq_len:
+            break
 
         if use_cache:
             next_input = next_val

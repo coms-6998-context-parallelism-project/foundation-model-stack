@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Tuple
 
+from fms.models.ring_attention_helper import RingAttentionHelper
 import torch
 import torch.nn as nn
 
@@ -127,62 +128,76 @@ class LLaMABlock(nn.Module):
     ):
         self_attn_past_key_value = past_key_value_state
 
-        # if isinstance(distributed_strategy, RingAttentionStrategy):
-        #     if(self.layer_index == 1):
-        #         print(x.shape, end = ", ")
-        #     x = distributed_strategy.shard_input(x)
+        residual = x
 
+        # === Attention computation ===
         if isinstance(distributed_strategy, RingAttentionStrategy):
-            if(self.layer_index ==0):
-            # Each rank gathers the full sequence before attention
-                x = distributed_strategy.gather_output(x)
-        # === End RingAttention gather ===
 
+            # Normalize input
+            x_norm = self.ln(x)
 
-        x_full = x
-        # Store original input for residual connection
-        residual = x
+            # Instantiate the RingAttention helper
+            ring_helper = RingAttentionHelper(
+                attn_module=self.attn,
+                layer_idx=self.layer_index,
+                strategy=distributed_strategy,
+                use_cache=use_cache,
+            )
 
+            # Perform attention using ring-style logic
+            attn_out, cache = ring_helper.forward(
+                x_norm,
+                mask=mask,
+                position_ids=position_ids,
+                past_key_value_state=self_attn_past_key_value,
+                is_causal_mask=is_causal_mask,
+            )
 
-        # === Begin RingAttention gather (mock global attention) ===
-        
+            if self.config.p_dropout != 0:
+                attn_out = self.dropout(attn_out)
 
-        x_norm = self.ln(x_full)
-        attn_out = self.attn(
-            q=x_norm,
-            mask=mask,
-            position_ids=position_ids,
-            attn_algorithm=attn_algorithm,
-            past_key_value_state=self_attn_past_key_value,
-            use_cache=use_cache,
-            is_self=True,
-            is_causal_mask=is_causal_mask,
-        )
+            x = attn_out + residual
 
-        if use_cache:
-            attn_out, cache = attn_out
+            # === Feedforward ===
+            residual = x
+            x = self.ff_ln(x)
+            x = self.ff_sub_layer(x)
+            if self.config.p_dropout != 0:
+                x = self.dropout(x)
+            x = x + residual
+
         else:
-            cache = None
+            x_norm = self.ln(x)
+            attn_out = self.attn(
+                q=x_norm,
+                mask=mask,
+                position_ids=position_ids,
+                attn_algorithm=attn_algorithm,
+                past_key_value_state=self_attn_past_key_value,
+                use_cache=use_cache,
+                is_self=True,
+                is_causal_mask=is_causal_mask,
+            )
+            if use_cache:
+                attn_out, cache = attn_out
+            else:
+                cache = None
 
-        # === Begin RingAttention re-shard ===
+            if self.config.p_dropout != 0:
+                attn_out = self.dropout(attn_out)
+            x = attn_out + residual
 
-        # === End RingAttention re-shard ===
-
-        if self.config.p_dropout != 0:
-            attn_out = self.dropout(attn_out)
-        x = attn_out + residual
-
-        # FF layer
-        residual = x
-        x = self.ff_ln(x)
-        x = self.ff_sub_layer(x)
-        if self.config.p_dropout != 0:
-            x = self.dropout(x)
-        x = x + residual
-
-
+            # === Feedforward ===
+            residual = x
+            x = self.ff_ln(x)
+            x = self.ff_sub_layer(x)
+            if self.config.p_dropout != 0:
+                x = self.dropout(x)
+            x = x + residual
 
         return (x, cache) if use_cache else x
+
+
 
 
 class LLaMA(nn.Module):

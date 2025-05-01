@@ -13,12 +13,11 @@ from fms.modules.feedforward import GatedLinearUnit
 
 logger = logging.getLogger(__name__)
 
-# reread this file
 # Note: This dataclass might become less necessary as we move away from threads,
 # but we can keep it for now to structure the arguments passed within the rank.
 @dataclass
 class BlockData:
-    engine_instance: 'RingAttentionEngine' 
+    engine_instance: 'RingAttentionEngine'
     rank: int
     world_size: int # World size of the ring group
     q_local_start: int # Start index within the *local* shard for Q (always 0)
@@ -106,7 +105,7 @@ class RingAttentionEngine:
         max_score = initial_max_score
         current_k_shard = args.k_shard
         current_k_rank = args.rank # Rank where the current K shard originated
-        
+
         # Temporary buffer for receiving K, size is fixed to strategy_block_size
         recv_shape = list(args.k_shard.shape)
         recv_shape[2] = self.strategy_block_size
@@ -123,15 +122,7 @@ class RingAttentionEngine:
             # The global_seq_len passed in should be the padded length (world_size * block_size)
             # No need to adjust length for last rank due to global padding.
             current_k_global_indices = torch.arange(current_k_global_offset, current_k_global_offset + current_k_len, device=device)
-            
-            # Determine the length of the tensor we expect to receive in this iteration
-            # The tensor we receive originated from the rank `(current_k_rank - 1 + world_size) % world_size`
-            # However, it's simpler to think about which rank *sent* it to us: self.prev_rank
-            # The length depends on which rank's data is currently at self.prev_rank
-            # incoming_rank_origin = (self.rank - 1 - i + args.world_size) % args.world_size # Removed unused variable
-            # expected_recv_len is always strategy_block_size now
 
-            # Slice the received buffer if necessary (only needed if shapes differ)
             # Use expected_recv_len (strategy_block_size) for slicing the *received* data *after* communication
             effective_recv_k = recv_k[:, :, :expected_recv_len, :] if i > 0 else current_k_shard
 
@@ -171,16 +162,10 @@ class RingAttentionEngine:
 
         for i in range(args.world_size):
             # Calculate global indices and length for the *current* K/V shards
-            current_kv_len = (global_seq_len + args.world_size - 1) // args.world_size
-            current_kv_global_offset = current_kv_rank * current_kv_len
-            # Adjust length for the last rank
             # Length is always strategy_block_size, offset is based on rank * strategy_block_size
             current_kv_len = self.strategy_block_size
             current_kv_global_offset = current_kv_rank * self.strategy_block_size
             current_k_global_indices = torch.arange(current_kv_global_offset, current_kv_global_offset + current_kv_len, device=device)
-            
-            # Determine the length of the tensor we expect to receive in this iteration
-            incoming_rank_origin = (self.rank - 1 - i + args.world_size) % args.world_size
 
             # Slice the received buffers if necessary
             # Use expected_recv_len for slicing the *received* data *after* communication
@@ -201,7 +186,7 @@ class RingAttentionEngine:
             current_kv_rank = (current_kv_rank - 1 + args.world_size) % args.world_size
 
         return num, den
-    
+
     """ final output """
     def compute_block_output(self, x: Tensor, num: Tensor, den: Tensor) -> Tensor:
 
@@ -212,10 +197,10 @@ class RingAttentionEngine:
         residual_1 = x + attn_out
         ff_out = self.ff(self.ff_norm(residual_1))
         return residual_1 + ff_out
-    
+
     """ Helper Functions"""
 
-    def _send_recv_tensor(self, send_tensor: Tensor, full_recv_buffer: Tensor, expected_recv_len: int) -> Tensor: # Definition expects 4 args (self + 3)
+    def _send_recv_tensor(self, send_tensor: Tensor, full_recv_buffer: Tensor, expected_recv_len: int) -> Tensor:
         """ Sends a tensor to the next rank and receives one from the previous rank. """
         # Use explicit blocking send/recv with different orders for even/odd ranks
         recv_buffer_slice = full_recv_buffer[:, :, :expected_recv_len, :].contiguous() # Ensure contiguous for recv
@@ -267,7 +252,7 @@ class RingAttentionEngine:
         scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / self.scale
 
         # Create boolean masks (True means mask this position)
-        final_mask = None
+        final_mask_bool = None
         q_len, k_len = q.shape[2], k.shape[2]
 
         # 1. Causal mask
@@ -277,21 +262,25 @@ class RingAttentionEngine:
             # Mask if key index is greater than query index (k > q)
             causal_mask_bool = k_indices_dev[None, :k_len] > q_indices_dev[:, None] # Shape [q_len, k_len]
             # Add batch and head dimensions for broadcasting
-            final_mask = causal_mask_bool.unsqueeze(0).unsqueeze(0) # Shape [1, 1, q_len, k_len]
+            final_mask_bool = causal_mask_bool.unsqueeze(0).unsqueeze(0) # Shape [1, 1, q_len, k_len]
 
         # 2. Padding mask (additive mask converted to boolean)
         if mask is not None:
             # Input mask has shape [B, 1, q_len, k_len] or [B, H, q_len, k_len]
-            padding_mask_bool = mask == -torch.inf
-            if final_mask is None:
-                final_mask = padding_mask_bool
+            # Ensure mask is boolean
+            padding_mask_bool = mask == -torch.inf if mask.dtype != torch.bool else mask
+            if final_mask_bool is None:
+                final_mask_bool = padding_mask_bool
             else:
                 # OR combines the masks, broadcasting dimensions B and H
-                final_mask = final_mask | padding_mask_bool
+                final_mask_bool = final_mask_bool | padding_mask_bool # Use boolean OR
 
         # 3. Apply the combined mask if it exists
-        if final_mask is not None:
-            scores = scores.masked_fill(final_mask, -torch.inf)
+        if final_mask_bool is not None:
+            # Ensure mask is expanded to match scores shape for masked_fill
+            # Scores shape: [B, H, q_len, k_len]
+            # Mask shape could be [1, 1, q_len, k_len] or [B, 1/H, q_len, k_len]
+            scores = scores.masked_fill(final_mask_bool, -torch.inf)
 
         return scores
 
@@ -335,19 +324,9 @@ class RingAttentionEngine:
         stable_scores = torch.clamp(stable_scores, max=10.0, min = -10.0)
 
         exp_scores = torch.exp(stable_scores)
-        # Check for NaNs/Infs after exponentiation (should ideally be only positive numbers or zero)
-        # if torch.isnan(exp_scores).any():
-            # print(f"[rank{self.rank}] WARNING: NaNs/Infs found in exp_scores!", flush=True) # Removed
-        # if (exp_scores == torch.inf).any():
-            # print(f"[rank{self.rank}] WARNING: Positive Infs found in exp_scores!", flush=True) # Removed
 
         num_update = torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
         den_update = exp_scores.sum(dim=-1, keepdim=True)
 
-        # Check for NaNs/Infs in updates before adding
-        # if torch.isnan(num_update).any() or (num_update == torch.inf).any():
-            # print(f"[rank{self.rank}] WARNING: NaNs/Infs found in num_update!", flush=True) # Removed
-        # if torch.isnan(den_update).any() or (den_update == torch.inf).any():
-            # print(f"[rank{self.rank}] WARNING: NaNs/Infs found in den_update!", flush=True) # Removed
         # Cast back to original dtype before returning
         return (current_num + num_update).to(orig_dtype), (current_den + den_update).to(orig_dtype)

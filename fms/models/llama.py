@@ -447,94 +447,104 @@ class LLaMA(nn.Module):
         if past_key_value_states is None or len(past_key_value_states) == 0:
             past_key_value_states = [None for _ in range(len(self.layers))]
 
+        # Determine sequence lengths and if it's a ring strategy run
         qlen = x_in.size(1)
-        klen = x_in.size(1)
+        klen = x_in.size(1) # Original key length from input
+        is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
+        original_global_seq_len = klen # Will be updated if ring strategy
 
-        # --- Explicit Position ID Calculation (Handles Padding and Cache) ---
-        # Calculate position_ids if not provided by the caller.
-        # This handles prefill and decode (with or without cache).
-        if position_ids is None:
-            # If position_ids are not provided, we assume it's a prefill scenario
-            # or a single-token generation at the very start (klen=1).
-            # The logic here calculates positions based on non-padding tokens.
-            # For single-token generation (qlen=1) *after* the first token,
-            # position_ids MUST be provided by the caller (e.g., the generate function).
-            is_decode_phase_with_cache = use_cache and past_key_value_states[0] is not None and past_key_value_states[0][0].numel() > 0 # Check if cache exists and is populated
-
-            if is_decode_phase_with_cache and qlen == 1:
-                # Decode phase with cache: position is the current cache length.
-                # Assuming cache shape [B, H, cache_len, D]
-                try:
-                    cache_len = past_key_value_states[0][0].size(2)
-                    position_ids = torch.full((x_in.size(0), 1), cache_len, dtype=torch.long, device=x_in.device)
-                except (IndexError, TypeError): # Handle potential errors if cache is weird
-                    # logger.warning("Failed to get cache length for position_ids during decode, falling back to calculating from input.") # Removed
-                    # Fallback to calculating based on input length if cache access fails
-                    is_pad = x_in == self.config.pad_id if self.config.pad_id is not None else torch.zeros_like(x_in, dtype=torch.bool)
-                    position_ids = (~is_pad).cumsum(dim=1) - 1
-                    position_ids = position_ids.clamp(min=0)
-            else:
-                # Prefill phase (or single-token generation at the very start, where klen=1): Calculate positions respecting padding.
-                # Create boolean mask for non-padding tokens
-                is_pad = x_in == self.config.pad_id if self.config.pad_id is not None else torch.zeros_like(x_in, dtype=torch.bool)
-                # Calculate cumulative sum of non-padding tokens to get positions
-                position_ids = (~is_pad).cumsum(dim=1) - 1
-                # Clamp positions to be non-negative (handles leading pads)
-                position_ids = position_ids.clamp(min=0)
-            # Ensure position_ids has the correct batch dimension (it should already if calculated from x_in)
-            if position_ids.size(0) != x_in.size(0):
-                # This expand might be problematic if batch size > 1 and padding differs per item.
-                # Consider calculating per batch item if padding varies.
-                position_ids = position_ids.expand(x_in.size(0), -1)
-        # --- End Explicit Position ID Calculation ---
-
-        # if we are using the cache, the key length needs to be extended with the past keys length
+        # Adjust klen based on cache
         if use_cache and past_key_value_states[0] is not None and past_key_value_states[0][0].numel() > 0:
             klen += past_key_value_states[0][0].size(-2)
 
-        # if mask is none, we need to specify causal mask
-        if mask is None:
-            # we are caching and can assume all 1s in the mask
-            if use_cache and klen != 1 and qlen == 1:
-                # b x h x qlen x kvlen
-                is_causal_mask = False
+        # Determine compute_global_seq_len (padded length for ring, klen otherwise)
+        # and shard input if necessary
+        layer_kwargs = {}
+        if is_ring_strategy:
+            x_in, original_global_seq_len = self.distributed_strategy.shard_input(x_in)
+            compute_global_seq_len = self.distributed_strategy.world_size * self.distributed_strategy.block_size
+            q_global_offset = self.distributed_strategy.rank * self.distributed_strategy.block_size
+            layer_kwargs = {"q_global_offset": q_global_offset, "global_seq_len": compute_global_seq_len}
+            # Update qlen to the local block size after sharding
+            qlen = x_in.size(1)
+        else:
+            compute_global_seq_len = klen
+            original_global_seq_len = klen # Redundant but clear
+
+        # --- Explicit Position ID Calculation (Handles Padding and Cache) ---
+        # Calculate position_ids if not provided by the caller.
+        if position_ids is None:
+            is_decode_phase_with_cache = use_cache and past_key_value_states[0] is not None and past_key_value_states[0][0].numel() > 0
+
+            if is_decode_phase_with_cache and qlen == 1:
+                # Decode phase with cache: position is the current cache length.
+                try:
+                    cache_len = past_key_value_states[0][0].size(2)
+                    position_ids = torch.full((x_in.size(0), 1), cache_len, dtype=torch.long, device=x_in.device)
+                except (IndexError, TypeError):
+                    # Fallback if cache access fails (should be rare)
+                    # Construct global padding pattern based on compute_global_seq_len and original_global_seq_len
+                    num_pads = compute_global_seq_len - original_global_seq_len
+                    global_is_pad = torch.cat([
+                        torch.ones(x_in.size(0), num_pads, dtype=torch.bool, device=x_in.device),
+                        torch.zeros(x_in.size(0), original_global_seq_len, dtype=torch.bool, device=x_in.device)
+                    ], dim=1) if self.config.pad_id is not None else torch.zeros(x_in.size(0), compute_global_seq_len, dtype=torch.bool, device=x_in.device)
+                    global_position_ids = (~global_is_pad).cumsum(dim=1) - 1
+                    global_position_ids = global_position_ids.clamp(min=0)
+                    # Take the last position ID for the decode step
+                    position_ids = global_position_ids[:, -1:]
             else:
-                is_causal_mask = True
+                # Prefill phase: Calculate positions respecting padding across the *compute_global_seq_len*.
+                # Construct global padding pattern based on compute_global_seq_len and original_global_seq_len
+                # Assuming left-padding for ring attention's shard_input behavior
+                num_pads = compute_global_seq_len - original_global_seq_len
+                global_is_pad = torch.cat([
+                    torch.ones(x_in.size(0), num_pads, dtype=torch.bool, device=x_in.device),
+                    torch.zeros(x_in.size(0), original_global_seq_len, dtype=torch.bool, device=x_in.device)
+                ], dim=1) if self.config.pad_id is not None else torch.zeros(x_in.size(0), compute_global_seq_len, dtype=torch.bool, device=x_in.device)
+
+                # Calculate cumulative sum of non-padding tokens to get positions
+                position_ids = (~global_is_pad).cumsum(dim=1) - 1
+                # Clamp positions to be non-negative (handles leading pads)
+                position_ids = position_ids.clamp(min=0)
+
+            # Ensure position_ids has the correct batch dimension
+            if position_ids.size(0) != x_in.size(0):
+                 position_ids = position_ids.expand(x_in.size(0), -1)
+        # --- End Explicit Position ID Calculation ---
+
+        # Determine causal mask necessity
+        if mask is None:
+            is_causal_mask = not (use_cache and klen != 1 and qlen == 1)
         else:
             is_causal_mask = False
 
-        # --- Ring Attention Strategy: Shard Input ---
-        is_ring_strategy = isinstance(self.distributed_strategy, RingAttentionStrategy)
-        original_global_seq_len = klen # Default if not ring
-        layer_kwargs = {} # Initialize empty kwargs
-        sharded_position_ids = position_ids # Default to original if not ring
+        # --- Ring Attention Strategy: Shard Position IDs ---
+        sharded_position_ids = position_ids # Default for non-ring
         if is_ring_strategy:
-            # shard_input now handles global padding and returns the original length
-            x_in, original_global_seq_len = self.distributed_strategy.shard_input(x_in)
-            # The compute_global_seq_len is the padded length used by the engine
-            compute_global_seq_len = self.distributed_strategy.world_size * self.distributed_strategy.block_size
-            # q_global_offset is the offset in the PADDED sequence
-            q_global_offset = self.distributed_strategy.rank * self.distributed_strategy.block_size
-
-            # Shard the padding-aware position_ids calculated earlier.
-            # Slice the global position_ids to get the local shard for this rank.
+            # Slice the global position_ids (calculated based on compute_global_seq_len)
             start_idx = self.distributed_strategy.rank * self.distributed_strategy.block_size
             end_idx = start_idx + self.distributed_strategy.block_size
-            sharded_position_ids = position_ids[:, start_idx:end_idx]
-            # Prepare kwargs specific to ring attention layers (excluding position_ids now)
-            layer_kwargs = {"q_global_offset": q_global_offset, "global_seq_len": compute_global_seq_len}
+            # Ensure slicing doesn't go out of bounds if position_ids is shorter than expected (e.g., during decode)
+            current_pos_len = position_ids.size(1)
+            slice_end = min(end_idx, current_pos_len)
+            slice_start = min(start_idx, slice_end) # Ensure start isn't past end
+            sharded_position_ids = position_ids[:, slice_start:slice_end]
+            # Pad if the slice is shorter than the block size (can happen if global len < compute_global_len)
+            pad_len = self.distributed_strategy.block_size - sharded_position_ids.size(1)
+            if pad_len > 0:
+                 # Pad with a value that RoPE ignores or handles gracefully (e.g., 0 or a large negative number if clamping)
+                 # Using 0 is common, assuming RoPE handles position 0 correctly.
+                 padding = torch.zeros(sharded_position_ids.size(0), pad_len, dtype=torch.long, device=sharded_position_ids.device)
+                 sharded_position_ids = torch.cat([padding, sharded_position_ids], dim=1) # Assuming left padding matches input padding
 
-        else:
-            # For non-ring strategy, original_global_seq_len is just klen
-            compute_global_seq_len = original_global_seq_len
-            # For non-ring, the position_ids passed down are the original (potentially padded) full sequence ones
-            # sharded_position_ids is already set to position_ids by default
+        # --- End Shard Position IDs ---
 
+        # Apply embedding
         x_in = self.shared(x_in)
 
-        # this is the output cache for all the decoder layers
+        # Layer processing loop
         present_key_value_states = []
-
         for i, layer in enumerate(self.layers):
             output = layer(
                 x=x_in,
@@ -548,16 +558,16 @@ class LLaMA(nn.Module):
             )
 
             if use_cache:
-                # Ring attention might not return cache
                 if isinstance(output, tuple):
                     x_in, present_key_value_state = output
                     present_key_value_states.append(present_key_value_state)
-                else:
+                else: # Ring attention might not return cache yet
                     x_in = output
-                    present_key_value_states.append(None) # Append None if no cache
+                    present_key_value_states.append(None)
             else:
                 x_in = output
 
+        # Final norm and dropout
         dec_out = x_in
         dec_out = self.dec_norm(dec_out)
         if self.config.p_dropout:
@@ -565,14 +575,13 @@ class LLaMA(nn.Module):
 
         # --- Ring Attention Strategy: Gather Output ---
         if is_ring_strategy:
-            # Gather along the sequence dimension
-            dec_out_gathered = self.distributed_strategy.gather_output(dec_out) # dec_out here is the local shard output
+            dec_out_gathered = self.distributed_strategy.gather_output(dec_out)
             # Truncate output back to original length if padding was added
             if dec_out_gathered.shape[self.distributed_strategy.dim] != original_global_seq_len:
-                # Slice using the correct dimension from the strategy
                 dec_out = dec_out_gathered.narrow(self.distributed_strategy.dim, 0, original_global_seq_len)
             else:
-                dec_out = dec_out_gathered # No truncation needed if lengths match
+                dec_out = dec_out_gathered
+        # --- End Gather Output ---
 
         return dec_out, present_key_value_states
 

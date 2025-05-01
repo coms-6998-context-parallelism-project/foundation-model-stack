@@ -135,7 +135,7 @@ class LLaMABlock(nn.Module):
         global_seq_len=None
     ):
         if attn_algorithm == "ring" and isinstance(self.distributed_strategy, RingAttentionStrategy):
-
+            print("Rank f{strategy.rank}")
             strategy = self.distributed_strategy
             ring_attention_group = strategy.group
             if ring_attention_group is None:
@@ -206,6 +206,7 @@ class LLaMABlock(nn.Module):
             # Ring attention engine now returns the local block, gathering happens outside
             return x_out # No cache returned for ring attention yet
         else:
+            print(f"Standard attention", end = ", ")
             # Standard Attention Path (Original LLaMABlock logic)
             return self.forward_standard(
                 x,

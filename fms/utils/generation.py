@@ -311,8 +311,8 @@ def generate(
         if isinstance(strategy, RingAttentionStrategy):
             # The max length the ring mechanism can handle due to fixed block sizes
             max_ring_len = strategy.world_size * strategy.block_size
-            if debug_ring:
-                print(f"[RANK {rank}] Iter {i} Current result len: {result.shape[1]}, Max ring len: {max_ring_len}", flush=True)
+            # if debug_ring:
+            print(f"[RANK {rank}] Iter {i} Current result len: {result.shape[1]}, Max ring len: {max_ring_len}", flush=True)
             # Check if the *current* length already meets or exceeds the limit.
             # The loop should break *before* trying to generate the token that would exceed the limit.
             if result.shape[1] >= max_ring_len:

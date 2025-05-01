@@ -320,7 +320,7 @@ def generate(
             rank, _ = distributed.rank_and_world(strategy.group)
             if rank == 0: # Only print from rank 0
                 top_probs, top_indices = torch.topk(F.softmax(logits.float(), dim=-1), 5)
-                # print(f"[DEBUG Ring Gen rank0] Iter {i} Logits (Top 5): Indices={top_indices.tolist()}, Probs={top_probs.tolist()}", flush=True) # Keep commented for now
+                print(f"[DEBUG Ring Gen rank0] Iter {i} Logits (Top 5): Indices={top_indices.tolist()}, Probs={top_probs.tolist()}", flush=True) # Uncommented
         # --- End Debug ---
 
         if do_sample:

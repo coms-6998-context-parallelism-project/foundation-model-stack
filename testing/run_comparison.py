@@ -27,10 +27,9 @@ def load_model_for_config(args, attn_algo, device):
             distr_strat = "ring"
             print(f"  Using distributed strategy: {distr_strat}, group size: {dist.get_world_size(group)}")
         else:
-            print(f"  Warning: Ring attention requested but not running distributed on CUDA. Will likely fallback or fail.")
-            # Allow fallback to standard attention if ring isn't possible
-            attn_algo = None # Or 'sdpa' if that's the desired fallback
-            distr_strat = None
+             # Allow attempting ring even if not distributed/CUDA, FMS model logic will handle feasibility
+            print(f"  Attempting Ring attention on {args.device_type}. FMS model will determine if feasible.")
+            # Keep attn_algo = "ring", but strategy will likely be None
     elif attn_algo == "sdpa":
         print(f"  Using SDPA attention.")
         # attn_algo = 'sdpa' # Explicitly set if needed by get_model or model.forward
@@ -78,7 +77,7 @@ def run_generate(model, tokenizer, prompt_ids, device, max_new_tokens, attn_algo
         model,
         prompt_ids,
         max_new_tokens=max_new_tokens,
-        use_cache=True, # Typically want cache for generation
+        use_cache=False, # Typically want cache for generation
         attn_algorithm=attn_algo_for_fwd # Pass the algorithm to forward
     )
 

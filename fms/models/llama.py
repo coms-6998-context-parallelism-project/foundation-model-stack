@@ -131,7 +131,10 @@ class LLaMABlock(nn.Module):
 
         if attn_data.position_encoder is not None and T > 0:
             assert position_ids is not None, "position_ids must be provided for rotary encoding"
-            assert position_ids.shape == (B, T), f"Expected position_ids shape {B}x{T}, got {position_ids.shape}"
+            # Adjust assertion for T=0 case where position_ids might be (B, 0)
+            expected_pos_shape = (B, T)
+            if not (T == 0 and position_ids.shape == (B, 0)) and position_ids.shape != expected_pos_shape:
+                 raise AssertionError(f"Expected position_ids shape {expected_pos_shape}, got {position_ids.shape}")
 
             # Identify valid tokens
             valid_mask = position_ids != -1

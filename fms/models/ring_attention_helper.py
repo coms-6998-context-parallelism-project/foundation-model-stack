@@ -45,13 +45,13 @@ class RingAttentionHelper:
         B, T = x_norm.shape[:2]
 
         if position_ids is None:
-            if valid_len == 0:
-                position_ids = torch.full((B, T), fill_value=-1, dtype=torch.long, device=x_norm.device)
-            else:
-                # Construct valid global position_ids: [start_idx_global + 0, ..., start_idx_global + valid_len-1]
+            # Initialize to -1 by default
+            position_ids = torch.full((B, T), fill_value=-1, dtype=torch.long, device=x_norm.device)
+            
+            if valid_len > 0:
                 valid_pos = torch.arange(start_idx_global, start_idx_global + valid_len, device=x_norm.device)
-                position_ids = torch.full((B, T), fill_value=-1, dtype=torch.long, device=x_norm.device)
-                position_ids[:, :valid_len] = valid_pos.unsqueeze(0)  # broadcast to all batches
+                position_ids[:, :valid_len] = valid_pos.unsqueeze(0)  # Broadcast to all batches
+
 
         # Compute local QKV aligned to global rotary positions
         q_local, k_local, v_local = self.llama_block.compute_local_qkv_and_rope(

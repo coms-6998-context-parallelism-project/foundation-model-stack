@@ -182,17 +182,16 @@ class LLaMABlock(nn.Module):
             if enable_debug_info:
                 # Gather the ORIGINAL block input for the engine comparison path
                 # Pad x_original to the block size before gathering, similar to how
-                # RingAttentionStrategy pads before communication.
+                # RingAttentionStrategy pads tensors before communication.
                 padded_x_original = x_original
-                if isinstance(distributed_strategy, RingAttentionStrategy):
-                    target_len = distributed_strategy.block_size
-                    current_len = x_original.shape[1]
-                    pad_len = target_len - current_len
-                    if pad_len > 0:
-                        pad_shape = list(x_original.shape)
-                        pad_shape[1] = pad_len
-                        pad = torch.zeros(*pad_shape, dtype=x_original.dtype, device=x_original.device)
-                        padded_x_original = torch.cat([x_original, pad], dim=1)
+                target_len = distributed_strategy.block_size
+                current_len = x_original.shape[1]
+                pad_len = target_len - current_len
+                if pad_len > 0:
+                    pad_shape = list(x_original.shape)
+                    pad_shape[1] = pad_len
+                    pad = torch.zeros(*pad_shape, dtype=x_original.dtype, device=x_original.device)
+                    padded_x_original = torch.cat([x_original, pad], dim=1)
                 x_gathered_original = distributed_strategy.gather_output(padded_x_original)
                 rank = dist.get_rank() if dist.is_initialized() else 0
                 output_engine_gathered = self._forward_engine_attention(
@@ -397,7 +396,19 @@ class LLaMABlock(nn.Module):
                              abs_diff = torch.abs(v1_flat_comp - v2_flat_comp)
                              max_diff = torch.max(abs_diff).item()
                              max_diff_idx = torch.argmax(abs_diff).item()
-                             diff_lines.append(f"  Stats: L2 Norm Diff={norm_diff:.6f}, Max Abs Diff={max_diff:.6f} @ index {max_diff_idx}")
+                             # --- Add offending element count and top diffs ---
+                             threshold = 1e-3
+                             offending_indices = torch.where(abs_diff > threshold)[0]
+                             num_offending = offending_indices.numel()
+                             percentage_offending = (num_offending / n_compare) * 100 if n_compare > 0 else 0
+                             # Find top 5 largest absolute differences
+                             top_k_diffs, top_k_indices = torch.topk(abs_diff, k=min(5, n_compare))
+                             top_diff_details = []
+                             for i in range(top_k_indices.numel()):
+                                 idx = top_k_indices[i].item()
+                                 top_diff_details.append(f"idx {idx}: Ring={v1_flat_comp[idx]:.4f}, Engine={v2_flat_comp[idx]:.4f} (Diff={top_k_diffs[i]:.4f})")
+                             diff_lines.append(f"  Stats: L2 Norm Diff={norm_diff:.6f}, Max Abs Diff={max_diff:.6f} @ index {max_diff_idx}, Offending (> {threshold:.1e}): {num_offending}/{n_compare} ({percentage_offending:.2f}%)")
+                             diff_lines.append(f"  Top 5 Diffs: [{', '.join(top_diff_details)}]")
 
                  # ... (rest of the detailed diff logic for tuples, types, etc.) ...
                  elif isinstance(val1, tuple) and isinstance(val2, tuple):

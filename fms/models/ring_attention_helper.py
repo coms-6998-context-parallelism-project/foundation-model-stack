@@ -49,10 +49,15 @@ class RingAttentionHelper:
             pad_shape[dim] = pad_len
             pad = torch.zeros(*pad_shape, dtype=t.dtype, device=t.device)
             return torch.cat([t, pad], dim=dim)
+        
+        q_len_actual = q_full.shape[2] if end_idx > q_full.shape[2] else end_idx - start_idx
+
 
         q = _pad_to_block(q_full[:, :, start_idx:end_idx, :], strategy.block_size)
         k = _pad_to_block(k_full[:, :, start_idx:end_idx, :], strategy.block_size)
         v = _pad_to_block(v_full[:, :, start_idx:end_idx, :], strategy.block_size)
+
+        
 
 
         print(f"[Rank {self.rank}] Sliced QKV shapes - Q: {q.shape}, K: {k.shape}, V: {v.shape}")
@@ -84,8 +89,16 @@ class RingAttentionHelper:
                 scores += mask
 
             if is_causal_mask:
-                causal_mask = torch.tril(torch.ones(T_q, k.shape[2], device=q.device)).unsqueeze(0).unsqueeze(0)
-                scores = scores.masked_fill(causal_mask == 0, -float("inf"))
+                # Compute global token positions
+                q_pos_start = self.rank * strategy.block_size
+                k_pos_start = ((self.rank - i) % self.world_size) * strategy.block_size
+                q_pos = torch.arange(q_pos_start, q_pos_start + T_q, device=q.device).unsqueeze(-1)  # (T_q, 1)
+                k_pos = torch.arange(k_pos_start, k_pos_start + k.shape[2], device=q.device).unsqueeze(0)  # (1, T_k)
+
+                # Causal: Q can attend only to K positions ≤ its position
+                causal_mask = (q_pos >= k_pos).unsqueeze(0).unsqueeze(0)  # (1, 1, T_q, T_k)
+                scores = scores.masked_fill(~causal_mask, -float("inf"))
+
 
             if self.debug_mode and debug_info is not None:
                 debug_info[f"scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu() # Log scores after masking

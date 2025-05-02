@@ -37,10 +37,6 @@ class RingAttentionHelper:
         max_score = torch.full((B, H, T_q, 1), -float("inf"), device=q.device, dtype=q.dtype)
         numerator = torch.zeros(B, H, T_q, D_v, device=q.device, dtype=q.dtype)
         denominator = torch.zeros(B, H, T_q, 1, device=q.device, dtype=q.dtype)
-
-        if self.debug_mode:
-            debug_info[f"initial_max_score_r{self.rank}"] = max_score.clone().detach().cpu()
-
         for i in range(self.world_size):
             scores = torch.einsum("bhqd,bhkd->bhqk", q_local, k) / scale
 
@@ -66,11 +62,6 @@ class RingAttentionHelper:
                 v, _ = self._ring_shift_tensor(v)
 
         attn_out = numerator / (denominator + 1e-10)
-
-        if self.debug_mode:
-            debug_info[f"final_numerator_r{self.rank}"] = numerator.clone().detach().cpu()
-            debug_info[f"final_denominator_r{self.rank}"] = denominator.clone().detach().cpu()
-            debug_info[f"attn_out_raw_r{self.rank}"] = attn_out.clone().detach().cpu()
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, H * D_v)
         attn_out = self.attn.dense(attn_out)

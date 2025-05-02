@@ -145,6 +145,7 @@ class LLaMABlock(nn.Module):
     ):
         enable_debug_info = True  # Set to True to collect debug info
         debug_info = {}
+        x_original = x # Store the original input for debug comparison
 
         if isinstance(distributed_strategy, RingAttentionStrategy):
             # --- RING ATTENTION PATH ---
@@ -169,14 +170,15 @@ class LLaMABlock(nn.Module):
 
             # No nested dict expected — flatten directly
             if enable_debug_info and debug_ring:
-                for k, v in debug_ring.items():
-                    debug_info[f"{k}_r{dist.get_rank() if dist.is_initialized() else 0}"] = v
+                for k, v in debug_ring.items(): # Keys already have rank suffix from _forward_ring_attention
+                    debug_info[k] = v # Directly assign without adding another suffix
 
             # --- ENGINE PATH FOR COMPARISON ---
             if enable_debug_info:
-                x_gathered = distributed_strategy.gather_output(x)
+                # Gather the ORIGINAL block input, not the output of the ring path
+                x_gathered_original = distributed_strategy.gather_output(x_original)
                 output_engine_gathered = self._forward_engine_attention(
-                    x_gathered,
+                    x_gathered_original, # Pass the gathered ORIGINAL input
                     mask=mask,
                     position_ids=position_ids,
                     past_key_value_state=past_key_value_state,
@@ -187,8 +189,8 @@ class LLaMABlock(nn.Module):
                 _, _, debug_engine = output_engine_gathered
 
                 if debug_engine:
-                    for k, v in debug_engine.items():
-                        debug_info[k] = v
+                    for k, v in debug_engine.items(): # Keys already have prefix and rank suffix from _forward_engine_attention
+                        debug_info[k] = v # Directly assign
 
                 # --- DEBUG DIFF ---
                 diffs = self._diff_debug_dicts(
@@ -224,8 +226,8 @@ class LLaMABlock(nn.Module):
                 cache = None
 
             if enable_debug_info and debug_engine:
-                for k, v in debug_engine.items():
-                    debug_info[f"engine_{k}_r{dist.get_rank() if dist.is_initialized() else 0}"] = v
+                for k, v in debug_engine.items(): # Keys already have prefix and rank suffix from _forward_engine_attention
+                    debug_info[k] = v # Directly assign
 
         return (x, cache) if use_cache else x
 
@@ -234,21 +236,25 @@ class LLaMABlock(nn.Module):
     def _diff_debug_dicts(self, d1, d2):
         diffs = {}
 
-        def normalize(key, prefix):
-            # Strip prefix and collapse repeated _rX at the end
+        def normalize(key, prefix, is_engine=False):
+            # Strip prefix
             base = key[len(prefix):]
-            if base.count("_r") > 1:  # e.g., "final_num_r0_r0" -> "final_num_r0"
-                parts = base.split("_r")
-                base = "_r".join(parts[:2])
+            # Engine keys use _r{block_id}, Ring keys use _r{rank}
+            # For comparison, we treat block_id as equivalent to rank
+            # No need to collapse repeated suffixes as that was fixed.
             return base
 
         # Build reverse maps
+        # Pass is_engine=True for engine keys if special handling is needed later
         ring_map = {normalize(k, "ring_"): k for k in d1 if k.startswith("ring_")}
-        engine_map = {normalize(k, "engine_"): k for k in d2 if k.startswith("engine_")}
+        engine_map = {normalize(k, "engine_", is_engine=True): k for k in d2 if k.startswith("engine_")}
 
         shared = ring_map.keys() & engine_map.keys()
         missing_ring = sorted(set(engine_map.keys()) - set(ring_map.keys()))
         missing_engine = sorted(set(ring_map.keys()) - set(engine_map.keys()))
+
+        print("engine keys: ", engine_map.keys())
+        print("ring keys:   ", ring_map.keys())
 
         if missing_ring:
             print("Missing in Ring:")
@@ -333,8 +339,13 @@ class LLaMABlock(nn.Module):
         rank = 0
     ):
         debug = {}
+        # Log the input x to this function (potentially sharded)
+        if enable_debug_info:
+            debug[f"ring_x_input_r{rank}"] = x.clone().detach().cpu()
         residual = x
         x_norm = self.ln(x)
+        if enable_debug_info: # This is the sharded x_norm
+            debug[f"ring_x_norm_r{rank}"] = x_norm.clone().detach().cpu() # Log sharded x_norm with simple key
 
         ring_helper = RingAttentionHelper(
             attn_module=self.attn,
@@ -391,7 +402,12 @@ class LLaMABlock(nn.Module):
         enable_debug_info: bool
     ):
         debug = {}
+        # Log the input x to this function (potentially gathered if in debug comparison)
+        if enable_debug_info:
+            debug[f"engine_x_input_r{dist.get_rank() if dist.is_initialized() else 0}"] = x.clone().detach().cpu()
         x_norm = self.ln(x)
+        if enable_debug_info:
+            debug[f"engine_x_norm_r{dist.get_rank() if dist.is_initialized() else 0}"] = x_norm.clone().detach().cpu() # Log global x_norm with simple key
 
         queries, keys, values = self.compute_local_qkv_and_rope(
             self.attn,
@@ -421,6 +437,7 @@ class LLaMABlock(nn.Module):
             debug_mode=enable_debug_info,
         )
 
+
         engine_output = engine.forward_full(
             q_global=queries,
             k_global=keys_e,
@@ -428,6 +445,7 @@ class LLaMABlock(nn.Module):
             mask_global=mask,
             x_global=x,
         )
+
 
         if enable_debug_info:
             x, engine_debug_data = engine_output

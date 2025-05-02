@@ -77,8 +77,8 @@ class RingAttentionHelper:
         for i in range(self.world_size):
             print(f"[Rank {self.rank}] Ring step {i}")
             scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / scale
-            if self.debug_mode and debug_info is not None:
-                debug_info[f"ring_raw_scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu()
+            if self.debug_mode and debug_info is not None: # Log raw scores BEFORE masking
+                debug_info[f"raw_scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu()
 
             if mask is not None:
                 scores += mask
@@ -88,7 +88,7 @@ class RingAttentionHelper:
                 scores = scores.masked_fill(causal_mask == 0, -float("inf"))
 
             if self.debug_mode and debug_info is not None:
-                debug_info[f"ring_scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu() # Log scores after masking
+                debug_info[f"scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu() # Log scores after masking
 
             block_max = scores.amax(dim=-1, keepdim=True)
             max_score = torch.maximum(max_score, block_max)
@@ -105,8 +105,8 @@ class RingAttentionHelper:
                 v, _ = self._ring_shift_tensor(v)
                 if self.debug_mode and debug_info is not None:
                     # Log the tensors that will be used in the *next* step (i+1)
-                    debug_info[f"ring_k_input_step{i+1}_r{self.rank}"] = k.clone().detach().cpu()
-                    debug_info[f"ring_v_input_step{i+1}_r{self.rank}"] = v.clone().detach().cpu()
+                    debug_info[f"k_input_step{i+1}_r{self.rank}"] = k.clone().detach().cpu()
+                    debug_info[f"v_input_step{i+1}_r{self.rank}"] = v.clone().detach().cpu()
 
         # Log intermediate values if debugging
         if self.debug_mode and debug_info is not None:

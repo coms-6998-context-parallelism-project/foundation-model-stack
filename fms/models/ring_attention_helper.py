@@ -217,7 +217,11 @@ class RingAttentionHelper:
             # Get the relevant slice of the global mask
             # Note: mask slicing uses global indices
             current_mask = mask_global[:, :, q_start_global:q_start_global+T_q_local, k_start_global:k_start_global+current_k_len] if mask_global is not None else None
-
+            if current_k_len == 0:
+                # Need to shift tensors even if we skip computation
+                if i < self.world_size - 1:
+                    current_k_block, current_k_len = self._ring_shift_tensor(current_k_block, self.strategy.block_size)
+                continue 
             # Compute raw scores for debugging before applying masks
             if self.debug_mode and debug_info is not None:
                  raw_scores = self._compute_attention_scores(
@@ -279,6 +283,14 @@ class RingAttentionHelper:
             # Global start index of the current k block being processed
             k_start_global = ((self.rank - i + self.world_size) % self.world_size) * self.strategy.block_size
             k_indices_global = torch.arange(k_start_global, k_start_global + current_k_len, device=device)
+
+            # Skip computation if the received K/V block has zero length
+            if current_k_len == 0:
+                # Need to shift tensors even if we skip computation
+                if i < self.world_size - 1:
+                    current_k_block, current_k_len = self._ring_shift_tensor(current_k_block, self.strategy.block_size)
+                    current_v_block, _ = self._ring_shift_tensor(current_v_block, self.strategy.block_size)
+                continue # Skip to the next iteration
 
             # Get the relevant slice of the global mask
             current_mask = mask_global[:, :, q_start_global:q_start_global+T_q_local, k_start_global:k_start_global+current_k_len] if mask_global is not None else None

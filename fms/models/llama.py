@@ -145,7 +145,7 @@ class LLaMABlock(nn.Module):
         distributed_strategy: Optional[DistributedStrategy] = None,
     ):
         
-        # print(self.layer_index, end = ", ")
+        print(self.layer_index, end = ", ")
         enable_debug_info = False  # Set to True to collect debug info
         minimal_debug_prints= False # Default to detailed prints
         # diff_mode = 1 # Set this to 1 for minimal tabular diffs only

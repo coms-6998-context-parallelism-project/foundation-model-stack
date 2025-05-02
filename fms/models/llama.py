@@ -180,15 +180,14 @@ class LLaMABlock(nn.Module):
         distributed_strategy: Optional[DistributedStrategy] = None,
     ):
         
-        print(self.layer_index, end = ", ")
-        enable_debug_info = True  # Set to True to collect debug info
-        minimal_debug_prints= False # Default to detailed prints
-        # diff_mode = 1 # Set this to 1 for minimal tabular diffs only
-        diff_mode = 0 # Set to 0 for default behavior
-        if diff_mode == 1:
-            minimal_debug_prints = True # Force minimal prints if diff_mode is 1
-
-        debug_info = {} # This dict will still be populated for comparisons
+        # --- Debug Verbosity Control ---
+        # 0: Off
+        # 1: Minimal diff summary (norms)
+        # 2: Level 1 + Missing keys
+        # 3: Level 2 + Detailed diff values
+        # 4: Level 3 + Enable internal helper debug logs
+        debug_verbosity = 1 # Set desired level here (0-4)
+        debug_info = {} if debug_verbosity > 0 else None # Init debug dict only if verbosity > 0
         x_original = x # Store the original input for debug comparison
 
         if isinstance(distributed_strategy, RingAttentionStrategy):
@@ -201,10 +200,9 @@ class LLaMABlock(nn.Module):
                 past_key_value_state=past_key_value_state,
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
-                strategy=distributed_strategy,
-                enable_debug_info=enable_debug_info,
-                rank = rank,
-                            minimal_debug_prints = minimal_debug_prints,
+                strategy=distributed_strategy, # Pass strategy
+                verbosity=debug_verbosity, # Pass verbosity level
+                rank=rank,
             )
 
             if use_cache:
@@ -214,12 +212,12 @@ class LLaMABlock(nn.Module):
                 cache = None
 
             # No nested dict expected — flatten directly
-            if enable_debug_info and debug_ring:
+            if debug_verbosity > 0 and debug_ring:
                 for k, v in debug_ring.items(): # Keys already have rank suffix from _forward_ring_attention
                     debug_info[k] = v # Directly assign without adding another suffix
-
+            
             # --- ENGINE PATH FOR COMPARISON ---
-            if enable_debug_info:
+            if debug_verbosity > 0:
                 # Gather the ORIGINAL block input for the engine comparison path
                 # Pad x_original to the block size before gathering, similar to how
                 # RingAttentionStrategy pads tensors before communication.
@@ -241,8 +239,7 @@ class LLaMABlock(nn.Module):
                     past_key_value_state=past_key_value_state,
                     use_cache=False,
                     is_causal_mask=is_causal_mask,
-                    enable_debug_info=True,
-                    minimal_debug_prints=minimal_debug_prints, # Pass flag
+                    verbosity=debug_verbosity, # Pass verbosity level
                 )
                 # Log the gathered input that was actually passed (optional, but good for clarity)
                 # Note: _forward_engine_attention already logs this internally as x_input_r{rank}
@@ -258,8 +255,7 @@ class LLaMABlock(nn.Module):
                 diffs = self._diff_debug_dicts(
                     {k: v for k, v in debug_info.items() if k.startswith("ring")},
                     {k: v for k, v in debug_info.items() if k.startswith("engine")},
-                    minimal_debug_prints=minimal_debug_prints,
-                    diff_mode=diff_mode # Pass diff_mode
+                    verbosity=debug_verbosity # Pass verbosity level
                 )
                 print(f"--- Exiting after debug diff in Rank {rank}, Layer {self.layer_index} ---") # Commented out to prevent early exit crash
 
@@ -276,8 +272,7 @@ class LLaMABlock(nn.Module):
                 past_key_value_state=past_key_value_state,
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
-                enable_debug_info=enable_debug_info,
-                minimal_debug_prints=minimal_debug_prints, # Pass flag
+                verbosity=debug_verbosity, # Pass verbosity level
             )
 
             if use_cache:
@@ -286,7 +281,7 @@ class LLaMABlock(nn.Module):
                 x, _, debug_engine = output_engine
                 cache = None
 
-            if enable_debug_info and debug_engine:
+            if debug_verbosity > 0 and debug_engine:
                 for k, v in debug_engine.items(): # Keys already have prefix and rank suffix from _forward_engine_attention
                     debug_info[k] = v # Directly assign
 
@@ -294,7 +289,7 @@ class LLaMABlock(nn.Module):
 
 
 
-    def _diff_debug_dicts(self, d1, d2, minimal_debug_prints=False, diff_mode=0): # Add diff_mode
+    def _diff_debug_dicts(self, d1, d2, verbosity=0): # Accept verbosity
         diffs = {}
 
 
@@ -321,20 +316,17 @@ class LLaMABlock(nn.Module):
         missing_ring = sorted(set(engine_map.keys()) - set(ring_map.keys()))
         missing_engine = sorted(set(ring_map.keys()) - set(engine_map.keys()))
 
-        # Only print these if not minimal
-        # if not minimal_debug_prints:
-        #     print("engine keys: ", engine_map.keys())
-        #     print("ring keys:   ", ring_map.keys())
+        # Print missing keys if verbosity >= 2
+        if verbosity >= 2:
+            if missing_ring:
+                print("Missing in Ring:")
+                for k in missing_ring:
+                    print(f"  {engine_map[k]}")
 
-        #     if missing_ring:
-        #         print("Missing in Ring:")
-        #         for k in missing_ring:
-        #             print(f"  {engine_map[k]}")
-
-        #     if missing_engine:
-        #         print("Missing in Engine:")
-        #         for k in missing_engine:
-        #             print(f"  {ring_map[k]}")
+            if missing_engine:
+                print("Missing in Engine:")
+                for k in missing_engine:
+                    print(f"  {ring_map[k]}")
 
         # --- Add Summary of Value Matches ---
         matching_keys = []
@@ -372,9 +364,9 @@ class LLaMABlock(nn.Module):
 
         # --- End Summary ---
 
-        # Always print the summary
-        # Only print the Value Match Summary if diff_mode is not 1
-        if diff_mode != 1:
+        # Print the Value Match Summary if verbosity >= 1
+        # (The detailed norm diffs below cover the minimal diff case)
+        if verbosity >= 1:
             summary_str = "\n--- Value Match Summary (First 5 Vals, 1% Tolerance) ---\n"
             summary_str += f"Matching Keys ({len(matching_keys)}): {sorted(matching_keys)}\n"
             summary_str += f"Non-Matching Keys ({len(non_matching_keys)}): {sorted(non_matching_keys)}\n"
@@ -383,8 +375,8 @@ class LLaMABlock(nn.Module):
             summary_str += "--------------------------------------------------------\n"
             print(summary_str) # Print summary before detailed diffs
 
-        # If minimal, print norm diffs for non-matching keys
-        if True:
+        # If verbosity >= 1, print norm diffs for non-matching keys
+        if verbosity >= 1:
             # Rename header for clarity
             print("--- Summary Diffs for Non-Matching Keys ---")
             for suffix in sorted(non_matching_keys):
@@ -425,8 +417,8 @@ class LLaMABlock(nn.Module):
                 else:
                     print(f"  {suffix}: N/A (Non-Tensor or Type Mismatch)")
             print("--------------------------------------------------------")
-        # Otherwise, print the full diffs
-        if not minimal_debug_prints:
+        # If verbosity >= 3, print the full diffs
+        if verbosity >= 3:
             # Indent this whole block
              for suffix in sorted(shared):
                  rk, ek = ring_map[suffix], engine_map[suffix]
@@ -528,12 +520,12 @@ class LLaMABlock(nn.Module):
         past_key_value_state,
         use_cache,
         is_causal_mask,
-        strategy,
-        enable_debug_info: bool,
-        minimal_debug_prints: bool, # Add flag
+        strategy, # Keep strategy
+        verbosity: int, # Add verbosity
         rank=0,
     ):
         debug = {}
+        enable_debug_info = verbosity > 0 # Use verbosity to determine if debug is enabled
         
         if enable_debug_info:
             # Log the local input x before gathering
@@ -549,7 +541,7 @@ class LLaMABlock(nn.Module):
 
         x_norm_gathered = self.ln(x_gathered) # Apply LN to the gathered tensor
         if enable_debug_info:
-            debug[f"ring_x_norm_gathered_r{rank}"] = x_norm_gathered.clone().detach().cpu()
+            debug[f"ring_x_norm_r{rank}"] = x_norm_gathered.clone().detach().cpu() # Rename key for comparison
 
         ring_helper = RingAttentionHelper(
             attn_module=self.attn,
@@ -557,8 +549,7 @@ class LLaMABlock(nn.Module):
             strategy=strategy,
             llama_block=self,
             use_cache=use_cache,
-            debug_mode=enable_debug_info,
-            minimal_debug_prints=minimal_debug_prints,
+            debug_mode=(verbosity >= 1), # Enable internal debug only at level 4
             ff=self.ff_sub_layer,              # Match engine
             ff_norm=self.ff_ln,                # Match engine
         )
@@ -573,7 +564,6 @@ class LLaMABlock(nn.Module):
             past_key_value_state=past_key_value_state,
             is_causal_mask=is_causal_mask,
             rank=rank,
-            minimal_debug_prints=minimal_debug_prints,
             valid_len=strategy._local_valid_len,
             residual=x_gathered # Pass the gathered residual source
         )
@@ -582,14 +572,14 @@ class LLaMABlock(nn.Module):
         if enable_debug_info and debug_ring:
             for k, v in debug_ring.items():
                 debug[f"ring_{k}"] = v
+        print(debug.keys())
 
-        return x, cache, debug if enable_debug_info else (x, cache)
-
-
-
-
-
-
+        # Always return the locally created debug dict if enable_debug_info is true
+        # Return None for debug dict if verbosity is 0
+        if verbosity == 0:
+            return x, cache, None
+        else:
+            return x, cache, debug
 
     def _forward_engine_attention(
         self,
@@ -600,16 +590,16 @@ class LLaMABlock(nn.Module):
         past_key_value_state,
         use_cache,
         is_causal_mask,
-        enable_debug_info: bool,
-        minimal_debug_prints: bool, # Add flag
+        verbosity: int, # Add verbosity
     ):
         debug = {}
+        enable_debug_info = verbosity > 0 # Use verbosity to determine if debug is enabled
         # Log the input x received by this function
         if enable_debug_info:
-            debug[f"x_input_r{dist.get_rank() if dist.is_initialized() else 0}"] = x.clone().detach().cpu() # Use simple key
+            debug[f"engine_x_input_r{dist.get_rank() if dist.is_initialized() else 0}"] = x.clone().detach().cpu() # Add engine_ prefix
         x_norm = self.ln(x) # This is the global x_norm
         if enable_debug_info:
-            debug[f"x_norm_r{dist.get_rank() if dist.is_initialized() else 0}"] = x_norm.clone().detach().cpu() # Use simple key
+            debug[f"engine_x_norm_r{dist.get_rank() if dist.is_initialized() else 0}"] = x_norm.clone().detach().cpu() # Add engine_ prefix
 
         queries, keys, values = self.compute_qkv_and_rope_thread(
             self.attn,
@@ -636,8 +626,7 @@ class LLaMABlock(nn.Module):
             ff=self.ff_sub_layer,
             ff_norm=self.ff_ln,
             is_causal=is_causal_mask and mask is None,
-            debug_mode=enable_debug_info,
-            minimal_debug_prints=minimal_debug_prints, # Pass flag
+            debug_mode=(verbosity >= 1), # Enable internal debug only at level 4
         )
 
 
@@ -652,8 +641,13 @@ class LLaMABlock(nn.Module):
 
 
         if enable_debug_info:
-            x, engine_debug_data = engine_output
-            if engine_debug_data:
+            if verbosity >= 1: # Corrected: Only unpack debug data if engine's debug mode was enabled
+                x, engine_debug_data = engine_output
+            else:
+                x = engine_output # Otherwise, only the output tensor is returned
+                engine_debug_data = None # Set to None as it wasn't returned
+
+            if engine_debug_data: # Check if debug data exists before processing
                 # Add engine prefix to keys coming from the engine's debug buffer
                 for k, v in engine_debug_data.items():
                     debug[f"engine_{k}"] = v

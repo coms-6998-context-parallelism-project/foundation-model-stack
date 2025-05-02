@@ -186,13 +186,15 @@ class LLaMABlock(nn.Module):
         distributed_strategy: Optional[DistributedStrategy] = None,
     ):
         
+        print(self.layer_index, end = ", ")
+        
         # --- Debug Verbosity Control ---
         # 0: Off
         # 1: Minimal diff summary (norms)
         # 2: Level 1 + Missing keys
         # 3: Level 2 + Detailed diff values
         # 4: Level 3 + Enable internal helper debug logs
-        debug_verbosity = 2 # Set desired level here (0-4)
+        debug_verbosity = 0 # Set desired level here (0-4)
         debug_info = {} if debug_verbosity > 0 else None # Init debug dict only if verbosity > 0
         x_original = x # Store the original input for debug comparison
 
@@ -565,7 +567,7 @@ class LLaMABlock(nn.Module):
 
         local_x_shape = x.shape
         correct_valid_len = strategy._local_valid_len # Use the strategy's valid length
-        print(f"[Rank {rank}, Layer {self.layer_index}] RingAttention: Input x shape={local_x_shape}, Correct valid_len={correct_valid_len}") # DEBUG PRINT
+        # print(f"[Rank {rank}, Layer {self.layer_index}] RingAttention: Input x shape={local_x_shape}, Correct valid_len={correct_valid_len}") # DEBUG PRINT
 
         x, cache, debug_ring = ring_helper.forward(
             x_norm_local, # Pass the local normalized tensor

@@ -1,6 +1,7 @@
 import logging
 import re
 from dataclasses import dataclass
+import time
 from typing import Any, List, Mapping, Optional, Tuple
 
 from fms.models.ring_attention_helper import RingAttentionHelper
@@ -175,10 +176,12 @@ class LLaMABlock(nn.Module):
 
             # --- ENGINE PATH FOR COMPARISON ---
             if enable_debug_info:
-                # Gather the ORIGINAL block input, not the output of the ring path
+                # Gather the ORIGINAL block input for the engine comparison path
                 x_gathered_original = distributed_strategy.gather_output(x_original)
+                # --- Add logging here ---
+                rank = dist.get_rank() if dist.is_initialized() else 0
                 output_engine_gathered = self._forward_engine_attention(
-                    x_gathered_original, # Pass the gathered ORIGINAL input
+                    x_gathered_original, # Pass the gathered original input
                     mask=mask,
                     position_ids=position_ids,
                     past_key_value_state=past_key_value_state,
@@ -186,6 +189,10 @@ class LLaMABlock(nn.Module):
                     is_causal_mask=is_causal_mask,
                     enable_debug_info=True,
                 )
+                # Log the gathered input that was actually passed (optional, but good for clarity)
+                # Note: _forward_engine_attention already logs this internally as x_input_r{rank}
+                # debug_info[f"engine_x_gathered_input_r{rank}"] = x_gathered_original.clone().detach().cpu()
+
                 _, _, debug_engine = output_engine_gathered
 
                 if debug_engine:
@@ -205,6 +212,7 @@ class LLaMABlock(nn.Module):
 
                 if dist.is_initialized():
                     dist.barrier()
+                time.sleep(3)
                 exit(0)
 
         else:
@@ -245,9 +253,15 @@ class LLaMABlock(nn.Module):
             return base
 
         # Build reverse maps
-        # Pass is_engine=True for engine keys if special handling is needed later
-        ring_map = {normalize(k, "ring_"): k for k in d1 if k.startswith("ring_")}
-        engine_map = {normalize(k, "engine_", is_engine=True): k for k in d2 if k.startswith("engine_")}
+        ring_map = {}
+        for k in d1:
+             if k.startswith("ring_"):
+                 ring_map[normalize(k, "ring_")] = k
+
+        engine_map = {}
+        for k in d2:
+            if k.startswith("engine_"):
+                 engine_map[normalize(k, "engine_", is_engine=True)] = k
 
         shared = ring_map.keys() & engine_map.keys()
         missing_ring = sorted(set(engine_map.keys()) - set(ring_map.keys()))
@@ -404,12 +418,12 @@ class LLaMABlock(nn.Module):
         enable_debug_info: bool
     ):
         debug = {}
-        # Log the input x to this function (potentially gathered if in debug comparison)
+        # Log the input x received by this function
         if enable_debug_info:
-            debug[f"engine_x_input_r{dist.get_rank() if dist.is_initialized() else 0}"] = x.clone().detach().cpu()
+            debug[f"x_input_r{dist.get_rank() if dist.is_initialized() else 0}"] = x.clone().detach().cpu() # Use simple key
         x_norm = self.ln(x) # This is the global x_norm
         if enable_debug_info:
-            debug[f"engine_x_norm_r{dist.get_rank() if dist.is_initialized() else 0}"] = x_norm.clone().detach().cpu() # Log global x_norm with simple key
+            debug[f"x_norm_r{dist.get_rank() if dist.is_initialized() else 0}"] = x_norm.clone().detach().cpu() # Use simple key
 
         queries, keys, values = self.compute_local_qkv_and_rope(
             self.attn,

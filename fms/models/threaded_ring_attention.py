@@ -38,7 +38,7 @@ class BlockData:
 # fake ring attention, for now (no multi gpu setup quite yet)
 class ThreadedRingAttentionEngine:
 
-    def __init__(self, block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool, debug_mode: bool = False):
+    def __init__(self, block_size: int, attn: MultiHeadAttention, ff: GatedLinearUnit, ff_norm: nn.Module, is_causal: bool, debug_mode: bool = False, minimal_debug_prints: bool = False):
 
         self.block_size = block_size
         self.attn = attn
@@ -48,6 +48,7 @@ class ThreadedRingAttentionEngine:
         self.head_dim = attn.emb_kq_per_head
         self.scale = math.sqrt(self.head_dim)
         self.debug_mode = debug_mode
+        self.minimal_debug_prints = minimal_debug_prints # Store flag
 
 
     # main method

@@ -4,24 +4,27 @@ import torch.distributed as dist
 import math
 
 class RingAttentionHelper:
-    def __init__(self, attn_module, layer_idx, strategy, llama_block, use_cache=False, debug_mode: bool = False):
+    def __init__(self, attn_module, layer_idx, strategy, llama_block, use_cache=False, debug_mode: bool = False, minimal_debug_prints: bool = False): # Add flag to init
         self.attn = attn_module
         self.layer_idx = layer_idx
         self.strategy = strategy
         self.use_cache = use_cache
         self.debug_mode = debug_mode
         self.llama_block = llama_block
+        self.minimal_debug_prints = minimal_debug_prints # Store flag
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
-    def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None, is_causal_mask=False, rank=0): # rank param seems unused here
-        if(self.layer_idx % 5 ==0):
-            if(self.rank ==0):
-                print(self.layer_idx, self.rank, x_norm.shape, end = "; ")
-                dist.barrier()
-            else:
-                dist.barrier()
-                print(self.layer_idx, self.rank, x_norm.shape)
+    def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None, is_causal_mask=False, rank=0, minimal_debug_prints: bool = False):
+        # Guard this block as well
+        if self.debug_mode and not self.minimal_debug_prints:
+            if(self.layer_idx % 5 ==0):
+                if(self.rank ==0):
+                    print(self.layer_idx, self.rank, x_norm.shape, end = "; ")
+                    dist.barrier()
+                else:
+                    dist.barrier()
+                    print(self.layer_idx, self.rank, x_norm.shape)
         if self.debug_mode:
             print(f"[Rank {self.rank}] x_norm shape before gather: {x_norm.shape}")
         # Guard barrier with debug_mode check
@@ -29,7 +32,7 @@ class RingAttentionHelper:
 
         if strategy.world_size > 1:
             x_norm_gathered = strategy.gather_tensor(x_norm, dim=1)
-            if self.debug_mode:
+            if self.debug_mode and not self.minimal_debug_prints: # Guard this print
                 print(f"[Rank {self.rank}] x_norm_gathered shape: {x_norm_gathered.shape}")
         else:
             x_norm_gathered = x_norm
@@ -49,7 +52,7 @@ class RingAttentionHelper:
             past_key_value_state=past_key_value_state,
             is_self=True,
         )
-        if self.debug_mode:
+        if self.debug_mode and not self.minimal_debug_prints: # Guard this print
             print(f"[Rank {self.rank}] QKV shapes - Q: {q_full.shape}, K: {k_full.shape}, V: {v_full.shape}")
 
         # True token count for this rank
@@ -76,7 +79,7 @@ class RingAttentionHelper:
         v = _pad_to_block(v_local, strategy.block_size)
 
         if self.debug_mode:
-            print(f"[Rank {self.rank}] Sliced QKV shapes - Q: {q.shape}, K: {k.shape}, V: {v.shape}")
+            if not self.minimal_debug_prints: print(f"[Rank {self.rank}] Sliced QKV shapes - Q: {q.shape}, K: {k.shape}, V: {v.shape}")
 
         if self.debug_mode:
             debug_info = {
@@ -97,7 +100,7 @@ class RingAttentionHelper:
 
 
         for i in range(self.world_size):
-            if self.debug_mode:
+            if self.debug_mode and not self.minimal_debug_prints:
                 print(f"[Rank {self.rank}] Ring step {i}")
             scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / scale
             if self.debug_mode and debug_info is not None:
@@ -149,7 +152,7 @@ class RingAttentionHelper:
         attn_out = attn_out[:, :real_T, :]  # finally trim back to real token count
 
         if self.debug_mode:
-            print(f"[Rank {self.rank}] Final attention output shape: {attn_out.shape}")
+            if not self.minimal_debug_prints: print(f"[Rank {self.rank}] Final attention output shape: {attn_out.shape}")
 
         return (attn_out, None, debug_info) if self.debug_mode else (attn_out, None)
 

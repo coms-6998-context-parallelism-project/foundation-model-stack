@@ -14,7 +14,12 @@ def _pad_to_block(t, target_len, dim=2):
     return torch.cat([t, pad], dim=dim)
 
 class RingAttentionHelper:
-    def __init__(self, attn_module, layer_idx, strategy, llama_block, use_cache=False, debug_mode: bool = False, minimal_debug_prints: bool = False):
+    def __init__(self, attn_module, layer_idx, strategy, llama_block, use_cache=False,
+             debug_mode: bool = False, minimal_debug_prints: bool = False,
+             ff=None, ff_norm=None):  # <-- Add these
+        self.attn = attn_module
+        self.ff = ff
+        self.ff_norm = ff_norm
         self.attn = attn_module
         self.layer_idx = layer_idx
         self.strategy = strategy # Assuming strategy contains block_size
@@ -32,7 +37,8 @@ class RingAttentionHelper:
              self.strategy.block_size = 128
 
     def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None,
-                is_causal_mask=False, rank=0, minimal_debug_prints: bool = False, valid_len=0):
+                is_causal_mask=False, rank=0, minimal_debug_prints: bool = False, valid_len=0, 
+                residual = None):
         """Main forward pass, delegates to forward_full after initial setup."""
 
         # Gather x_norm across ranks if world_size > 1
@@ -60,7 +66,7 @@ class RingAttentionHelper:
             k_global=k_global,
             v_global=v_global,
             mask_global=mask,
-            x_global=x_norm_gathered, # Pass gathered x_norm for residual connection
+            x_global=residual, # Pass gathered x_norm for residual connection
             x_norm_global=x_norm_gathered, # Pass gathered x_norm for FF layernorm
             valid_len=valid_len # Pass the local valid length
         )
@@ -94,8 +100,10 @@ class RingAttentionHelper:
         v_local = v_global[:, :, start_idx_global:end_idx_global, :]
 
         # Slice the relevant portion of x_global and x_norm_global for residual connections
-        x_block = x_global[:, start_idx_global:end_idx_global, :]
-        x_norm_block = x_norm_global[:, start_idx_global:end_idx_global, :]
+        x_block = x_global[:, :valid_len, :]  # ✅ Now matches attn_out
+
+        x_norm_block = x_norm_global[:, :valid_len, :]
+
 
 
         if self.debug_mode and debug_info is not None:
@@ -104,6 +112,7 @@ class RingAttentionHelper:
                 f"k_local_r{self.rank}": k_local.detach().cpu(),
                 f"v_local_r{self.rank}": v_local.detach().cpu(),
                 f"x_norm_r{self.rank}": x_norm_block.detach().cpu(),
+                f"x_block_r{self.rank}": x_block.detach().cpu(),
             })
 
         # --- Pass 1: Compute Max Scores ---
@@ -146,28 +155,28 @@ class RingAttentionHelper:
 
         # Apply dense layer and dropout
         attn_out = self.attn.dense(attn_out)
-        if hasattr(self.llama_block, 'dropout') and self.llama_block.config.p_dropout != 0:
-            attn_out = self.llama_block.dropout(attn_out)
+        # if hasattr(self.llama_block, 'dropout') and self.llama_block.config.p_dropout != 0:
+        #     attn_out = self.llama_block.dropout(attn_out)
 
         if self.debug_mode and debug_info is not None:
             debug_info[f"attn_out_raw_r{self.rank}"] = attn_out.clone().detach().cpu()
 
         # Add residual connection for attention output
-        residual_1 = attn_out + x_block
+        residual_1 = x_block + attn_out
         if self.debug_mode and debug_info is not None:
             debug_info[f"attn_out_residual_r{self.rank}"] = residual_1.clone().detach().cpu()
 
         # --- Feedforward Network ---
-        ff_ln_out = self.llama_block.ff_ln(residual_1)
+        ff_ln_out = self.ff_norm(residual_1)
         if self.debug_mode and debug_info is not None:
             debug_info[f"ff_ln_out_r{self.rank}"] = ff_ln_out.clone().detach().cpu()
 
-        ff_out_raw = self.llama_block.ff_sub_layer(ff_ln_out)
+        ff_out_raw = self.ff(ff_ln_out)
         if self.debug_mode and debug_info is not None:
             debug_info[f"ff_out_raw_r{self.rank}"] = ff_out_raw.clone().detach().cpu()
 
-        if hasattr(self.llama_block, 'dropout') and self.llama_block.config.p_dropout != 0:
-            ff_out_raw = self.llama_block.dropout(ff_out_raw)
+        # if hasattr(self.llama_block, 'dropout') and self.llama_block.config.p_dropout != 0:
+        #     ff_out_raw = self.llama_block.dropout(ff_out_raw)
 
         # Add residual connection after FF
         x = ff_out_raw + residual_1

@@ -463,7 +463,11 @@ class LLaMABlock(nn.Module):
             use_cache=use_cache,
             debug_mode=enable_debug_info,
             minimal_debug_prints=minimal_debug_prints,
+            ff=self.ff_sub_layer,              # Match engine
+            ff_norm=self.ff_ln,                # Match engine
         )
+
+
 
         x, cache, debug_ring = ring_helper.forward(
             x_norm,
@@ -474,9 +478,10 @@ class LLaMABlock(nn.Module):
             is_causal_mask=is_causal_mask,
             rank=rank,
             minimal_debug_prints=minimal_debug_prints,
-            valid_len = strategy._local_valid_len, 
-
+            valid_len=strategy._local_valid_len,
+            residual=residual  # ✅ Pass the correct x_block source
         )
+
 
         if enable_debug_info and debug_ring:
             for k, v in debug_ring.items():
@@ -556,21 +561,9 @@ class LLaMABlock(nn.Module):
                 # Add engine prefix to keys coming from the engine's debug buffer
                 for k, v in engine_debug_data.items():
                     debug[f"engine_{k}"] = v
-            # Log raw attention output (assuming it's part of engine_debug_data now)
-            # No separate logging needed here if engine logs it.
+
         else:
             x = engine_output
-
-        # Note: The engine output 'x' already includes the two residual adds and FF layer.
-        # To log intermediates equivalent to the ring path, the engine itself needs modification.
-        # Assuming engine_debug_data now contains attn_out_residual_rX, ff_ln_out_rX, ff_out_raw_rX
-        # If not, we would need to recompute or modify the engine further.
-        # For now, let's assume the engine provides these via engine_debug_data.
-        # Example placeholder if engine doesn't provide them:
-        # if enable_debug_info:
-        #     debug[f"engine_attn_out_residual_r{...}"] = ...
-        #     debug[f"engine_ff_ln_out_r{...}"] = ...
-        #     debug[f"engine_ff_out_raw_r{...}"] = ...
 
 
         cache = (keys, values) if use_cache else None

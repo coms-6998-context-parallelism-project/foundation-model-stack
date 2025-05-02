@@ -138,6 +138,7 @@ class ThreadedRingAttentionEngine:
                 f"ff_out_raw_r{block_id}": ff_out_raw.clone().detach().cpu(), # Log raw ff output
                 f"block_output_r{block_id}": block_output.clone().detach().cpu(), # Log the block's output
                 f"x_norm_r{block_id}": args.x_norm_block.clone().detach().cpu(), # Log the x_norm block slice
+                f"x_block_r{block_id}": args.x_block.clone().detach().cpu(), # Add x_block logging
                 })
     """ compute max scores for stability (first flash pass) """
     def compute_max_score(self, args: BlockData, initial_max_score: Tensor) -> Tensor:

@@ -145,7 +145,7 @@ class LLaMABlock(nn.Module):
         distributed_strategy: Optional[DistributedStrategy] = None,
     ):
         enable_debug_info = True  # Set to True to collect debug info
-        minimal_debug_prints= True
+        minimal_debug_prints= False
         debug_info = {} # This dict will still be populated for comparisons
         x_original = x # Store the original input for debug comparison
 
@@ -218,6 +218,7 @@ class LLaMABlock(nn.Module):
                 if dist.is_initialized():
                     dist.barrier()
                 time.sleep(3)
+                exit(0)
 
         else:
             # --- ENGINE-ONLY PATH ---
@@ -274,19 +275,19 @@ class LLaMABlock(nn.Module):
         missing_engine = sorted(set(ring_map.keys()) - set(engine_map.keys()))
 
         # Only print these if not minimal
-        if not minimal_debug_prints:
-            print("engine keys: ", engine_map.keys())
-            print("ring keys:   ", ring_map.keys())
+        # if not minimal_debug_prints:
+        #     print("engine keys: ", engine_map.keys())
+        #     print("ring keys:   ", ring_map.keys())
 
-            if missing_ring:
-                print("Missing in Ring:")
-                for k in missing_ring:
-                    print(f"  {engine_map[k]}")
+        #     if missing_ring:
+        #         print("Missing in Ring:")
+        #         for k in missing_ring:
+        #             print(f"  {engine_map[k]}")
 
-            if missing_engine:
-                print("Missing in Engine:")
-                for k in missing_engine:
-                    print(f"  {ring_map[k]}")
+        #     if missing_engine:
+        #         print("Missing in Engine:")
+        #         for k in missing_engine:
+        #             print(f"  {ring_map[k]}")
 
         # --- Add Summary of Value Matches ---
         matching_keys = []
@@ -362,17 +363,29 @@ class LLaMABlock(nn.Module):
                  val1, val2 = d1[rk], d2[ek]
 
                  diff_lines = [f"\n--- Key Suffix: {suffix} ---",
-                             f"                    {'Shape':<25} {'Dtype':<15} {'Values (up to shorter length)'}"]
+                             f"                    {'Shape':<25} {'Dtype':<15} {'First 5 Vals'}"] # Revert header
 
                  if isinstance(val1, torch.Tensor) and isinstance(val2, torch.Tensor):
-                     # Print all values up to the shorter length
-                     n_compare = min(val1.numel(), val2.numel())
-                     v1_flat = val1.flatten()[:n_compare].cpu().float()
-                     v2_flat = val2.flatten()[:n_compare].cpu().float()
+                     # Print first 5 values
+                     n_print = min(val1.numel(), val2.numel(), 5)
+                     v1_flat = val1.flatten()[:n_print].cpu().float()
+                     v2_flat = val2.flatten()[:n_print].cpu().float()
                      v1 = [f"{v:.4f}" for v in v1_flat.tolist()]
                      v2 = [f"{v:.4f}" for v in v2_flat.tolist()]
                      diff_lines.append(f"Ring:   {str(val1.shape):<25} {str(val1.dtype):<15} {v1}")
                      diff_lines.append(f"Engine: {str(val2.shape):<25} {str(val2.dtype):<15} {v2}")
+
+                     # Add overall diff stats for non-matching tensors
+                     if suffix in non_matching_keys:
+                         n_compare = min(val1.numel(), val2.numel())
+                         if n_compare > 0:
+                             v1_flat_comp = val1.flatten()[:n_compare].cpu().float()
+                             v2_flat_comp = val2.flatten()[:n_compare].cpu().float()
+                             norm_diff = torch.linalg.norm(v1_flat_comp - v2_flat_comp).item()
+                             abs_diff = torch.abs(v1_flat_comp - v2_flat_comp)
+                             max_diff = torch.max(abs_diff).item()
+                             max_diff_idx = torch.argmax(abs_diff).item()
+                             diff_lines.append(f"  Stats: L2 Norm Diff={norm_diff:.6f}, Max Abs Diff={max_diff:.6f} @ index {max_diff_idx}")
 
                  # ... (rest of the detailed diff logic for tuples, types, etc.) ...
                  elif isinstance(val1, tuple) and isinstance(val2, tuple):

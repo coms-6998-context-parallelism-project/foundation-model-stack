@@ -271,7 +271,7 @@ class LLaMABlock(nn.Module):
             val1, val2 = d1[rk], d2[ek]
 
             diff_lines = [f"\n--- Key Suffix: {suffix} ---",
-                        f"        {'Shape':<25} {'Dtype':<15} {'First 5 Vals'}"]
+                        f"                    {'Shape':<25} {'Dtype':<15} {'First 5 Vals'}"]
 
             if isinstance(val1, torch.Tensor) and isinstance(val2, torch.Tensor):
                 v1 = [f"{v:.4f}" for v in val1.flatten()[:5].tolist()]
@@ -351,6 +351,7 @@ class LLaMABlock(nn.Module):
             attn_module=self.attn,
             layer_idx=self.layer_index,
             strategy=strategy,
+            llama_block= self,
             use_cache=use_cache,
             debug_mode=enable_debug_info,
         )
@@ -358,6 +359,7 @@ class LLaMABlock(nn.Module):
         ring_output = ring_helper.forward(
             x_norm,
             mask=mask,
+            strategy= strategy,
             position_ids=position_ids,
             past_key_value_state=past_key_value_state,
             is_causal_mask=is_causal_mask,

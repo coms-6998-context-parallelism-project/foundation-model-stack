@@ -165,17 +165,17 @@ class TensorParallelStrategy(DistributedStrategy):
 class RingAttentionStrategy(DistributedStrategy):
     """
     Distributed strategy for ring attention with automatic input padding.
-    Handles input sharding and output gathering across ranks.
+    Ensures tensors gathered across ranks are the same shape.
     """
 
-    def __init__(self, block_size: int, group=None, from_meta=False): # Add block_size
+    def __init__(self, block_size: int, group=None, from_meta=False):
         super().__init__(from_meta)
         assert torch.distributed.is_initialized(), "Requires initialized process group"
         self.group = group or torch.distributed.GroupMember.WORLD
         self.rank = self.group.rank()
         self.world_size = self.group.size()
-        self.block_size = block_size # Store block_size
-        self._original_seq_len = None  # Track original sequence length for unpadding
+        self.block_size = block_size
+        self._original_seq_len = None
 
     def _distribute_module(self, module: nn.Module, final_layers: bool = False) -> nn.Module:
         return module
@@ -183,83 +183,49 @@ class RingAttentionStrategy(DistributedStrategy):
     def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
         return block
 
+    def _pad_to_block_size(self, x: Tensor, dim: int = 1) -> Tensor:
+        """Pads tensor along a dimension to block_size if needed."""
+        length = x.size(dim)
+        if length >= self.block_size:
+            return x
+        pad_shape = list(x.shape)
+        pad_shape[dim] = self.block_size - length
+        pad = torch.zeros(*pad_shape, dtype=x.dtype, device=x.device)
+        return torch.cat([x, pad], dim=dim)
+
     def shard_input(self, x: Tensor) -> Tensor:
-        """
-        Shard input along the sequence dimension. Automatically pads if needed.
-        """
-        # If world_size is 1, no sharding needed, but store original length
         if self.world_size == 1:
             self._original_seq_len = x.size(1)
             return x
 
         batch_size, seq_len = x.size(0), x.size(1)
         self._original_seq_len = seq_len
+        start = self.rank * self.block_size
+        end = min(start + self.block_size, seq_len)
 
-        # Calculate start and end indices for this rank's block
-        start_idx = self.rank * self.block_size
-
-        # Handle ranks that are completely outside the original sequence length
-        if start_idx >= seq_len:
-            # Return a tensor of size block_size, filled with padding (zeros)
-            # This ensures all ranks have a tensor of the same size for gather operations
-            return torch.zeros((batch_size, self.block_size, *x.shape[2:]), dtype=x.dtype, device=x.device)
-
-        end_idx = min(start_idx + self.block_size, seq_len)
-        shard = x[:, start_idx:end_idx, :].contiguous()
-
-        # Pad the shard if it's smaller than block_size (occurs for the last block)
-        current_shard_len = shard.size(1)
-        pad_len = self.block_size - current_shard_len
-        if pad_len > 0:
-            pad_tensor = torch.zeros((batch_size, pad_len, *x.shape[2:]), dtype=x.dtype, device=x.device)
-            shard = torch.cat([shard, pad_tensor], dim=1)
-
-        return shard
+        shard = x[:, start:end, :]
+        return self._pad_to_block_size(shard, dim=1)
 
     def gather_output(self, x_local: Tensor) -> Tensor:
-        """
-        Gather sequence shards and trim padding to recover original sequence length.
-        """
         if self.world_size == 1:
             return x_local
 
-        # x_local is the output corresponding to the (potentially padded) shard.
-        # It should have sequence length self.block_size.
-        gathered = [torch.empty_like(x_local) for _ in range(self.world_size)]
-        dist.all_gather(gathered, x_local.contiguous(), group=self.group)
-        full_padded = torch.cat(gathered, dim=1) # Shape: [B, world_size * block_size, D]
-
-        # Trim the result back to the original sequence length.
-        # The gathered tensor might be longer than original_seq_len due to padding of shards.
-        if self._original_seq_len is not None and full_padded.size(1) > self._original_seq_len:
-            full = full_padded[:, :self._original_seq_len] # Slice full_padded and assign to full
-        else:
-            full = full_padded # If no trimming needed, assign full_padded to full
+        padded_list = [torch.empty_like(x_local) for _ in range(self.world_size)]
+        dist.all_gather(padded_list, x_local.contiguous(), group=self.group)
+        full = torch.cat(padded_list, dim=1)
+        if self._original_seq_len and full.size(1) > self._original_seq_len:
+            return full[:, :self._original_seq_len]
         return full
 
     def gather_tensor(self, tensor: Tensor, dim: int = 1) -> Tensor:
-        """
-        Gathers a tensor sharded along a specific dimension across ranks.
-        Assumes the tensor might have been padded by shard_input if dim=1.
-
-        Args:
-            tensor (Tensor): The local shard of the tensor.
-            dim (int): The dimension along which the tensor is sharded. Defaults to 1 (sequence dim).
-
-        Returns:
-            Tensor: The gathered, potentially unpadded, tensor on all ranks.
-        """
         if self.world_size == 1:
             return tensor
 
-        gathered_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
-        dist.all_gather(gathered_list, tensor.contiguous(), group=self.group)
-        gathered_tensor = torch.cat(gathered_list, dim=dim)
+        tensor = self._pad_to_block_size(tensor, dim=dim)
+        gathered = [torch.empty_like(tensor) for _ in range(self.world_size)]
+        dist.all_gather(gathered, tensor.contiguous(), group=self.group)
+        result = torch.cat(gathered, dim=dim)
 
-        # Trim padding if gathering along sequence dimension (dim=1)
-        # and the original sequence length was stored (meaning shard_input was called)
-        # and padding might have been applied to shards.
-        # Assumes the gathered tensor's dimension `dim` corresponds to the sequence length.
-        if dim == 1 and self._original_seq_len is not None and gathered_tensor.size(dim) > self._original_seq_len:
-             gathered_tensor = gathered_tensor.narrow(dim, 0, self._original_seq_len)
-        return gathered_tensor
+        if dim == 1 and self._original_seq_len and result.size(dim) > self._original_seq_len:
+            result = result.narrow(dim, 0, self._original_seq_len)
+        return result

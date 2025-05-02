@@ -15,7 +15,6 @@ class RingAttentionHelper:
         self.world_size = dist.get_world_size()
 
     def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None, is_causal_mask=False, rank=0):
-        # Log input shape before gather
         print(f"[Rank {self.rank}] x_norm shape before gather: {x_norm.shape}")
         dist.barrier()
 
@@ -41,6 +40,7 @@ class RingAttentionHelper:
 
         start_idx = self.rank * strategy.block_size
         end_idx = start_idx + strategy.block_size
+
         def _pad_to_block(t, target_len, dim=2):
             pad_len = target_len - t.shape[dim]
             if pad_len <= 0:
@@ -49,16 +49,10 @@ class RingAttentionHelper:
             pad_shape[dim] = pad_len
             pad = torch.zeros(*pad_shape, dtype=t.dtype, device=t.device)
             return torch.cat([t, pad], dim=dim)
-        
-        q_len_actual = q_full.shape[2] if end_idx > q_full.shape[2] else end_idx - start_idx
-
 
         q = _pad_to_block(q_full[:, :, start_idx:end_idx, :], strategy.block_size)
         k = _pad_to_block(k_full[:, :, start_idx:end_idx, :], strategy.block_size)
         v = _pad_to_block(v_full[:, :, start_idx:end_idx, :], strategy.block_size)
-
-        
-
 
         print(f"[Rank {self.rank}] Sliced QKV shapes - Q: {q.shape}, K: {k.shape}, V: {v.shape}")
 
@@ -82,26 +76,22 @@ class RingAttentionHelper:
         for i in range(self.world_size):
             print(f"[Rank {self.rank}] Ring step {i}")
             scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / scale
-            if self.debug_mode and debug_info is not None: # Log raw scores BEFORE masking
+            if self.debug_mode and debug_info is not None:
                 debug_info[f"raw_scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu()
 
             if mask is not None:
                 scores += mask
 
             if is_causal_mask:
-                # Compute global token positions
                 q_pos_start = self.rank * strategy.block_size
                 k_pos_start = ((self.rank - i) % self.world_size) * strategy.block_size
-                q_pos = torch.arange(q_pos_start, q_pos_start + T_q, device=q.device).unsqueeze(-1)  # (T_q, 1)
-                k_pos = torch.arange(k_pos_start, k_pos_start + k.shape[2], device=q.device).unsqueeze(0)  # (1, T_k)
-
-                # Causal: Q can attend only to K positions ≤ its position
-                causal_mask = (q_pos >= k_pos).unsqueeze(0).unsqueeze(0)  # (1, 1, T_q, T_k)
+                q_pos = torch.arange(q_pos_start, q_pos_start + T_q, device=q.device).unsqueeze(-1)
+                k_pos = torch.arange(k_pos_start, k_pos_start + k.shape[2], device=q.device).unsqueeze(0)
+                causal_mask = (q_pos >= k_pos).unsqueeze(0).unsqueeze(0)
                 scores = scores.masked_fill(~causal_mask, -float("inf"))
 
-
             if self.debug_mode and debug_info is not None:
-                debug_info[f"scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu() # Log scores after masking
+                debug_info[f"scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu()
 
             block_max = scores.amax(dim=-1, keepdim=True)
             max_score = torch.maximum(max_score, block_max)
@@ -112,16 +102,15 @@ class RingAttentionHelper:
             denominator += exp_scores.sum(dim=-1, keepdim=True)
 
             if i < self.world_size - 1:
-                # Store previous k, v before shifting for potential logging if needed
-                # k_prev, v_prev = k, v
-                k, _ = self._ring_shift_tensor(k)
-                v, _ = self._ring_shift_tensor(v)
+                k, k_valid_len = self._ring_shift_tensor(k, strategy.block_size)
+                v, v_valid_len = self._ring_shift_tensor(v, strategy.block_size)
+                k = k[:, :, :k_valid_len, :]
+                v = v[:, :, :v_valid_len, :]
+
                 if self.debug_mode and debug_info is not None:
-                    # Log the tensors that will be used in the *next* step (i+1)
                     debug_info[f"k_input_step{i+1}_r{self.rank}"] = k.clone().detach().cpu()
                     debug_info[f"v_input_step{i+1}_r{self.rank}"] = v.clone().detach().cpu()
 
-        # Log intermediate values if debugging
         if self.debug_mode and debug_info is not None:
             debug_info[f"max_score_r{self.rank}"] = max_score.clone().detach().cpu()
             debug_info[f"numerator_r{self.rank}"] = numerator.clone().detach().cpu()
@@ -132,19 +121,42 @@ class RingAttentionHelper:
         attn_out = self.attn.dense(attn_out)
         print(f"[Rank {self.rank}] Final attention output shape: {attn_out.shape}")
 
+        
+
         return (attn_out, None, debug_info) if self.debug_mode else (attn_out, None)
 
-    def _ring_shift_tensor(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _ring_shift_tensor(self, tensor: torch.Tensor, pad_len: int) -> Tuple[torch.Tensor, int]:
         send_rank = (self.rank + 1) % self.world_size
         recv_rank = (self.rank - 1 + self.world_size) % self.world_size
-        try:
-            print(f"[Rank {self.rank}] Shifting tensor: send → {send_rank}, recv ← {recv_rank}, shape: {tensor.shape}")
-            tensor_recv = torch.empty_like(tensor, memory_format=torch.contiguous_format)
-            send_req = dist.isend(tensor.contiguous(), dst=send_rank)
-            dist.recv(tensor_recv, src=recv_rank)
-            send_req.wait()
-            print(f"[Rank {self.rank}] Received tensor from {recv_rank}")
-            return tensor_recv, recv_rank
-        except Exception as e:
-            print(f"[Rank {self.rank}] Error in ring shift: {e}")
-            raise
+
+        valid_len = tensor.shape[2]
+        pad_size = pad_len - valid_len
+
+        if pad_size > 0:
+            pad_tensor = torch.zeros(
+                *tensor.shape[:2], pad_size, tensor.shape[-1],
+                dtype=tensor.dtype, device=tensor.device
+            )
+            tensor_to_send = torch.cat([tensor, pad_tensor], dim=2)
+        else:
+            tensor_to_send = tensor
+
+        tensor_to_send = tensor_to_send.contiguous()
+
+        send_len = torch.tensor([valid_len], dtype=torch.int32, device=tensor.device)
+        recv_len = torch.empty(1, dtype=torch.int32, device=tensor.device)
+
+        # 🔄 Length exchange using async ops
+        len_send_req = dist.isend(send_len, dst=send_rank)
+        len_recv_req = dist.irecv(recv_len, src=recv_rank)
+        len_send_req.wait()
+        len_recv_req.wait()
+
+        # 🔄 Tensor exchange using async ops
+        tensor_recv = torch.empty_like(tensor_to_send)
+        tensor_send_req = dist.isend(tensor_to_send, dst=send_rank)
+        tensor_recv_req = dist.irecv(tensor_recv, src=recv_rank)
+        tensor_send_req.wait()
+        tensor_recv_req.wait()
+
+        return tensor_recv, recv_len.item()

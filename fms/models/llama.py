@@ -181,8 +181,19 @@ class LLaMABlock(nn.Module):
             # --- ENGINE PATH FOR COMPARISON ---
             if enable_debug_info:
                 # Gather the ORIGINAL block input for the engine comparison path
-                x_gathered_original = distributed_strategy.gather_output(x_original)
-                # --- Add logging here ---
+                # Pad x_original to the block size before gathering, similar to how
+                # RingAttentionStrategy pads before communication.
+                padded_x_original = x_original
+                if isinstance(distributed_strategy, RingAttentionStrategy):
+                    target_len = distributed_strategy.block_size
+                    current_len = x_original.shape[1]
+                    pad_len = target_len - current_len
+                    if pad_len > 0:
+                        pad_shape = list(x_original.shape)
+                        pad_shape[1] = pad_len
+                        pad = torch.zeros(*pad_shape, dtype=x_original.dtype, device=x_original.device)
+                        padded_x_original = torch.cat([x_original, pad], dim=1)
+                x_gathered_original = distributed_strategy.gather_output(padded_x_original)
                 rank = dist.get_rank() if dist.is_initialized() else 0
                 output_engine_gathered = self._forward_engine_attention(
                     x_gathered_original, # Pass the gathered original input
@@ -215,12 +226,11 @@ class LLaMABlock(nn.Module):
                     print(f"\n--- [Rank {rank}] Debug Info Diffs in LLaMABlock {self.layer_index} ---")
                 for key, formatted_string in diffs.items():
                     print(formatted_string)
-                print(f"--- Exiting after debug diff in Rank {rank}, Layer {self.layer_index} ---")
+                # print(f"--- Exiting after debug diff in Rank {rank}, Layer {self.layer_index} ---") # Commented out to prevent early exit crash
 
-                if dist.is_initialized():
-                    dist.barrier()
+                # if dist.is_initialized():
+                #     dist.barrier() # Commented out barrier as well
                 # time.sleep(3)
-                # exit(0)
 
         else:
             # --- ENGINE-ONLY PATH ---

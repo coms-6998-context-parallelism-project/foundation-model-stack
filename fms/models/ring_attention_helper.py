@@ -76,7 +76,7 @@ class RingAttentionHelper:
             return x, None, debug_info
         else:
             # Return just the output tensor to match original non-debug behavior
-            return result
+            return result, None, None
 
     def forward_full(self, q_global: torch.Tensor, k_global: torch.Tensor, v_global: torch.Tensor,
                      mask_global: Optional[torch.Tensor], x_global: torch.Tensor, x_norm_global: torch.Tensor,

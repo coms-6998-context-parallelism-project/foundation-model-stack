@@ -147,7 +147,7 @@ class LLaMABlock(nn.Module):
         
         print(self.layer_index, end = ", ")
         enable_debug_info = True  # Set to True to collect debug info
-        minimal_debug_prints= False
+        minimal_debug_prints= True
         debug_info = {} # This dict will still be populated for comparisons
         x_original = x # Store the original input for debug comparison
 
@@ -219,7 +219,7 @@ class LLaMABlock(nn.Module):
 
                 if dist.is_initialized():
                     dist.barrier()
-                time.sleep(3)
+                # time.sleep(3)
                 # exit(0)
 
         else:

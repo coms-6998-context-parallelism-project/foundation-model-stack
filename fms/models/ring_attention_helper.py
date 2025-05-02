@@ -90,27 +90,31 @@ class RingAttentionHelper:
         B, H, T_global, D_head = q_global.shape
         D_v = self.attn.emb_v_per_head
         T_q_local = valid_len # Use the provided valid_len as the local sequence length
+        T_block = self.strategy.block_size # Padded block size per rank
 
         # Determine the start and end indices for the local block on this rank
         start_idx_global = self.rank * self.strategy.block_size
-        end_idx_global = start_idx_global + T_q_local # Slice using the local valid length
+        # Use T_q_local (valid_len) for slicing Q, K, V from the global QKV tensors
+        end_idx_qkv = start_idx_global + T_q_local
+        # Use T_block for slicing x_global and x_norm_global to match engine's block slicing
+        end_idx_block = start_idx_global + T_block
 
-        q_local = q_global[:, :, start_idx_global:end_idx_global, :]
-        k_local = k_global[:, :, start_idx_global:end_idx_global, :]
-        v_local = v_global[:, :, start_idx_global:end_idx_global, :]
+        q_local = q_global[:, :, start_idx_global:end_idx_qkv, :]
+        k_local = k_global[:, :, start_idx_global:end_idx_qkv, :]
+        v_local = v_global[:, :, start_idx_global:end_idx_qkv, :]
 
-        # Slice the relevant portion of x_global and x_norm_global for residual connections
-        x_block = x_global[:, :valid_len, :]  # ✅ Now matches attn_out
-
-        x_norm_block = x_norm_global[:, :valid_len, :]
+        # Slice x_global (original residual) using valid_len for the residual connection
+        x_block = x_global[:, start_idx_global:end_idx_qkv, :] # Slice the gathered *original* residual
+        # Slice x_norm_global (normalized padded) using block indices to match engine logging
+        x_norm_block = x_norm_global[:, start_idx_global:end_idx_block, :] # Slice the gathered *normalized padded* input
 
 
 
         if self.debug_mode and debug_info is not None:
             debug_info.update({
                 f"q_local_r{self.rank}": q_local.detach().cpu(),
-                f"k_local_r{self.rank}": k_local.detach().cpu(),
-                f"v_local_r{self.rank}": v_local.detach().cpu(),
+                f"k_local_r{self.rank}": k_local.detach().cpu(), # This is the local block K
+                f"v_local_r{self.rank}": v_local.detach().cpu(), # This is the local block V
                 f"x_norm_r{self.rank}": x_norm_block.detach().cpu(),
                 f"x_block_r{self.rank}": x_block.detach().cpu(),
             })

@@ -467,14 +467,20 @@ class LLaMABlock(nn.Module):
         debug = {}
         
         if enable_debug_info:
-            debug[f"ring_x_input_r{rank}"] = x.clone().detach().cpu()
+            # Log the local input x before gathering
+            debug[f"ring_x_local_input_r{rank}"] = x.clone().detach().cpu()
 
         residual = x
-        x_norm = self.ln(x)
 
+        # Gather x *before* applying LayerNorm to match engine comparison path
+        if strategy.world_size > 1:
+            x_gathered = strategy.gather_tensor(x, dim=1)
+        else:
+            x_gathered = x
 
+        x_norm_gathered = self.ln(x_gathered) # Apply LN to the gathered tensor
         if enable_debug_info:
-            debug[f"ring_x_norm_r{rank}"] = x_norm.clone().detach().cpu()
+            debug[f"ring_x_norm_gathered_r{rank}"] = x_norm_gathered.clone().detach().cpu()
 
         ring_helper = RingAttentionHelper(
             attn_module=self.attn,
@@ -491,7 +497,7 @@ class LLaMABlock(nn.Module):
 
 
         x, cache, debug_ring = ring_helper.forward(
-            x_norm,
+            x_norm_gathered, # Pass the gathered and normalized tensor
             mask=mask,
             strategy=strategy,
             position_ids=position_ids,
@@ -500,7 +506,7 @@ class LLaMABlock(nn.Module):
             rank=rank,
             minimal_debug_prints=minimal_debug_prints,
             valid_len=strategy._local_valid_len,
-            residual=residual  # ✅ Pass the correct x_block source
+            residual=x_gathered # Pass the gathered residual source
         )
 
 

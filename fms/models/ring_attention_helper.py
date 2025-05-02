@@ -38,8 +38,15 @@ class RingAttentionHelper:
         )
         print(f"[Rank {self.rank}] QKV shapes - Q: {q_full.shape}, K: {k_full.shape}, V: {v_full.shape}")
 
+        # True token count for this rank
+        real_T = x_norm.shape[1]
+
         start_idx = self.rank * strategy.block_size
-        end_idx = start_idx + strategy.block_size
+
+        # Correct slicing of unpadded portion before padding
+        q_local = q_full[:, :, start_idx:start_idx + real_T, :]
+        k_local = k_full[:, :, start_idx:start_idx + real_T, :]
+        v_local = v_full[:, :, start_idx:start_idx + real_T, :]
 
         def _pad_to_block(t, target_len, dim=2):
             pad_len = target_len - t.shape[dim]
@@ -50,9 +57,9 @@ class RingAttentionHelper:
             pad = torch.zeros(*pad_shape, dtype=t.dtype, device=t.device)
             return torch.cat([t, pad], dim=dim)
 
-        q = _pad_to_block(q_full[:, :, start_idx:end_idx, :], strategy.block_size)
-        k = _pad_to_block(k_full[:, :, start_idx:end_idx, :], strategy.block_size)
-        v = _pad_to_block(v_full[:, :, start_idx:end_idx, :], strategy.block_size)
+        q = _pad_to_block(q_local, strategy.block_size)
+        k = _pad_to_block(k_local, strategy.block_size)
+        v = _pad_to_block(v_local, strategy.block_size)
 
         print(f"[Rank {self.rank}] Sliced QKV shapes - Q: {q.shape}, K: {k.shape}, V: {v.shape}")
 
@@ -69,9 +76,10 @@ class RingAttentionHelper:
         D_v = self.attn.emb_v_per_head
         scale = math.sqrt(D)
 
-        max_score = torch.full((B, H, T_q, 1), -float("inf"), device=q.device, dtype=q.dtype)
-        numerator = torch.zeros(B, H, T_q, D_v, device=q.device, dtype=q.dtype)
-        denominator = torch.zeros(B, H, T_q, 1, device=q.device, dtype=q.dtype)
+        max_score = torch.full((B, H, T_q, 1), -float("inf"), device=q.device, dtype=torch.float32)
+        numerator = torch.zeros(B, H, T_q, D_v, device=q.device, dtype=torch.float32)
+        denominator = torch.zeros(B, H, T_q, 1, device=q.device, dtype=torch.float32)
+
 
         for i in range(self.world_size):
             print(f"[Rank {self.rank}] Ring step {i}")
@@ -96,10 +104,14 @@ class RingAttentionHelper:
             block_max = scores.amax(dim=-1, keepdim=True)
             max_score = torch.maximum(max_score, block_max)
 
-            stable_scores = (scores - max_score).clamp(min=-10.0, max=10.0)
-            exp_scores = torch.exp(stable_scores)
-            numerator += torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
+            stable_scores = (scores - max_score).clamp(min=-10.0, max=10.0).to(torch.float32)
+            exp_scores = torch.exp(stable_scores)  # Now in float32
+
+            v_f32 = v.to(torch.float32)
+            numerator += torch.einsum("bhqk,bhkd->bhqd", exp_scores, v_f32)
             denominator += exp_scores.sum(dim=-1, keepdim=True)
+
+
 
             if i < self.world_size - 1:
                 k, k_valid_len = self._ring_shift_tensor(k, strategy.block_size)
@@ -115,15 +127,15 @@ class RingAttentionHelper:
             debug_info[f"max_score_r{self.rank}"] = max_score.clone().detach().cpu()
             debug_info[f"numerator_r{self.rank}"] = numerator.clone().detach().cpu()
             debug_info[f"denominator_r{self.rank}"] = denominator.clone().detach().cpu()
-
-        attn_out = numerator / (denominator + 1e-10)
+        attn_out = (numerator / (denominator + 1e-10)).to(q.dtype)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, H * D_v)
         attn_out = self.attn.dense(attn_out)
+        attn_out = attn_out[:, :real_T, :]  # finally trim back to real token count
+
         print(f"[Rank {self.rank}] Final attention output shape: {attn_out.shape}")
 
-        
-
         return (attn_out, None, debug_info) if self.debug_mode else (attn_out, None)
+
 
     def _ring_shift_tensor(self, tensor: torch.Tensor, pad_len: int) -> Tuple[torch.Tensor, int]:
         send_rank = (self.rank + 1) % self.world_size

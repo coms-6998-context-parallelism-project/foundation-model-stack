@@ -392,22 +392,24 @@ class LLaMABlock(nn.Module):
         is_causal_mask,
         strategy,
         enable_debug_info: bool,
-        rank = 0
+        rank=0,
     ):
         debug = {}
-        # Log the input x to this function (potentially sharded)
+        
         if enable_debug_info:
             debug[f"ring_x_input_r{rank}"] = x.clone().detach().cpu()
+
         residual = x
         x_norm = self.ln(x)
-        if enable_debug_info: # This is the sharded x_norm
-            debug[f"ring_x_norm_r{rank}"] = x_norm.clone().detach().cpu() # Log sharded x_norm with simple key
+
+        if enable_debug_info:
+            debug[f"ring_x_norm_r{rank}"] = x_norm.clone().detach().cpu()
 
         ring_helper = RingAttentionHelper(
             attn_module=self.attn,
             layer_idx=self.layer_index,
             strategy=strategy,
-            llama_block= self,
+            llama_block=self,
             use_cache=use_cache,
             debug_mode=enable_debug_info,
         )
@@ -415,11 +417,11 @@ class LLaMABlock(nn.Module):
         ring_output = ring_helper.forward(
             x_norm,
             mask=mask,
-            strategy= strategy,
+            strategy=strategy,
             position_ids=position_ids,
             past_key_value_state=past_key_value_state,
             is_causal_mask=is_causal_mask,
-            rank = rank
+            rank=rank,
         )
 
         if enable_debug_info:
@@ -427,34 +429,43 @@ class LLaMABlock(nn.Module):
             if ring_debug_data:
                 for k, v in ring_debug_data.items():
                     debug[f"ring_{k}"] = v
-            # Log raw attention output before dropout/residual
-            if enable_debug_info:
-                debug[f"ring_attn_out_raw_r{rank}"] = attn_out.clone().detach().cpu()
+            debug[f"ring_attn_out_raw_r{rank}"] = attn_out.clone().detach().cpu()
         else:
             attn_out, cache = ring_output
 
+        # Trim padding if present to match original sequence length
+        if attn_out.shape[1] > residual.shape[1]:
+            attn_out = attn_out[:, :residual.shape[1], :]
+
         if self.config.p_dropout != 0:
             attn_out = self.dropout(attn_out)
+
         x = attn_out + residual
+
         if enable_debug_info:
             debug[f"ring_attn_out_residual_r{rank}"] = x.clone().detach().cpu()
 
         residual = x
         ff_ln_out = self.ff_ln(x)
+
         if enable_debug_info:
             debug[f"ring_ff_ln_out_r{rank}"] = ff_ln_out.clone().detach().cpu()
+
         ff_out_raw = self.ff_sub_layer(ff_ln_out)
+
         if enable_debug_info:
             debug[f"ring_ff_out_raw_r{rank}"] = ff_out_raw.clone().detach().cpu()
 
         if self.config.p_dropout != 0:
-            x = self.dropout(x)
-        x = x + residual
+            ff_out_raw = self.dropout(ff_out_raw)
+
+        x = ff_out_raw + residual
 
         if enable_debug_info:
             debug[f"ring_block_output_r{rank}"] = x.clone().detach().cpu()
 
         return x, cache, debug
+
 
 
 

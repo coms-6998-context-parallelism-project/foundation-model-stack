@@ -411,7 +411,8 @@ def get_model(
             )
         elif distributed_strategy == "ring":
             print("using RingAttentionStrategy")
-            extra_args["distributed_strategy"] = RingAttentionStrategy(group)
+            # Pass block_size explicitly. Using 32 as a default, similar to ThreadedRingAttentionEngine.
+            extra_args["distributed_strategy"] = RingAttentionStrategy(block_size=32, group=group)
 
     # Create the model on meta device to allocate weights lazily
     fms_model = _get_model_instance(

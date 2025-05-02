@@ -270,7 +270,7 @@ class LLaMABlock(nn.Module):
             rk, ek = ring_map[suffix], engine_map[suffix]
             val1, val2 = d1[rk], d2[ek]
 
-            diff_lines = [f"--- Key Suffix: {suffix} ---",
+            diff_lines = [f"\n--- Key Suffix: {suffix} ---",
                         f"        {'Shape':<25} {'Dtype':<15} {'First 5 Vals'}"]
 
             if isinstance(val1, torch.Tensor) and isinstance(val2, torch.Tensor):
@@ -405,7 +405,7 @@ class LLaMABlock(nn.Module):
         # Log the input x to this function (potentially gathered if in debug comparison)
         if enable_debug_info:
             debug[f"engine_x_input_r{dist.get_rank() if dist.is_initialized() else 0}"] = x.clone().detach().cpu()
-        x_norm = self.ln(x)
+        x_norm = self.ln(x) # This is the global x_norm
         if enable_debug_info:
             debug[f"engine_x_norm_r{dist.get_rank() if dist.is_initialized() else 0}"] = x_norm.clone().detach().cpu() # Log global x_norm with simple key
 
@@ -444,6 +444,7 @@ class LLaMABlock(nn.Module):
             v_global=values_e,
             mask_global=mask,
             x_global=x,
+            x_norm_global=x_norm, # Pass global x_norm
         )
 
 

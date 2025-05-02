@@ -31,6 +31,7 @@ class BlockData:
     k_local: Tensor
     v_local: Tensor
     x_block: Tensor
+    x_norm_block: Tensor # Add x_norm block
 
 
 
@@ -50,7 +51,7 @@ class ThreadedRingAttentionEngine:
 
 
     # main method
-    def forward_full(self, q_global: Tensor, k_global: Tensor, v_global: Tensor, mask_global: Optional[Tensor], x_global: Tensor) -> Union[Tensor, Tuple[Tensor, Dict]]:
+    def forward_full(self, q_global: Tensor, k_global: Tensor, v_global: Tensor, mask_global: Optional[Tensor], x_global: Tensor, x_norm_global: Tensor) -> Union[Tensor, Tuple[Tensor, Dict]]:
 
         T_q = q_global.shape[2]
 
@@ -74,10 +75,12 @@ class ThreadedRingAttentionEngine:
                 v_global[:, :, q_start:q_end, :],
                 x_global[:, q_start:q_end, :]
             )
+            # Slice the global x_norm for this block
+            x_norm_block = x_norm_global[:, q_start:q_end, :]
 
             block_data = BlockData(
                 engine_instance=self, block_id=block_id, num_blocks=num_blocks, q_start=q_start, q_end=q_end, mask_global=mask_global, block_queues=block_queues, 
-                await_max=max_barrier, await_sums=sum_barrier, result_buffer=result_buffer, debug_buffer=debug_buffer, q_block=q_block, k_local=k_block, v_local=v_block, x_block=x_block
+                await_max=max_barrier, await_sums=sum_barrier, result_buffer=result_buffer, debug_buffer=debug_buffer, q_block=q_block, k_local=k_block, v_local=v_block, x_block=x_block, x_norm_block=x_norm_block # Pass x_norm_block
             )
 
             thread = threading.Thread(target=ThreadedRingAttentionEngine.block_worker, args=(block_data,), daemon=True)
@@ -122,6 +125,7 @@ class ThreadedRingAttentionEngine:
                 f"q_local_r{block_id}": args.q_block.clone().detach().cpu(),
                 f"k_local_r{block_id}": args.k_local.clone().detach().cpu(),
                 f"v_local_r{block_id}": args.v_local.clone().detach().cpu(),
+                f"x_norm_r{block_id}": args.x_norm_block.clone().detach().cpu(), # Log the x_norm block slice
             })
             if attn_out_raw_debug is not None: args.debug_buffer[f"attn_out_raw_r{block_id}"] = attn_out_raw_debug # Add attn_out_raw
 

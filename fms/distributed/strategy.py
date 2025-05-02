@@ -1,5 +1,6 @@
 import os
 from abc import abstractmethod
+import math # Add math import
 from typing import List
 
 import torch
@@ -167,12 +168,13 @@ class RingAttentionStrategy(DistributedStrategy):
     Handles input sharding and output gathering across ranks.
     """
 
-    def __init__(self, group=None, from_meta=False):
+    def __init__(self, block_size: int, group=None, from_meta=False): # Add block_size
         super().__init__(from_meta)
         assert torch.distributed.is_initialized(), "Requires initialized process group"
         self.group = group or torch.distributed.GroupMember.WORLD
         self.rank = self.group.rank()
         self.world_size = self.group.size()
+        self.block_size = block_size # Store block_size
         self._original_seq_len = None  # Track original sequence length for unpadding
 
     def _distribute_module(self, module: nn.Module, final_layers: bool = False) -> nn.Module:
@@ -185,20 +187,34 @@ class RingAttentionStrategy(DistributedStrategy):
         """
         Shard input along the sequence dimension. Automatically pads if needed.
         """
-        if self.world_size == 1 or x.size(1) == 1:
+        # If world_size is 1, no sharding needed, but store original length
+        if self.world_size == 1:
+            self._original_seq_len = x.size(1)
             return x
 
         batch_size, seq_len = x.size(0), x.size(1)
         self._original_seq_len = seq_len
 
-        # Calculate padded length
-        pad_len = (self.world_size - seq_len % self.world_size) % self.world_size
+        # Calculate start and end indices for this rank's block
+        start_idx = self.rank * self.block_size
+
+        # Handle ranks that are completely outside the original sequence length
+        if start_idx >= seq_len:
+            # Return a tensor of size block_size, filled with padding (zeros)
+            # This ensures all ranks have a tensor of the same size for gather operations
+            return torch.zeros((batch_size, self.block_size, *x.shape[2:]), dtype=x.dtype, device=x.device)
+
+        end_idx = min(start_idx + self.block_size, seq_len)
+        shard = x[:, start_idx:end_idx, :].contiguous()
+
+        # Pad the shard if it's smaller than block_size (occurs for the last block)
+        current_shard_len = shard.size(1)
+        pad_len = self.block_size - current_shard_len
         if pad_len > 0:
             pad_tensor = torch.zeros((batch_size, pad_len, *x.shape[2:]), dtype=x.dtype, device=x.device)
-            x = torch.cat([x, pad_tensor], dim=1)
+            shard = torch.cat([shard, pad_tensor], dim=1)
 
-        local_seq_len = x.size(1) // self.world_size
-        return x.split(local_seq_len, dim=1)[self.rank].contiguous()
+        return shard
 
     def gather_output(self, x_local: Tensor) -> Tensor:
         """
@@ -207,13 +223,18 @@ class RingAttentionStrategy(DistributedStrategy):
         if self.world_size == 1:
             return x_local
 
+        # x_local is the output corresponding to the (potentially padded) shard.
+        # It should have sequence length self.block_size.
         gathered = [torch.empty_like(x_local) for _ in range(self.world_size)]
         dist.all_gather(gathered, x_local.contiguous(), group=self.group)
-        full = torch.cat(gathered, dim=1)
+        full_padded = torch.cat(gathered, dim=1) # Shape: [B, world_size * block_size, D]
 
-        # Trim padding if it was added
-        if self._original_seq_len is not None:
-            full = full[:, :self._original_seq_len]
+        # Trim the result back to the original sequence length.
+        # The gathered tensor might be longer than original_seq_len due to padding of shards.
+        if self._original_seq_len is not None and full_padded.size(1) > self._original_seq_len:
+            full = full_padded[:, :self._original_seq_len] # Slice full_padded and assign to full
+        else:
+            full = full_padded # If no trimming needed, assign full_padded to full
         return full
 
     def gather_tensor(self, tensor: Tensor, dim: int = 1) -> Tensor:
@@ -235,7 +256,10 @@ class RingAttentionStrategy(DistributedStrategy):
         dist.all_gather(gathered_list, tensor.contiguous(), group=self.group)
         gathered_tensor = torch.cat(gathered_list, dim=dim)
 
-        # Trim padding if gathering along sequence dimension (dim=1) and padding was applied
-        if dim == 1 and self._original_seq_len is not None and gathered_tensor.shape[dim] > self._original_seq_len:
+        # Trim padding if gathering along sequence dimension (dim=1)
+        # and the original sequence length was stored (meaning shard_input was called)
+        # and padding might have been applied to shards.
+        # Assumes the gathered tensor's dimension `dim` corresponds to the sequence length.
+        if dim == 1 and self._original_seq_len is not None and gathered_tensor.size(dim) > self._original_seq_len:
              gathered_tensor = gathered_tensor.narrow(dim, 0, self._original_seq_len)
         return gathered_tensor

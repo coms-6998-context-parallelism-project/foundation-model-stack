@@ -145,9 +145,14 @@ class LLaMABlock(nn.Module):
         distributed_strategy: Optional[DistributedStrategy] = None,
     ):
         
-        print(self.layer_index, end = ", ")
+        # print(self.layer_index, end = ", ")
         enable_debug_info = False  # Set to True to collect debug info
-        minimal_debug_prints= True
+        minimal_debug_prints= False # Default to detailed prints
+        # diff_mode = 1 # Set this to 1 for minimal tabular diffs only
+        diff_mode = 1 # Set to 0 for default behavior
+        if diff_mode == 1:
+            minimal_debug_prints = True # Force minimal prints if diff_mode is 1
+
         debug_info = {} # This dict will still be populated for comparisons
         x_original = x # Store the original input for debug comparison
 
@@ -218,13 +223,9 @@ class LLaMABlock(nn.Module):
                 diffs = self._diff_debug_dicts(
                     {k: v for k, v in debug_info.items() if k.startswith("ring")},
                     {k: v for k, v in debug_info.items() if k.startswith("engine")},
-                    minimal_debug_prints=minimal_debug_prints, # Pass flag as argument
+                    minimal_debug_prints=minimal_debug_prints,
+                    diff_mode=diff_mode # Pass diff_mode
                 )
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                if not minimal_debug_prints: # Guard the diff print header
-                    print(f"\n--- [Rank {rank}] Debug Info Diffs in LLaMABlock {self.layer_index} ---")
-                for key, formatted_string in diffs.items():
-                    print(formatted_string)
                 # print(f"--- Exiting after debug diff in Rank {rank}, Layer {self.layer_index} ---") # Commented out to prevent early exit crash
 
                 # if dist.is_initialized():
@@ -258,7 +259,7 @@ class LLaMABlock(nn.Module):
 
 
 
-    def _diff_debug_dicts(self, d1, d2, minimal_debug_prints=False): # Add flag to signature
+    def _diff_debug_dicts(self, d1, d2, minimal_debug_prints=False, diff_mode=0): # Add diff_mode
         diffs = {}
 
 
@@ -337,16 +338,18 @@ class LLaMABlock(nn.Module):
         # --- End Summary ---
 
         # Always print the summary
-        summary_str = "\n--- Value Match Summary (First 5 Vals, 1% Tolerance) ---\n"
-        summary_str += f"Matching Keys ({len(matching_keys)}): {sorted(matching_keys)}\n"
-        summary_str += f"Non-Matching Keys ({len(non_matching_keys)}): {sorted(non_matching_keys)}\n"
-        if comparison_failed_keys:
-            summary_str += f"Comparison Failed Keys ({len(comparison_failed_keys)}): {sorted(comparison_failed_keys)}\n"
-        summary_str += "--------------------------------------------------------\n"
-        print(summary_str) # Print summary before detailed diffs
+        # Only print the Value Match Summary if diff_mode is not 1
+        if diff_mode != 1:
+            summary_str = "\n--- Value Match Summary (First 5 Vals, 1% Tolerance) ---\n"
+            summary_str += f"Matching Keys ({len(matching_keys)}): {sorted(matching_keys)}\n"
+            summary_str += f"Non-Matching Keys ({len(non_matching_keys)}): {sorted(non_matching_keys)}\n"
+            if comparison_failed_keys:
+                summary_str += f"Comparison Failed Keys ({len(comparison_failed_keys)}): {sorted(comparison_failed_keys)}\n"
+            summary_str += "--------------------------------------------------------\n"
+            print(summary_str) # Print summary before detailed diffs
 
         # If minimal, print norm diffs for non-matching keys
-        if minimal_debug_prints:
+        if True:
             # Rename header for clarity
             print("--- Summary Diffs for Non-Matching Keys ---")
             for suffix in sorted(non_matching_keys):

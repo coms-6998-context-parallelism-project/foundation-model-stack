@@ -215,11 +215,11 @@ class ThreadedRingAttentionEngine:
     """ Helper Functions"""
 
     # Modified to optionally skip masking for raw score logging
-    def raw_attention(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, apply_mask: bool = True) -> Tensor:
+    def raw_attention(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, apply_mask: bool = True, keep_causal = True) -> Tensor:
 
         scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / self.scale
         if apply_mask and mask is not None: scores = scores + mask
-        if self.is_causal:
+        if self.is_causal and keep_causal:
             q_indices_dev = q_indices.to(k_indices.device)
             causal_mask = (k_indices[None, :] > q_indices_dev[:, None]).unsqueeze(0).unsqueeze(0)
             scores = scores.masked_fill(causal_mask, -torch.inf)
@@ -240,7 +240,7 @@ class ThreadedRingAttentionEngine:
     def update_max_attn(self, args: BlockData, step_idx: int, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, current_max_score: Tensor) -> Tensor:
 
         # Compute raw scores WITHOUT mask first for logging
-        raw_scores = self.raw_attention(q, k, None, q_indices, k_indices, apply_mask=False)
+        raw_scores = self.raw_attention(q, k, None, q_indices, k_indices, apply_mask=False, keep_causal= False)
         if self.debug_mode and args.debug_buffer is not None:
             args.debug_buffer[f"raw_scores_step{step_idx}_r{args.block_id}"] = raw_scores.clone().detach().cpu()
 

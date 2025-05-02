@@ -37,57 +37,80 @@ class RingAttentionHelper:
              self.strategy.block_size = 128
 
     def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None,
-                is_causal_mask=False, rank=0, minimal_debug_prints: bool = False, valid_len=0, 
-                residual = None):
-        """Main forward pass, delegates to forward_full after initial setup."""
+            is_causal_mask=False, rank=0, minimal_debug_prints: bool = False, valid_len=0, 
+            residual=None):
+        """Main forward pass, delegates to forward_full after initial setup without global gather."""
 
-        # Gather x_norm across ranks if world_size > 1
-        if self.world_size > 1:
-            # strategy.gather_tensor should handle the communication
-            x_norm_gathered = strategy.gather_tensor(x_norm, dim=1)
-            qkv_input = x_norm_gathered
-        else:
-            x_norm_gathered = x_norm
-            qkv_input = x_norm
+        start_idx_global = self.rank * self.strategy.block_size
 
-        # Compute QKV for the gathered input. This step is assumed to handle Rope.
-        # The output q_global, k_global, v_global represent the full QKV tensors
-        # across the global sequence length.
-        q_global, k_global, v_global = self.llama_block.compute_local_qkv_and_rope(
-            self.attn, q=qkv_input, k=qkv_input, v=qkv_input,
-            position_ids=position_ids, use_cache=False, past_key_value_state=past_key_value_state, is_self=True
+        # Safe and globally aligned position_ids
+        if position_ids is None:
+            if valid_len == 0:
+                # Empty sequence: valid and safe
+                position_ids = torch.zeros((x_norm.shape[0], 0), dtype=torch.long, device=x_norm.device)
+            else:
+                # Local indices: 0..valid_len-1, then offset globally
+                position_ids = torch.arange(valid_len, device=x_norm.device).unsqueeze(0).expand(x_norm.shape[0], -1)
+
+        # Apply global offset so RoPE simulates unified sequence
+        position_ids = position_ids + start_idx_global
+
+        # Pad position_ids to match padded x_norm length
+        if position_ids.shape[1] < x_norm.shape[1]:
+            pad_len = x_norm.shape[1] - position_ids.shape[1]
+            pad = torch.full((position_ids.shape[0], pad_len), fill_value=0, device=position_ids.device, dtype=position_ids.dtype)
+            position_ids = torch.cat([position_ids, pad], dim=1)
+
+
+        # Compute local QKV aligned to global rotary positions
+        q_local, k_local, v_local = self.llama_block.compute_local_qkv_and_rope(
+            self.attn,
+            q=x_norm, k=x_norm, v=x_norm,
+            position_ids=position_ids,
+            use_cache=False,
+            past_key_value_state=past_key_value_state,
+            is_self=True
         )
 
-        # valid_len is the actual number of tokens on the current rank (local valid length).
-        # This is crucial for slicing the correct portion of the global tensors.
 
+        # Use x_norm as x_norm_global (since it's local-only now), pad to block size for FF layer
+        x_norm_padded = _pad_to_block(x_norm, self.strategy.block_size, dim=1)
+
+        # Pad residual if needed (matches engine assumption)
+        if residual is not None:
+            x_residual_padded = _pad_to_block(residual, valid_len, dim=1)
+        else:
+            x_residual_padded = None
+
+        # Forward full with locally computed Q/K/V
         result = self.forward_full(
-            q_global=q_global,
-            k_global=k_global,
-            v_global=v_global,
+            q_local=q_local,
+            k_local=k_local,
+            v_local=v_local,
             mask_global=mask,
-            x_global=residual, # Pass gathered x_norm for residual connection
-            x_norm_global=x_norm_gathered, # Pass gathered x_norm for FF layernorm
-            valid_len=valid_len # Pass the local valid length
+            x_block=x_residual_padded,
+            x_norm_block=x_norm_padded,
+            valid_len=valid_len,
+            q_start_global=start_idx_global
         )
 
         if self.debug_mode:
             x, debug_info = result
             return x, None, debug_info
         else:
-            # Return just the output tensor to match original non-debug behavior
             return result, None, None
 
-    def forward_full(self, q_global: torch.Tensor, k_global: torch.Tensor, v_global: torch.Tensor,
-                     mask_global: Optional[torch.Tensor], x_global: torch.Tensor, x_norm_global: torch.Tensor,
-                     valid_len: int) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
+
+    def forward_full(self, q_local: torch.Tensor, k_local: torch.Tensor, v_local: torch.Tensor,
+                     mask_global: Optional[torch.Tensor], # x_global: torch.Tensor, x_norm_global: torch.Tensor,
+                     valid_len: int, x_block, x_norm_block, q_start_global) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict],]:
         """
         Performs the full ring attention forward pass using a two-pass approach.
         Uses torch.distributed for communication.
         """
         debug_info = {} if self.debug_mode else None
 
-        B, H, T_global, D_head = q_global.shape
+        B, H, T_q_local, D_head = q_local.shape
         D_v = self.attn.emb_v_per_head
         T_q_local = valid_len # Use the provided valid_len as the local sequence length
         T_block = self.strategy.block_size # Padded block size per rank
@@ -99,14 +122,10 @@ class RingAttentionHelper:
         # Use T_block for slicing x_global and x_norm_global to match engine's block slicing
         end_idx_block = start_idx_global + T_block
 
-        q_local = q_global[:, :, start_idx_global:end_idx_qkv, :]
-        k_local = k_global[:, :, start_idx_global:end_idx_qkv, :]
-        v_local = v_global[:, :, start_idx_global:end_idx_qkv, :]
-
-        # Slice x_global (original residual) using valid_len for the residual connection
-        x_block = x_global[:, start_idx_global:end_idx_qkv, :] # Slice the gathered *original* residual
-        # Slice x_norm_global (normalized padded) using block indices to match engine logging
-        x_norm_block = x_norm_global[:, start_idx_global:end_idx_block, :] # Slice the gathered *normalized padded* input
+        # # Slice x_global (original residual) using valid_len for the residual connection
+        # x_block = x_global[:, start_idx_global:end_idx_qkv, :] # Slice the gathered *original* residual
+        # # Slice x_norm_global (normalized padded) using block indices to match engine logging
+        # x_norm_block = x_norm_global[:, start_idx_global:end_idx_block, :] # Slice the gathered *normalized padded* input
 
 
 

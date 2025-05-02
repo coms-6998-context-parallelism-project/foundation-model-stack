@@ -118,7 +118,42 @@ class LLaMABlock(nn.Module):
 
         if self.config.p_dropout != 0:
             self.dropout = nn.Dropout(self.config.p_dropout)
-    def compute_local_qkv_and_rope(self, attn_data, q, k=None, v=None, position_ids=None, use_cache=False, past_key_value_state=None, is_self=True):
+    def compute_local_qkv_and_rope(
+        self, attn_data, q, k=None, v=None, position_ids=None,
+        use_cache=False, past_key_value_state=None, is_self=True
+    ):
+        B, T, _ = q.shape
+        q_out, k_out, v_out = attn_data.in_proj(q, k, v)
+
+        queries = q_out.view(B, T, attn_data.nheads, attn_data.emb_kq_per_head)
+        keys    = k_out.view(B, T, attn_data.kvheads, attn_data.emb_kq_per_head)
+        values  = v_out.view(B, T, attn_data.kvheads, attn_data.emb_v_per_head)
+
+        if attn_data.position_encoder is not None and T > 0:
+            # Sanity check: position_ids must be passed in already, shaped [B, T]
+            assert position_ids is not None, "position_ids must be provided for rotary encoding"
+            assert position_ids.shape[0] == B, f"position_ids batch mismatch: {position_ids.shape[0]} != {B}"
+            assert position_ids.shape[1] == T, f"position_ids seq mismatch: {position_ids.shape[1]} != {T}"
+
+            # Clamp to ensure we don't index beyond RoPE cache
+            max_pos = getattr(attn_data.position_encoder, 'max_position_embeddings', 2048)
+            position_ids = position_ids.clamp(0, max_pos - 1)
+
+            # Apply rotary position encodings
+            queries, keys = attn_data.position_encoder.adjusted_qk(
+                queries, keys, position_ids
+            )
+
+        return (
+            queries.transpose(1, 2),  # [B, H, T, D]
+            keys.transpose(1, 2),
+            values.transpose(1, 2)
+        )
+
+
+
+    
+    def compute_qkv_and_rope_thread(self, attn_data, q, k=None, v=None, position_ids=None, use_cache=False, past_key_value_state=None, is_self=True):
         B, T, _ = q.shape
         q_out, k_out, v_out = attn_data.in_proj(q, k, v)
 
@@ -146,10 +181,10 @@ class LLaMABlock(nn.Module):
     ):
         
         print(self.layer_index, end = ", ")
-        enable_debug_info = False  # Set to True to collect debug info
+        enable_debug_info = True  # Set to True to collect debug info
         minimal_debug_prints= False # Default to detailed prints
         # diff_mode = 1 # Set this to 1 for minimal tabular diffs only
-        diff_mode = 1 # Set to 0 for default behavior
+        diff_mode = 0 # Set to 0 for default behavior
         if diff_mode == 1:
             minimal_debug_prints = True # Force minimal prints if diff_mode is 1
 
@@ -226,11 +261,11 @@ class LLaMABlock(nn.Module):
                     minimal_debug_prints=minimal_debug_prints,
                     diff_mode=diff_mode # Pass diff_mode
                 )
-                # print(f"--- Exiting after debug diff in Rank {rank}, Layer {self.layer_index} ---") # Commented out to prevent early exit crash
+                print(f"--- Exiting after debug diff in Rank {rank}, Layer {self.layer_index} ---") # Commented out to prevent early exit crash
 
-                # if dist.is_initialized():
-                #     dist.barrier() # Commented out barrier as well
-                # time.sleep(3)
+                if dist.is_initialized():
+                    dist.barrier() # Commented out barrier as well
+                time.sleep(3)
 
         else:
             # --- ENGINE-ONLY PATH ---
@@ -391,7 +426,7 @@ class LLaMABlock(nn.Module):
                     print(f"  {suffix}: N/A (Non-Tensor or Type Mismatch)")
             print("--------------------------------------------------------")
         # Otherwise, print the full diffs
-        else:
+        if not minimal_debug_prints:
             # Indent this whole block
              for suffix in sorted(shared):
                  rk, ek = ring_map[suffix], engine_map[suffix]
@@ -576,7 +611,7 @@ class LLaMABlock(nn.Module):
         if enable_debug_info:
             debug[f"x_norm_r{dist.get_rank() if dist.is_initialized() else 0}"] = x_norm.clone().detach().cpu() # Use simple key
 
-        queries, keys, values = self.compute_local_qkv_and_rope(
+        queries, keys, values = self.compute_qkv_and_rope_thread(
             self.attn,
             q=x_norm,
             k=x_norm,

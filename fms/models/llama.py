@@ -146,7 +146,7 @@ class LLaMABlock(nn.Module):
     ):
         
         print(self.layer_index, end = ", ")
-        enable_debug_info = True  # Set to True to collect debug info
+        enable_debug_info = False  # Set to True to collect debug info
         minimal_debug_prints= True
         debug_info = {} # This dict will still be populated for comparisons
         x_original = x # Store the original input for debug comparison
@@ -347,7 +347,8 @@ class LLaMABlock(nn.Module):
 
         # If minimal, print norm diffs for non-matching keys
         if minimal_debug_prints:
-            print("--- Norm Diffs for Non-Matching Keys (First 5 Vals) ---")
+            # Rename header for clarity
+            print("--- Summary Diffs for Non-Matching Keys ---")
             for suffix in sorted(non_matching_keys):
                 if suffix not in shared: continue # Skip if key wasn't actually shared (e.g., comparison failed)
                 rk, ek = ring_map[suffix], engine_map[suffix]
@@ -358,8 +359,28 @@ class LLaMABlock(nn.Module):
                         # Calculate norm diff over the shorter length
                         v1_flat = val1.flatten()[:n_compare].cpu().float()
                         v2_flat = val2.flatten()[:n_compare].cpu().float()
-                        norm_diff = torch.linalg.norm(v1_flat - v2_flat).item()
-                        print(f"  {suffix}: {norm_diff:.6f}")
+                        abs_diff = torch.abs(v1_flat - v2_flat)
+                        norm_v2 = torch.linalg.norm(v2_flat).item()
+                        norm_diff = torch.linalg.norm(v1_flat - v2_flat).item() # Calculate norm_diff first
+                        rel_norm_diff = (norm_diff / norm_v2) if norm_v2 > 1e-9 else float('inf') # Avoid division by zero
+                        max_diff = torch.max(abs_diff).item()
+                        max_diff_flat_idx = torch.argmax(abs_diff).item()
+                        mean_abs_diff = torch.mean(abs_diff).item()
+                        threshold = 1e-4 # Use a threshold for significant difference
+                        offending_indices = torch.where(abs_diff > threshold)[0]
+                        num_offending = offending_indices.numel()
+                        percentage_offending = (num_offending / abs_diff.numel()) * 100 if abs_diff.numel() > 0 else 0
+
+                        # Unravel the flat index to multi-dimensional index
+                        original_shape = val1.shape # Use val1's shape as reference
+                        indices = []
+                        temp_idx = max_diff_flat_idx
+                        for dim_size in reversed(original_shape):
+                            indices.append(temp_idx % dim_size)
+                            temp_idx //= dim_size
+                        max_diff_coords = tuple(reversed(indices))
+
+                        print(f"  {suffix}: L2={norm_diff:.4f}, RelL2={rel_norm_diff:.4f}, MaxAbs={max_diff:.4f} @{max_diff_coords}, MeanAbs={mean_abs_diff:.4f}, Offending(>{threshold:.1e})={num_offending}/{n_compare} ({percentage_offending:.1f}%)")
                     else:
                         # Handle case where one or both tensors are empty
                         print(f"  {suffix}: N/A (Empty Tensor)")
@@ -395,20 +416,30 @@ class LLaMABlock(nn.Module):
                              norm_diff = torch.linalg.norm(v1_flat_comp - v2_flat_comp).item()
                              abs_diff = torch.abs(v1_flat_comp - v2_flat_comp)
                              max_diff = torch.max(abs_diff).item()
-                             max_diff_idx = torch.argmax(abs_diff).item()
-                             # --- Add offending element count and top diffs ---
-                             threshold = 1e-3
+                             max_diff_flat_idx = torch.argmax(abs_diff).item()
+                             mean_abs_diff = torch.mean(abs_diff).item()
+                             threshold = 1e-4 # Define a threshold for significant difference
                              offending_indices = torch.where(abs_diff > threshold)[0]
                              num_offending = offending_indices.numel()
-                             percentage_offending = (num_offending / n_compare) * 100 if n_compare > 0 else 0
+                             percentage_offending = (num_offending / abs_diff.numel()) * 100 if abs_diff.numel() > 0 else 0
+
+                             # Unravel the flat index to multi-dimensional index
+                             original_shape = val1.shape # Use val1's shape as reference
+                             indices = []
+                             temp_idx = max_diff_flat_idx
+                             for dim_size in reversed(original_shape):
+                                 indices.append(temp_idx % dim_size)
+                                 temp_idx //= dim_size
+                             max_diff_coords = tuple(reversed(indices))
                              # Find top 5 largest absolute differences
                              top_k_diffs, top_k_indices = torch.topk(abs_diff, k=min(5, n_compare))
                              top_diff_details = []
                              for i in range(top_k_indices.numel()):
                                  idx = top_k_indices[i].item()
                                  top_diff_details.append(f"idx {idx}: Ring={v1_flat_comp[idx]:.4f}, Engine={v2_flat_comp[idx]:.4f} (Diff={top_k_diffs[i]:.4f})")
-                             diff_lines.append(f"  Stats: L2 Norm Diff={norm_diff:.6f}, Max Abs Diff={max_diff:.6f} @ index {max_diff_idx}, Offending (> {threshold:.1e}): {num_offending}/{n_compare} ({percentage_offending:.2f}%)")
-                             diff_lines.append(f"  Top 5 Diffs: [{', '.join(top_diff_details)}]")
+                             diff_lines.append(f"  Stats: L2 Norm Diff={norm_diff:.6f}, Max Abs Diff={max_diff:.6f} @{max_diff_coords}, Offending (> {threshold:.1e}): {num_offending}/{n_compare} ({percentage_offending:.2f}%)")
+                             diff_lines.append(f"  Stats: Mean Abs Diff={mean_abs_diff:.6f}")
+                             diff_lines.append(f"  Top 5 Abs Diffs: [{', '.join(top_diff_details)}]")
 
                  # ... (rest of the detailed diff logic for tuples, types, etc.) ...
                  elif isinstance(val1, tuple) and isinstance(val2, tuple):
@@ -780,6 +811,7 @@ class LLaMA(nn.Module):
         # x_in: batch_size x seq_len
         # mask: batch_size x seq_len x seq_len
         # bias: nheads x seq_len x seq_len
+        original_seq_len = x_in.size(1) # Capture original sequence length
         if past_key_value_states is None or len(past_key_value_states) == 0:
             past_key_value_states = [None for _ in range(len(self.layers))]
 
@@ -834,8 +866,11 @@ class LLaMA(nn.Module):
         if self.config.p_dropout:
             dec_out = self.dropout(dec_out)
 
-        # if isinstance(distributed_strategy, RingAttentionStrategy):
-        #     dec_out = distributed_strategy.gather_output(dec_out)
+        if isinstance(distributed_strategy, RingAttentionStrategy):
+            # Gather the potentially padded tensor
+            gathered_dec_out = distributed_strategy.gather_tensor(dec_out, dim=1)
+            # Slice back to the original sequence length
+            dec_out = gathered_dec_out[:, :original_seq_len, :]
 
         return dec_out, present_key_value_states
 

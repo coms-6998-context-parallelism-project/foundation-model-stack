@@ -280,6 +280,39 @@ class LLaMABlock(nn.Module):
             for k in missing_engine:
                 print(f"  {ring_map[k]}")
 
+        # --- Add Summary of Value Matches ---
+        matching_keys = []
+        non_matching_keys = []
+        comparison_failed_keys = []
+
+        for suffix in sorted(shared):
+            rk, ek = ring_map[suffix], engine_map[suffix]
+            val1, val2 = d1[rk], d2[ek]
+
+            if isinstance(val1, torch.Tensor) and isinstance(val2, torch.Tensor):
+                # Compare first 5 values
+                n_compare = min(val1.numel(), val2.numel(), 5)
+                if n_compare > 0:
+                    v1_flat = val1.flatten()[:n_compare]
+                    v2_flat = val2.flatten()[:n_compare]
+                    try:
+                        # Use torch.allclose for robust comparison with relative tolerance (1%)
+                        # Added atol for stability near zero
+                        if torch.allclose(v1_flat.float(), v2_flat.float(), rtol=0.01, atol=1e-5):
+                            matching_keys.append(suffix)
+                        else:
+                            non_matching_keys.append(suffix)
+                    except Exception as e:
+                        comparison_failed_keys.append(f"{suffix} (Error: {e})")
+                else:
+                     # If tensors are empty or only one is, consider non-matching
+                     non_matching_keys.append(suffix)
+            else:
+                # Non-tensor types or mismatched types are considered non-matching for this check
+                non_matching_keys.append(suffix)
+
+        # --- End Summary ---
+
         for suffix in sorted(shared):
             rk, ek = ring_map[suffix], engine_map[suffix]
             val1, val2 = d1[rk], d2[ek]
@@ -307,6 +340,15 @@ class LLaMABlock(nn.Module):
                 diff_lines.append(f"  Mismatched types: Ring={type(val1)}, Engine={type(val2)}")
 
             diffs[suffix] = "\n".join(diff_lines)
+
+        # Prepend the summary to the output dictionary if needed, or just print it
+        summary_str = "\n--- Value Match Summary (First 5 Vals, 1% Tolerance) ---\n"
+        summary_str += f"Matching Keys ({len(matching_keys)}): {sorted(matching_keys)}\n"
+        summary_str += f"Non-Matching Keys ({len(non_matching_keys)}): {sorted(non_matching_keys)}\n"
+        if comparison_failed_keys:
+            summary_str += f"Comparison Failed Keys ({len(comparison_failed_keys)}): {sorted(comparison_failed_keys)}\n"
+        summary_str += "--------------------------------------------------------\n"
+        print(summary_str) # Print summary before detailed diffs
 
         return diffs
 

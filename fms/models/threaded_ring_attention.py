@@ -126,6 +126,8 @@ class ThreadedRingAttentionEngine:
                 f"q_local_r{block_id}": args.q_block.clone().detach().cpu(),
                 f"k_local_r{block_id}": args.k_local.clone().detach().cpu(),
                 f"v_local_r{block_id}": args.v_local.clone().detach().cpu(),
+                # Note: Per-step scores and shifted tensors are logged in helper functions now
+                # and added directly to args.debug_buffer
                 f"max_score_r{block_id}": final_max_score.clone().detach().cpu(), # Log max score
                 f"numerator_r{block_id}": final_num.clone().detach().cpu(), # Log numerator
                 f"denominator_r{block_id}": final_den.clone().detach().cpu(), # Log denominator
@@ -135,9 +137,7 @@ class ThreadedRingAttentionEngine:
                 f"ff_out_raw_r{block_id}": ff_out_raw.clone().detach().cpu(), # Log raw ff output
                 f"block_output_r{block_id}": block_output.clone().detach().cpu(), # Log the block's output
                 f"x_norm_r{block_id}": args.x_norm_block.clone().detach().cpu(), # Log the x_norm block slice
-            })
-            if attn_out_raw_debug is not None: args.debug_buffer[f"attn_out_raw_r{block_id}"] = attn_out_raw_debug # Add attn_out_raw
-
+                })
     """ compute max scores for stability (first flash pass) """
     def compute_max_score(self, args: BlockData, initial_max_score: Tensor) -> Tensor:
 
@@ -156,10 +156,14 @@ class ThreadedRingAttentionEngine:
         for i in range(args.num_blocks):
             mask = args.mask_global[:, :, args.q_start:args.q_end, current_k_global_start:current_k_global_start+current_k.shape[2]] if args.mask_global is not None else None
 
-            max_score = engine.update_max_attn(args.q_block, current_k, mask, q_indices, current_k_idx, max_score)
+            # Call helper which now includes logging
+            max_score = engine.update_max_attn(args, i, args.q_block, current_k, mask, q_indices, current_k_idx, max_score)
             if i < args.num_blocks - 1:
                 send_q.put((current_k, current_k_idx, current_k_global_start))
                 current_k, current_k_idx, current_k_global_start = recv_q.get()
+                if engine.debug_mode and args.debug_buffer is not None:
+                    # Log the tensors received for the *next* step (i+1)
+                    args.debug_buffer[f"engine_k_input_step{i+1}_r{args.block_id}"] = current_k.clone().detach().cpu()
 
         return max_score
 
@@ -181,10 +185,15 @@ class ThreadedRingAttentionEngine:
         for i in range(args.num_blocks):
             mask = args.mask_global[:, :, args.q_start:args.q_end, current_k_global_start:current_k_global_start+current_k.shape[2]] if args.mask_global is not None else None
 
-            num, den = engine.update_totals(args.q_block, current_k, current_v, mask, q_indices, current_k_idx, final_max_score, num, den)
+            # Call helper which now includes logging
+            num, den = engine.update_totals(args, i, args.q_block, current_k, current_v, mask, q_indices, current_k_idx, final_max_score, num, den)
             if i < args.num_blocks - 1:
                 send_q.put((current_k, current_v, current_k_idx, current_k_global_start))
                 current_k, current_v, current_k_idx, current_k_global_start = recv_q.get()
+                if engine.debug_mode and args.debug_buffer is not None:
+                    # Log the tensors received for the *next* step (i+1)
+                    args.debug_buffer[f"engine_k_input_step{i+1}_r{args.block_id}"] = current_k.clone().detach().cpu()
+                    args.debug_buffer[f"engine_v_input_step{i+1}_r{args.block_id}"] = current_v.clone().detach().cpu()
 
         return num, den
     
@@ -226,16 +235,24 @@ class ThreadedRingAttentionEngine:
 
         return max_score, numerator, denominator
 
-    def update_max_attn(self, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, current_max_score: Tensor) -> Tensor:
+    # Modified to accept args and step index for logging
+    def update_max_attn(self, args: BlockData, step_idx: int, q: Tensor, k: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, current_max_score: Tensor) -> Tensor:
 
         attn_scores = self.raw_attention(q, k, mask, q_indices, k_indices)
+        if self.debug_mode and args.debug_buffer is not None:
+            args.debug_buffer[f"engine_raw_scores_step{step_idx}_r{args.block_id}"] = attn_scores.clone().detach().cpu()
+
         block_max = attn_scores.masked_fill(attn_scores == -torch.inf, torch.finfo(attn_scores.dtype).min).amax(dim=-1, keepdim=True)
         return torch.maximum(current_max_score, block_max)
 
-    def update_totals(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, final_max_score: Tensor, current_num: Tensor, current_den: Tensor) -> Tuple[Tensor, Tensor]:
+    # Modified to accept args and step index for logging
+    def update_totals(self, args: BlockData, step_idx: int, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor], q_indices: Tensor, k_indices: Tensor, final_max_score: Tensor, current_num: Tensor, current_den: Tensor) -> Tuple[Tensor, Tensor]:
         attn_scores = self.raw_attention(q, k, mask, q_indices, k_indices)
         stable_scores = (attn_scores - final_max_score).clamp(min=-10.0, max=10.0)
         exp_scores = torch.exp(stable_scores)
+        # Log updates if needed (can add here similar to raw_scores logging)
+        # if self.debug_mode and args.debug_buffer is not None:
+        #     args.debug_buffer[f"engine_exp_scores_step{step_idx}_r{args.block_id}"] = exp_scores.clone().detach().cpu()
         num_update = torch.einsum("bhqk,bhkd->bhqd", exp_scores, v)
         den_update = exp_scores.sum(dim=-1, keepdim=True)
         return current_num + num_update, current_den + den_update

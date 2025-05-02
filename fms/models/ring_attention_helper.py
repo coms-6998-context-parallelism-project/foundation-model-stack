@@ -40,27 +40,18 @@ class RingAttentionHelper:
             is_causal_mask=False, rank=0, minimal_debug_prints: bool = False, valid_len=0, 
             residual=None):
         """Main forward pass, delegates to forward_full after initial setup without global gather."""
-
+        
         start_idx_global = self.rank * self.strategy.block_size
+        B, T = x_norm.shape[:2]
 
-        # Safe and globally aligned position_ids
         if position_ids is None:
             if valid_len == 0:
-                # Empty sequence: valid and safe
-                position_ids = torch.zeros((x_norm.shape[0], 0), dtype=torch.long, device=x_norm.device)
+                position_ids = torch.full((B, T), fill_value=-1, dtype=torch.long, device=x_norm.device)
             else:
-                # Local indices: 0..valid_len-1, then offset globally
-                position_ids = torch.arange(valid_len, device=x_norm.device).unsqueeze(0).expand(x_norm.shape[0], -1)
-
-        # Apply global offset so RoPE simulates unified sequence
-        position_ids = position_ids + start_idx_global
-
-        # Pad position_ids to match padded x_norm length
-        if position_ids.shape[1] < x_norm.shape[1]:
-            pad_len = x_norm.shape[1] - position_ids.shape[1]
-            pad = torch.full((position_ids.shape[0], pad_len), fill_value=0, device=position_ids.device, dtype=position_ids.dtype)
-            position_ids = torch.cat([position_ids, pad], dim=1)
-
+                # Construct valid global position_ids: [start_idx_global + 0, ..., start_idx_global + valid_len-1]
+                valid_pos = torch.arange(start_idx_global, start_idx_global + valid_len, device=x_norm.device)
+                position_ids = torch.full((B, T), fill_value=-1, dtype=torch.long, device=x_norm.device)
+                position_ids[:, :valid_len] = valid_pos.unsqueeze(0)  # broadcast to all batches
 
         # Compute local QKV aligned to global rotary positions
         q_local, k_local, v_local = self.llama_block.compute_local_qkv_and_rope(
@@ -72,15 +63,15 @@ class RingAttentionHelper:
             is_self=True
         )
 
+        # Trim QKV tensors to valid_len (not block_size)
+        q_local = q_local[:, :, :valid_len, :]
+        k_local = k_local[:, :, :valid_len, :]
+        v_local = v_local[:, :, :valid_len, :]
 
-        # Use x_norm as x_norm_global (since it's local-only now), pad to block size for FF layer
-        x_norm_padded = _pad_to_block(x_norm, self.strategy.block_size, dim=1)
-
-        # Pad residual if needed (matches engine assumption)
-        if residual is not None:
-            x_residual_padded = _pad_to_block(residual, valid_len, dim=1)
-        else:
-            x_residual_padded = None
+        # Ensure x_norm and residual are trimmed to valid_len if they weren't already
+        # (They should be based on how _forward_ring_attention calls this)
+        x_norm_local = x_norm[:, :valid_len, :]
+        residual_local = residual[:, :valid_len, :] if residual is not None else None
 
         # Forward full with locally computed Q/K/V
         result = self.forward_full(
@@ -88,8 +79,8 @@ class RingAttentionHelper:
             k_local=k_local,
             v_local=v_local,
             mask_global=mask,
-            x_block=x_residual_padded,
-            x_norm_block=x_norm_padded,
+            x_block=residual_local, # Pass trimmed residual
+            x_norm_block=x_norm_local, # Pass trimmed norm
             valid_len=valid_len,
             q_start_global=start_idx_global
         )
@@ -120,21 +111,15 @@ class RingAttentionHelper:
         # Use T_q_local (valid_len) for slicing Q, K, V from the global QKV tensors
         end_idx_qkv = start_idx_global + T_q_local
         # Use T_block for slicing x_global and x_norm_global to match engine's block slicing
-        end_idx_block = start_idx_global + T_block
-
-        # # Slice x_global (original residual) using valid_len for the residual connection
-        # x_block = x_global[:, start_idx_global:end_idx_qkv, :] # Slice the gathered *original* residual
-        # # Slice x_norm_global (normalized padded) using block indices to match engine logging
-        # x_norm_block = x_norm_global[:, start_idx_global:end_idx_block, :] # Slice the gathered *normalized padded* input
-
-
+        # end_idx_block = start_idx_global + T_block # Not needed if we receive trimmed inputs
 
         if self.debug_mode and debug_info is not None:
             debug_info.update({
-                f"q_local_r{self.rank}": q_local.detach().cpu(),
-                f"k_local_r{self.rank}": k_local.detach().cpu(), # This is the local block K
-                f"v_local_r{self.rank}": v_local.detach().cpu(), # This is the local block V
-                f"x_norm_r{self.rank}": x_norm_block.detach().cpu(),
+                f"q_local_r{self.rank}": q_local.detach().cpu(), # Shape: [B, H, valid_len, D]
+                f"k_local_r{self.rank}": k_local.detach().cpu(), # Shape: [B, Hkv, valid_len, D]
+                # Log the trimmed x_block (residual) and x_norm_block received
+                f"v_local_r{self.rank}": v_local.detach().cpu(), # Shape: [B, Hkv, valid_len, Dv]
+                f"x_norm_r{self.rank}": x_norm_block.detach().cpu(), # Shape: [B, valid_len, D_emb]
                 f"x_block_r{self.rank}": x_block.detach().cpu(),
             })
 
@@ -184,25 +169,30 @@ class RingAttentionHelper:
         if self.debug_mode and debug_info is not None:
             debug_info[f"attn_out_raw_r{self.rank}"] = attn_out.clone().detach().cpu()
 
-        # Add residual connection for attention output
+        # Add residual connection for attention output (using trimmed tensors)
         residual_1 = x_block + attn_out
         if self.debug_mode and debug_info is not None:
             debug_info[f"attn_out_residual_r{self.rank}"] = residual_1.clone().detach().cpu()
 
         # --- Feedforward Network ---
-        ff_ln_out = self.ff_norm(residual_1)
-        if self.debug_mode and debug_info is not None:
-            debug_info[f"ff_ln_out_r{self.rank}"] = ff_ln_out.clone().detach().cpu()
+        # Pad residual_1 before FF Norm and FF layer
+        residual_1_padded = _pad_to_block(residual_1, self.strategy.block_size, dim=1)
 
-        ff_out_raw = self.ff(ff_ln_out)
+        ff_ln_out_padded = self.ff_norm(residual_1_padded)
         if self.debug_mode and debug_info is not None:
-            debug_info[f"ff_out_raw_r{self.rank}"] = ff_out_raw.clone().detach().cpu()
+            # Log the padded version going into FF
+            debug_info[f"ff_ln_out_padded_r{self.rank}"] = ff_ln_out_padded.clone().detach().cpu()
+
+        ff_out_padded = self.ff(ff_ln_out_padded)
+        if self.debug_mode and debug_info is not None:
+            debug_info[f"ff_out_raw_padded_r{self.rank}"] = ff_out_padded.clone().detach().cpu()
 
         # if hasattr(self.llama_block, 'dropout') and self.llama_block.config.p_dropout != 0:
         #     ff_out_raw = self.llama_block.dropout(ff_out_raw)
 
-        # Add residual connection after FF
-        x = ff_out_raw + residual_1
+        # Slice FF output back to valid_len before adding residual
+        ff_out_trimmed = ff_out_padded[:, :T_q_local, :]
+        x = ff_out_trimmed + residual_1 # Add trimmed tensors
 
         if self.debug_mode and debug_info is not None:
             debug_info[f"block_output_r{self.rank}"] = x.clone().detach().cpu()

@@ -130,19 +130,25 @@ class LLaMABlock(nn.Module):
         values  = v_out.view(B, T, attn_data.kvheads, attn_data.emb_v_per_head)
 
         if attn_data.position_encoder is not None and T > 0:
-            # Sanity check: position_ids must be passed in already, shaped [B, T]
             assert position_ids is not None, "position_ids must be provided for rotary encoding"
-            assert position_ids.shape[0] == B, f"position_ids batch mismatch: {position_ids.shape[0]} != {B}"
-            assert position_ids.shape[1] == T, f"position_ids seq mismatch: {position_ids.shape[1]} != {T}"
+            assert position_ids.shape == (B, T), f"Expected position_ids shape {B}x{T}, got {position_ids.shape}"
 
-            # Clamp to ensure we don't index beyond RoPE cache
-            max_pos = getattr(attn_data.position_encoder, 'max_position_embeddings', 2048)
-            position_ids = position_ids.clamp(0, max_pos - 1)
+            # Identify valid tokens
+            valid_mask = position_ids != -1
+            if valid_mask.any():
+                # Clamp safe indexing into RoPE cache (even though -1s are masked)
+                max_pos = getattr(attn_data.position_encoder, 'max_position_embeddings', 2048)
+                position_ids_safe = position_ids.clamp(min=0, max=max_pos - 1)
 
-            # Apply rotary position encodings
-            queries, keys = attn_data.position_encoder.adjusted_qk(
-                queries, keys, position_ids
-            )
+                # Compute RoPE on the full batch (includes padded values)
+                queries_rope, keys_rope = attn_data.position_encoder.adjusted_qk(
+                    queries, keys, position_ids_safe
+                )
+
+                # Keep original (unrotated) values at padded positions
+                mask_q = valid_mask.unsqueeze(-1).unsqueeze(-1)  # shape [B, T, 1, 1]
+                queries = torch.where(mask_q, queries_rope, queries)
+                keys    = torch.where(mask_q, keys_rope, keys)
 
         return (
             queries.transpose(1, 2),  # [B, H, T, D]
@@ -186,7 +192,7 @@ class LLaMABlock(nn.Module):
         # 2: Level 1 + Missing keys
         # 3: Level 2 + Detailed diff values
         # 4: Level 3 + Enable internal helper debug logs
-        debug_verbosity = 1 # Set desired level here (0-4)
+        debug_verbosity = 2 # Set desired level here (0-4)
         debug_info = {} if debug_verbosity > 0 else None # Init debug dict only if verbosity > 0
         x_original = x # Store the original input for debug comparison
 
@@ -255,13 +261,14 @@ class LLaMABlock(nn.Module):
                 diffs = self._diff_debug_dicts(
                     {k: v for k, v in debug_info.items() if k.startswith("ring")},
                     {k: v for k, v in debug_info.items() if k.startswith("engine")},
-                    verbosity=debug_verbosity # Pass verbosity level
+                    debug_verbosity=debug_verbosity # Pass verbosity level
                 )
-                print(f"--- Exiting after debug diff in Rank {rank}, Layer {self.layer_index} ---") # Commented out to prevent early exit crash
+                # print(f"--- Exiting after debug diff in Rank {rank}, Layer {self.layer_index} ---") # Commented out to prevent early exit crash
 
                 if dist.is_initialized():
                     dist.barrier() # Commented out barrier as well
                 time.sleep(3)
+                exit(0)
 
         else:
             # --- ENGINE-ONLY PATH ---
@@ -289,7 +296,7 @@ class LLaMABlock(nn.Module):
 
 
 
-    def _diff_debug_dicts(self, d1, d2, verbosity=0): # Accept verbosity
+    def _diff_debug_dicts(self, d1, d2, debug_verbosity=0): # Accept verbosity
         diffs = {}
 
 
@@ -317,7 +324,7 @@ class LLaMABlock(nn.Module):
         missing_engine = sorted(set(ring_map.keys()) - set(engine_map.keys()))
 
         # Print missing keys if verbosity >= 2
-        if verbosity >= 2:
+        if debug_verbosity >= 4:
             if missing_ring:
                 print("Missing in Ring:")
                 for k in missing_ring:
@@ -366,7 +373,7 @@ class LLaMABlock(nn.Module):
 
         # Print the Value Match Summary if verbosity >= 1
         # (The detailed norm diffs below cover the minimal diff case)
-        if verbosity >= 1:
+        if debug_verbosity >= 1:
             summary_str = "\n--- Value Match Summary (First 5 Vals, 1% Tolerance) ---\n"
             summary_str += f"Matching Keys ({len(matching_keys)}): {sorted(matching_keys)}\n"
             summary_str += f"Non-Matching Keys ({len(non_matching_keys)}): {sorted(non_matching_keys)}\n"
@@ -376,7 +383,7 @@ class LLaMABlock(nn.Module):
             print(summary_str) # Print summary before detailed diffs
 
         # If verbosity >= 1, print norm diffs for non-matching keys
-        if verbosity >= 1:
+        if debug_verbosity >= 1:
             # Rename header for clarity
             print("--- Summary Diffs for Non-Matching Keys ---")
             for suffix in sorted(non_matching_keys):
@@ -418,9 +425,10 @@ class LLaMABlock(nn.Module):
                     print(f"  {suffix}: N/A (Non-Tensor or Type Mismatch)")
             print("--------------------------------------------------------")
         # If verbosity >= 3, print the full diffs
-        if verbosity >= 3:
+        if debug_verbosity >= 2: # Changed condition from >= 3 to >= 2
             # Indent this whole block
-             for suffix in sorted(shared):
+             print("\n--- Detailed Diffs ---") # Added header for clarity
+             for suffix in sorted(shared): # Iterate through shared keys
                  rk, ek = ring_map[suffix], engine_map[suffix]
                  val1, val2 = d1[rk], d2[ek]
 
@@ -429,7 +437,7 @@ class LLaMABlock(nn.Module):
 
                  if isinstance(val1, torch.Tensor) and isinstance(val2, torch.Tensor):
                      # Print first 5 values
-                     n_print = min(val1.numel(), val2.numel(), 5)
+                     n_print = min(val1.numel(), val2.numel(), 5) # Limit to 5 values
                      v1_flat = val1.flatten()[:n_print].cpu().float()
                      v2_flat = val2.flatten()[:n_print].cpu().float()
                      v1 = [f"{v:.4f}" for v in v1_flat.tolist()]
@@ -437,7 +445,7 @@ class LLaMABlock(nn.Module):
                      diff_lines.append(f"Ring:   {str(val1.shape):<25} {str(val1.dtype):<15} {v1}")
                      diff_lines.append(f"Engine: {str(val2.shape):<25} {str(val2.dtype):<15} {v2}")
 
-                     # Add overall diff stats for non-matching tensors
+                     # Add detailed stats only for non-matching tensors in detailed view
                      if suffix in non_matching_keys:
                          n_compare = min(val1.numel(), val2.numel())
                          if n_compare > 0:
@@ -448,7 +456,7 @@ class LLaMABlock(nn.Module):
                              max_diff = torch.max(abs_diff).item()
                              max_diff_flat_idx = torch.argmax(abs_diff).item()
                              mean_abs_diff = torch.mean(abs_diff).item()
-                             threshold = 1e-4 # Define a threshold for significant difference
+                             threshold = 1e-4 # Use the same threshold as summary
                              offending_indices = torch.where(abs_diff > threshold)[0]
                              num_offending = offending_indices.numel()
                              percentage_offending = (num_offending / abs_diff.numel()) * 100 if abs_diff.numel() > 0 else 0
@@ -462,6 +470,7 @@ class LLaMABlock(nn.Module):
                                  temp_idx //= dim_size
                              max_diff_coords = tuple(reversed(indices))
                              # Find top 5 largest absolute differences
+                             # Ensure k is not larger than the number of elements
                              top_k_diffs, top_k_indices = torch.topk(abs_diff, k=min(5, n_compare))
                              top_diff_details = []
                              for i in range(top_k_indices.numel()):
@@ -471,15 +480,17 @@ class LLaMABlock(nn.Module):
                              diff_lines.append(f"  Stats: Mean Abs Diff={mean_abs_diff:.6f}")
                              diff_lines.append(f"  Top 5 Abs Diffs: [{', '.join(top_diff_details)}]")
 
-                 # ... (rest of the detailed diff logic for tuples, types, etc.) ...
                  elif isinstance(val1, tuple) and isinstance(val2, tuple):
-                     # ... (existing tuple comparison logic) ...
-                     pass # Placeholder if tuple logic was removed/commented
+                     # Basic tuple comparison (can be expanded if needed)
+                     diff_lines.append(f"Ring:   {type(val1)} len={len(val1)}")
+                     diff_lines.append(f"Engine: {type(val2)} len={len(val2)}")
+                     if len(val1) != len(val2):
+                         diff_lines.append("  Length mismatch")
                  else:
                      diff_lines.append(f"  Mismatched types: Ring={type(val1)}, Engine={type(val2)}")
 
                  diffs[suffix] = "\n".join(diff_lines) # Store the detailed diff string
-
+                 print(diffs[suffix]) # Print detailed diff immediately
         return diffs
 
 
@@ -530,18 +541,16 @@ class LLaMABlock(nn.Module):
         if enable_debug_info:
             # Log the local input x before gathering
             debug[f"ring_x_local_input_r{rank}"] = x.clone().detach().cpu()
-
+        
         residual = x
-
-        # Gather x *before* applying LayerNorm to match engine comparison path
-        if strategy.world_size > 1:
-            x_gathered = strategy.gather_tensor(x, dim=1)
-        else:
-            x_gathered = x
-
-        x_norm_gathered = self.ln(x_gathered) # Apply LN to the gathered tensor
+        
+        # Apply LayerNorm locally
+        x_norm_local = self.ln(x) 
         if enable_debug_info:
-            debug[f"ring_x_norm_r{rank}"] = x_norm_gathered.clone().detach().cpu() # Rename key for comparison
+            # Log the local norm. The comparison function expects keys ending in _block_r{rank}
+            # Note: This tensor might have padding applied later in the helper for FF.
+            # The helper should log the *unpadded* version for accurate comparison.
+            debug[f"ring_x_norm_local_pre_pad_r{rank}"] = x_norm_local.clone().detach().cpu() 
 
         ring_helper = RingAttentionHelper(
             attn_module=self.attn,
@@ -554,25 +563,26 @@ class LLaMABlock(nn.Module):
             ff_norm=self.ff_ln,                # Match engine
         )
 
-
+        local_x_shape = x.shape
+        correct_valid_len = strategy._local_valid_len # Use the strategy's valid length
+        print(f"[Rank {rank}, Layer {self.layer_index}] RingAttention: Input x shape={local_x_shape}, Correct valid_len={correct_valid_len}") # DEBUG PRINT
 
         x, cache, debug_ring = ring_helper.forward(
-            x_norm_gathered, # Pass the gathered and normalized tensor
+            x_norm_local, # Pass the local normalized tensor
             mask=mask,
             strategy=strategy,
             position_ids=position_ids,
             past_key_value_state=past_key_value_state,
             is_causal_mask=is_causal_mask,
             rank=rank,
-            valid_len=strategy._local_valid_len,
-            residual=x_gathered # Pass the gathered residual source
+            valid_len=correct_valid_len, # Pass the correct valid length
+            residual=residual # Pass the local residual source
         )
 
 
         if enable_debug_info and debug_ring:
             for k, v in debug_ring.items():
                 debug[f"ring_{k}"] = v
-        print(debug.keys())
 
         # Always return the locally created debug dict if enable_debug_info is true
         # Return None for debug dict if verbosity is 0

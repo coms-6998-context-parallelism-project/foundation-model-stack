@@ -196,6 +196,7 @@ class RingAttentionStrategy(DistributedStrategy):
     def shard_input(self, x: Tensor) -> Tensor:
         if self.world_size == 1:
             self._original_seq_len = x.size(1)
+            self._local_valid_len = x.size(1)
             return x
 
         batch_size, seq_len = x.size(0), x.size(1)
@@ -203,8 +204,10 @@ class RingAttentionStrategy(DistributedStrategy):
         start = self.rank * self.block_size
         end = min(start + self.block_size, seq_len)
 
+        self._local_valid_len = end - start  # 👈 Fix is here
         shard = x[:, start:end, :]
         return self._pad_to_block_size(shard, dim=1)
+
 
     def gather_output(self, x_local: Tensor) -> Tensor:
         if self.world_size == 1:

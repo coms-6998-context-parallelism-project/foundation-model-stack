@@ -144,6 +144,8 @@ class LLaMABlock(nn.Module):
         attn_algorithm=None,
         distributed_strategy: Optional[DistributedStrategy] = None,
     ):
+        
+        print(self.layer_index, end = ", ")
         enable_debug_info = True  # Set to True to collect debug info
         minimal_debug_prints= False
         debug_info = {} # This dict will still be populated for comparisons
@@ -218,7 +220,7 @@ class LLaMABlock(nn.Module):
                 if dist.is_initialized():
                     dist.barrier()
                 time.sleep(3)
-                exit(0)
+                # exit(0)
 
         else:
             # --- ENGINE-ONLY PATH ---
@@ -449,6 +451,7 @@ class LLaMABlock(nn.Module):
         residual = x
         x_norm = self.ln(x)
 
+
         if enable_debug_info:
             debug[f"ring_x_norm_r{rank}"] = x_norm.clone().detach().cpu()
 
@@ -471,6 +474,8 @@ class LLaMABlock(nn.Module):
             is_causal_mask=is_causal_mask,
             rank=rank,
             minimal_debug_prints=minimal_debug_prints,
+            valid_len = strategy._local_valid_len, 
+
         )
 
         if enable_debug_info and debug_ring:

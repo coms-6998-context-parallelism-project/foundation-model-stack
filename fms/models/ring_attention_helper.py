@@ -24,7 +24,9 @@ class RingAttentionHelper:
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
-    def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None, is_causal_mask=False, rank=0, minimal_debug_prints: bool = False):
+    def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None,
+            is_causal_mask=False, rank=0, minimal_debug_prints: bool = False, valid_len=0):
+
         if self.debug_mode:
             dist.barrier()
 
@@ -37,52 +39,49 @@ class RingAttentionHelper:
             dist.barrier()
 
         q_full, k_full, v_full = self.llama_block.compute_local_qkv_and_rope(
-            self.attn,
-            q=x_norm_gathered,
-            k=x_norm_gathered,
-            v=x_norm_gathered,
-            position_ids=position_ids,
-            use_cache=False,
-            past_key_value_state=past_key_value_state,
-            is_self=True,
+            self.attn, q=x_norm_gathered, k=x_norm_gathered, v=x_norm_gathered,
+            position_ids=position_ids, use_cache=False, past_key_value_state=past_key_value_state, is_self=True
         )
 
-        real_T = x_norm.shape[1]
         start_idx = self.rank * strategy.block_size
+        real_T = valid_len
 
+        # No padding for computation
         q_local = q_full[:, :, start_idx:start_idx + real_T, :]
         k_local = k_full[:, :, start_idx:start_idx + real_T, :]
         v_local = v_full[:, :, start_idx:start_idx + real_T, :]
 
-        q = _pad_to_block(q_local, strategy.block_size)
-        k = _pad_to_block(k_local, strategy.block_size)
-        v = _pad_to_block(v_local, strategy.block_size)
-
         if self.debug_mode:
             debug_info = {
-                f"q_local_r{self.rank}": q.detach().cpu(),
-                f"k_local_r{self.rank}": k.detach().cpu(),
-                f"v_local_r{self.rank}": v.detach().cpu(),
+                f"q_local_r{self.rank}": q_local.detach().cpu(),
+                f"k_local_r{self.rank}": k_local.detach().cpu(),
+                f"v_local_r{self.rank}": v_local.detach().cpu(),
                 f"x_norm_r{self.rank}": x_norm.detach().cpu(),
             }
         else:
             debug_info = None
 
-        B, H, T_q, D = q.shape
+        B, H, T_q, D = q_local.shape
         D_v = self.attn.emb_v_per_head
         scale = math.sqrt(D)
 
-        max_score = torch.full((B, H, T_q, 1), -float("inf"), device=q.device, dtype=torch.float32)
-        numerator = torch.zeros(B, H, T_q, D_v, device=q.device, dtype=torch.float32)
-        denominator = torch.zeros(B, H, T_q, 1, device=q.device, dtype=torch.float32)
+        max_score = torch.full((B, H, T_q, 1), -float("inf"), device=q_local.device, dtype=torch.float32)
+        numerator = torch.zeros(B, H, T_q, D_v, device=q_local.device, dtype=torch.float32)
+        denominator = torch.zeros(B, H, T_q, 1, device=q_local.device, dtype=torch.float32)
 
-        q_indices = torch.arange(start_idx, start_idx + T_q, device=q.device)
+        q_indices = torch.arange(start_idx, start_idx + T_q, device=q_local.device)
+
+        k = k_local
+        v = v_local
 
         for i in range(self.world_size):
             k_start_idx = ((self.rank - i) % self.world_size) * strategy.block_size
-            k_indices = torch.arange(k_start_idx, k_start_idx + k.shape[2], device=q.device)
+            k_indices = torch.arange(k_start_idx, k_start_idx + k.shape[2], device=q_local.device)
 
-            scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / scale
+            scores = torch.einsum("bhqd,bhkd->bhqk", q_local, k) / scale
+
+            if self.debug_mode and debug_info is not None:
+                debug_info[f"raw_scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu()
 
             if mask is not None:
                 scores += mask
@@ -92,7 +91,7 @@ class RingAttentionHelper:
                 scores = scores.masked_fill(causal_mask, -torch.inf)
 
             if self.debug_mode and debug_info is not None:
-                debug_info[f"raw_scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu()
+                debug_info[f"scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu()
 
             block_max = scores.masked_fill(scores == -torch.inf, torch.finfo(scores.dtype).min).amax(dim=-1, keepdim=True)
             max_score = torch.maximum(max_score, block_max)
@@ -120,7 +119,7 @@ class RingAttentionHelper:
             debug_info[f"numerator_r{self.rank}"] = numerator.clone().detach().cpu()
             debug_info[f"denominator_r{self.rank}"] = denominator.clone().detach().cpu()
 
-        attn_out = (numerator / (denominator + 1e-10)).to(q.dtype)
+        attn_out = (numerator / (denominator + 1e-10)).to(q_local.dtype)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, H * D_v)
         attn_out = self.attn.dense(attn_out)
 
@@ -158,6 +157,7 @@ class RingAttentionHelper:
             debug_info[f"block_output_r{self.rank}"] = x.clone().detach().cpu()
 
         return (x, None, debug_info) if self.debug_mode else (x, None)
+
 
     def _ring_shift_tensor(self, tensor: torch.Tensor, pad_len: int) -> Tuple[torch.Tensor, int]:
         send_rank = (self.rank + 1) % self.world_size

@@ -385,21 +385,32 @@ class LLaMABlock(nn.Module):
             if ring_debug_data:
                 for k, v in ring_debug_data.items():
                     debug[f"ring_{k}"] = v
+            # Log raw attention output before dropout/residual
+            if enable_debug_info:
+                debug[f"ring_attn_out_raw_r{rank}"] = attn_out.clone().detach().cpu()
         else:
             attn_out, cache = ring_output
-
 
         if self.config.p_dropout != 0:
             attn_out = self.dropout(attn_out)
         x = attn_out + residual
+        if enable_debug_info:
+            debug[f"ring_attn_out_residual_r{rank}"] = x.clone().detach().cpu()
 
         residual = x
-        x = self.ff_ln(x)
-        x = self.ff_sub_layer(x)
+        ff_ln_out = self.ff_ln(x)
+        if enable_debug_info:
+            debug[f"ring_ff_ln_out_r{rank}"] = ff_ln_out.clone().detach().cpu()
+        ff_out_raw = self.ff_sub_layer(ff_ln_out)
+        if enable_debug_info:
+            debug[f"ring_ff_out_raw_r{rank}"] = ff_out_raw.clone().detach().cpu()
 
         if self.config.p_dropout != 0:
             x = self.dropout(x)
         x = x + residual
+
+        if enable_debug_info:
+            debug[f"ring_block_output_r{rank}"] = x.clone().detach().cpu()
 
         return x, cache, debug
 
@@ -467,10 +478,24 @@ class LLaMABlock(nn.Module):
         if enable_debug_info:
             x, engine_debug_data = engine_output
             if engine_debug_data:
+                # Add engine prefix to keys coming from the engine's debug buffer
                 for k, v in engine_debug_data.items():
                     debug[f"engine_{k}"] = v
+            # Log raw attention output (assuming it's part of engine_debug_data now)
+            # No separate logging needed here if engine logs it.
         else:
             x = engine_output
+
+        # Note: The engine output 'x' already includes the two residual adds and FF layer.
+        # To log intermediates equivalent to the ring path, the engine itself needs modification.
+        # Assuming engine_debug_data now contains attn_out_residual_rX, ff_ln_out_rX, ff_out_raw_rX
+        # If not, we would need to recompute or modify the engine further.
+        # For now, let's assume the engine provides these via engine_debug_data.
+        # Example placeholder if engine doesn't provide them:
+        # if enable_debug_info:
+        #     debug[f"engine_attn_out_residual_r{...}"] = ...
+        #     debug[f"engine_ff_ln_out_r{...}"] = ...
+        #     debug[f"engine_ff_out_raw_r{...}"] = ...
 
 
         cache = (keys, values) if use_cache else None

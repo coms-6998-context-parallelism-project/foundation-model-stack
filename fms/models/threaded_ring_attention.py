@@ -111,12 +111,13 @@ class ThreadedRingAttentionEngine:
         final_num, final_den = engine.compute_sums(args, final_max_score, initial_num, initial_den)
         args.await_sums.wait()
 
-        block_output = engine.compute_block_output(args.x_block, final_num, final_den)
-        args.result_buffer[args.q_start] = block_output
+        # Separate computation steps for logging intermediates
+        attn_out_raw, residual_1 = engine.compute_attn_out_and_residual1(args.x_block, final_num, final_den)
+        ff_ln_out = engine.ff_norm(residual_1)
+        ff_out_raw = engine.ff(ff_ln_out)
+        block_output = residual_1 + ff_out_raw # Assuming no dropout in engine for simplicity/comparison
 
-        # Retrieve additional debug info logged within compute_block_output
-        attn_out_raw_debug = block_output._debug_extras if hasattr(block_output, '_debug_extras') else None
-        if hasattr(block_output, '_debug_extras'): del block_output._debug_extras # Clean up temporary attribute
+        args.result_buffer[args.q_start] = block_output
 
         # Store debug info if enabled, using the standardized keys
         if engine.debug_mode and args.debug_buffer is not None:
@@ -125,6 +126,14 @@ class ThreadedRingAttentionEngine:
                 f"q_local_r{block_id}": args.q_block.clone().detach().cpu(),
                 f"k_local_r{block_id}": args.k_local.clone().detach().cpu(),
                 f"v_local_r{block_id}": args.v_local.clone().detach().cpu(),
+                f"max_score_r{block_id}": final_max_score.clone().detach().cpu(), # Log max score
+                f"numerator_r{block_id}": final_num.clone().detach().cpu(), # Log numerator
+                f"denominator_r{block_id}": final_den.clone().detach().cpu(), # Log denominator
+                f"attn_out_raw_r{block_id}": attn_out_raw.clone().detach().cpu(), # Log raw attn output
+                f"attn_out_residual_r{block_id}": residual_1.clone().detach().cpu(), # Log after 1st residual
+                f"ff_ln_out_r{block_id}": ff_ln_out.clone().detach().cpu(), # Log after 2nd layernorm
+                f"ff_out_raw_r{block_id}": ff_out_raw.clone().detach().cpu(), # Log raw ff output
+                f"block_output_r{block_id}": block_output.clone().detach().cpu(), # Log the block's output
                 f"x_norm_r{block_id}": args.x_norm_block.clone().detach().cpu(), # Log the x_norm block slice
             })
             if attn_out_raw_debug is not None: args.debug_buffer[f"attn_out_raw_r{block_id}"] = attn_out_raw_debug # Add attn_out_raw
@@ -180,15 +189,17 @@ class ThreadedRingAttentionEngine:
         return num, den
     
     """ final output """
-    def compute_block_output(self, x: Tensor, num: Tensor, den: Tensor) -> Tensor:
+    def compute_attn_out_and_residual1(self, x_residual: Tensor, num: Tensor, den: Tensor) -> Tuple[Tensor, Tensor]:
 
-        B, q_len, E = x.shape; H, D_v = num.shape[1], num.shape[3]
+        B, q_len, E = x_residual.shape; H, D_v = num.shape[1], num.shape[3]
         attn_out_h = num / (den + 10-10)
         attn_out = attn_out_h.transpose(1, 2).contiguous().view(B, q_len, H * D_v)
         attn_out = self.attn.dense(attn_out)
-        residual_1 = x + attn_out
-        ff_out = self.ff(self.ff_norm(residual_1))
-        return residual_1 + ff_out
+        # TODO: Add dropout if needed for engine comparison
+        residual_1 = x_residual + attn_out
+        return attn_out, residual_1
+        # ff_out = self.ff(self.ff_norm(residual_1)) # Moved to worker
+        # return residual_1 + ff_out # Moved to worker
     
 
 

@@ -97,6 +97,12 @@ class RingAttentionHelper:
                 k, _ = self._ring_shift_tensor(k)
                 v, _ = self._ring_shift_tensor(v)
 
+        # Log intermediate values if debugging
+        if self.debug_mode and debug_info is not None:
+            debug_info[f"max_score_r{self.rank}"] = max_score.clone().detach().cpu()
+            debug_info[f"numerator_r{self.rank}"] = numerator.clone().detach().cpu()
+            debug_info[f"denominator_r{self.rank}"] = denominator.clone().detach().cpu()
+
         attn_out = numerator / (denominator + 1e-10)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, H * D_v)
         attn_out = self.attn.dense(attn_out)

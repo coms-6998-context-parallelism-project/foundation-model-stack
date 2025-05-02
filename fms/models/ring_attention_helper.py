@@ -391,8 +391,3 @@ class RingAttentionHelper:
             req.wait()
 
         return tensor_recv, recv_len.item()
-
-# Example Usage (requires torch.distributed initialization and mock objects)
-if __name__ == '__main__':
-    print("RingAttentionHelper refactored successfully, focusing on valid_len and reduced verbosity.")
-    print("To test, run in a distributed environment with appropriate mock objects.")

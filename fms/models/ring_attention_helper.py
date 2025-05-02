@@ -14,18 +14,31 @@ class RingAttentionHelper:
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
-    def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None, is_causal_mask=False, rank=0):
-        print(f"[Rank {self.rank}] x_norm shape before gather: {x_norm.shape}")
-        dist.barrier()
+    def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None, is_causal_mask=False, rank=0): # rank param seems unused here
+        if(self.layer_idx % 5 ==0):
+            if(self.rank ==0):
+                print(self.layer_idx, self.rank, x_norm.shape, end = "; ")
+                dist.barrier()
+            else:
+                dist.barrier()
+                print(self.layer_idx, self.rank, x_norm.shape)
+        if self.debug_mode:
+            print(f"[Rank {self.rank}] x_norm shape before gather: {x_norm.shape}")
+        # Guard barrier with debug_mode check
+        if self.debug_mode: dist.barrier()
 
         if strategy.world_size > 1:
             x_norm_gathered = strategy.gather_tensor(x_norm, dim=1)
-            print(f"[Rank {self.rank}] x_norm_gathered shape: {x_norm_gathered.shape}")
+            if self.debug_mode:
+                print(f"[Rank {self.rank}] x_norm_gathered shape: {x_norm_gathered.shape}")
         else:
             x_norm_gathered = x_norm
 
-        dist.barrier()
-        print(f"[Rank {self.rank}] Computing QKV...")
+        # Consider removing barriers if not strictly needed for timing/debugging
+        # Guard barrier with debug_mode check
+        if self.debug_mode: dist.barrier()
+        if(self.debug_mode):
+            print(f"[Rank {self.rank}] Computing QKV...")
         q_full, k_full, v_full = self.llama_block.compute_local_qkv_and_rope(
             self.attn,
             q=x_norm_gathered,
@@ -36,7 +49,8 @@ class RingAttentionHelper:
             past_key_value_state=past_key_value_state,
             is_self=True,
         )
-        print(f"[Rank {self.rank}] QKV shapes - Q: {q_full.shape}, K: {k_full.shape}, V: {v_full.shape}")
+        if self.debug_mode:
+            print(f"[Rank {self.rank}] QKV shapes - Q: {q_full.shape}, K: {k_full.shape}, V: {v_full.shape}")
 
         # True token count for this rank
         real_T = x_norm.shape[1]
@@ -61,7 +75,8 @@ class RingAttentionHelper:
         k = _pad_to_block(k_local, strategy.block_size)
         v = _pad_to_block(v_local, strategy.block_size)
 
-        print(f"[Rank {self.rank}] Sliced QKV shapes - Q: {q.shape}, K: {k.shape}, V: {v.shape}")
+        if self.debug_mode:
+            print(f"[Rank {self.rank}] Sliced QKV shapes - Q: {q.shape}, K: {k.shape}, V: {v.shape}")
 
         if self.debug_mode:
             debug_info = {
@@ -82,7 +97,8 @@ class RingAttentionHelper:
 
 
         for i in range(self.world_size):
-            print(f"[Rank {self.rank}] Ring step {i}")
+            if self.debug_mode:
+                print(f"[Rank {self.rank}] Ring step {i}")
             scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / scale
             if self.debug_mode and debug_info is not None:
                 debug_info[f"raw_scores_step{i}_r{self.rank}"] = scores.clone().detach().cpu()
@@ -132,7 +148,8 @@ class RingAttentionHelper:
         attn_out = self.attn.dense(attn_out)
         attn_out = attn_out[:, :real_T, :]  # finally trim back to real token count
 
-        print(f"[Rank {self.rank}] Final attention output shape: {attn_out.shape}")
+        if self.debug_mode:
+            print(f"[Rank {self.rank}] Final attention output shape: {attn_out.shape}")
 
         return (attn_out, None, debug_info) if self.debug_mode else (attn_out, None)
 

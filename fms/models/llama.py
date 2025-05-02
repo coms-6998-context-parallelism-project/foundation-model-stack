@@ -213,7 +213,6 @@ class LLaMABlock(nn.Module):
                 if dist.is_initialized():
                     dist.barrier()
                 time.sleep(3)
-                exit(0)
 
         else:
             # --- ENGINE-ONLY PATH ---

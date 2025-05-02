@@ -27,7 +27,7 @@ if [ "$run_ring" = true ]; then
   echo "====================================="
   echo "Running Ring Attention (nproc=2)..."
   echo "====================================="
-  torchrun --nproc_per_node=2 \
+  PYTORCH_ENABLE_MPS_FALLBACK=1 torchrun --nproc_per_node=2 \
     scripts/inference.py \
     --architecture llama \
     --variant 7b \

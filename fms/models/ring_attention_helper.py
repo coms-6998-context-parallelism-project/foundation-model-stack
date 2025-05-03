@@ -377,6 +377,7 @@ class RingAttentionHelper:
         padded = _pad_to_block(tensor, pad_len, dim=-1).contiguous()
 
         print(f"[Rank {rank}][START] tensor.shape={tuple(tensor.shape)}")
+        
 
 
         if not tensor.is_cuda:
@@ -393,6 +394,13 @@ class RingAttentionHelper:
             send_len = torch.tensor([valid_len], dtype=torch.int32, device=tensor.device)
             recv_len = torch.empty(1, dtype=torch.int32, device=tensor.device)
 
+            if self.debug_mode:
+                print(f"[Rank {rank}][CPU SEND] len={valid_len}", flush=True)
+                # Print stats and values of the tensor being sent
+                padded_cpu = padded.detach().cpu().float()
+                print(f"[Rank {rank}][CPU SEND] data[:5]={padded_cpu.flatten()[:5].tolist()}", flush=True)
+                print(f"[Rank {rank}][CPU SEND] mean={padded_cpu.mean():.4f}, std={padded_cpu.std():.4f}", flush=True)
+
             reqs = [
                 dist.isend(send_len, dst=send_rank),
                 dist.irecv(recv_len, src=recv_rank)
@@ -408,9 +416,15 @@ class RingAttentionHelper:
             for req in reqs:
                 req.wait()
 
+            received_len_val = recv_len.item()
+            if self.debug_mode:
+                print(f"[Rank {rank}][CPU RECV] len={received_len_val}", flush=True)
+                # Print stats and values of the tensor received
+                recv_cpu = tensor_recv.detach().cpu().float()
+                print(f"[Rank {rank}][CPU RECV] data[:5]={recv_cpu.flatten()[:5].tolist()}", flush=True)
+                print(f"[Rank {rank}][CPU RECV] mean={recv_cpu.mean():.4f}, std={recv_cpu.std():.4f}", flush=True)
             print(f"[Rank {rank}][CPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
-
-            return tensor_recv, recv_len.item()
+            recv_len = recv_len.item()
 
         else:
             # GPU: collective ring shift mirroring CPU behavior exactly
@@ -425,6 +439,13 @@ class RingAttentionHelper:
             dist.all_gather(len_list, len_t)
             recv_len = int(len_list[recv_rank].item())
 
+            if self.debug_mode:
+                print(f"[Rank {rank}][GPU SEND] len={valid_len}", flush=True)
+                # Print stats and values of the tensor being sent
+                padded_cpu = padded.detach().cpu().float()
+                print(f"[Rank {rank}][GPU SEND] data[:5]={padded_cpu.flatten()[:5].tolist()}", flush=True)
+                print(f"[Rank {rank}][GPU SEND] mean={padded_cpu.mean():.4f}, std={padded_cpu.std():.4f}", flush=True)
+
             # 3) collective send/recv buffers (only neighbor slot has data)
             send_list = [torch.empty_like(padded) for _ in range(world)]
             recv_list = [torch.empty_like(padded) for _ in range(world)]
@@ -435,6 +456,15 @@ class RingAttentionHelper:
 
             # 5) extract neighbor's block and return
             tensor_recv = recv_list[recv_rank]
-            print(f"[Rank {rank}][GPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
-            return tensor_recv, recv_len
 
+            if self.debug_mode:
+                print(f"[Rank {rank}][GPU RECV] len={recv_len}", flush=True)
+                # Print stats and values of the tensor received
+                recv_cpu = tensor_recv.detach().cpu().float()
+                print(f"[Rank {rank}][GPU RECV] data[:5]={recv_cpu.flatten()[:5].tolist()}", flush=True)
+                print(f"[Rank {rank}][GPU RECV] mean={recv_cpu.mean():.4f}, std={recv_cpu.std():.4f}", flush=True)
+            print(f"[Rank {rank}][GPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
+
+        dist.barrier()
+        exit(0)
+        return tensor_recv, recv_len

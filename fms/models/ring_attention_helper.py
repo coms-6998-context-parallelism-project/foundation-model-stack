@@ -375,8 +375,8 @@ class RingAttentionHelper:
         # 1) pad along last dim
         valid_len = tensor.shape[-1]
         padded = _pad_to_block(tensor, pad_len, dim=-1).contiguous()
-
-        print(f"[Rank {rank}][START] tensor.shape={tuple(tensor.shape)}")
+        if self.debug_mode:
+            print(f"[Rank {rank}][START] tensor.shape={tuple(tensor.shape)}")
         
 
 
@@ -423,7 +423,7 @@ class RingAttentionHelper:
                 recv_cpu = tensor_recv.detach().cpu().float()
                 print(f"[Rank {rank}][CPU RECV] data[:5]={recv_cpu.flatten()[:5].tolist()}", flush=True)
                 print(f"[Rank {rank}][CPU RECV] mean={recv_cpu.mean():.4f}, std={recv_cpu.std():.4f}", flush=True)
-            print(f"[Rank {rank}][CPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
+                print(f"[Rank {rank}][CPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
             recv_len = recv_len.item()
 
         else:
@@ -463,7 +463,7 @@ class RingAttentionHelper:
                 recv_cpu = tensor_recv.detach().cpu().float()
                 print(f"[Rank {rank}][GPU RECV] data[:5]={recv_cpu.flatten()[:5].tolist()}", flush=True)
                 print(f"[Rank {rank}][GPU RECV] mean={recv_cpu.mean():.4f}, std={recv_cpu.std():.4f}", flush=True)
-            print(f"[Rank {rank}][GPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
+                print(f"[Rank {rank}][GPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
 
         dist.barrier()
         # exit(0)

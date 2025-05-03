@@ -33,7 +33,7 @@ class RingAttentionHelper:
         # Ensure block_size is set
         if not hasattr(self.strategy, 'block_size'):
              print("Warning: strategy object does not have 'block_size'. Using a default of 128.")
-             self.strategy.block_size = 32
+             self.strategy.block_size = 64
 
     def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None,
             is_causal_mask=False, rank=0, minimal_debug_prints: bool = False, valid_len=0, 

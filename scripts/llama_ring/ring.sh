@@ -53,10 +53,10 @@ pip install -e . >/dev/null 2>&1 || echo "[WARN] pip install failed"
 
 mkdir -p "${CURRENT_REPO_DIR}/testing"
 cd "$HOME"
-
+set -x
 echo "[INFO] Cleaning old outputs…"
 rm -f "$HOME"/inference_insomnia_*.out "${CURRENT_REPO_DIR}/testing/inference_local_*.out"
-
+set +x
 cleanup() {
   echo; echo "[INFO] Cleaning up…"
   if [[ "$RUN_LOCATION" == "insomnia" && -n "${job_id:-}" ]]; then
@@ -87,6 +87,8 @@ if [[ "$RUN_LOCATION" != "insomnia" ]]; then
   timestamp=$(date +%Y%m%d_%H%M%S)
   output_file="${CURRENT_REPO_DIR}/testing/inference_local_${timestamp}.out"
   echo "[INFO] torchrun (nproc=2) → $output_file"
+  # Enable command tracing
+
   torchrun --nproc_per_node=2 \
     "$CURRENT_REPO_DIR/scripts/inference.py" \
     --architecture llama --variant 7b \
@@ -96,6 +98,7 @@ if [[ "$RUN_LOCATION" != "insomnia" ]]; then
     "${script_args[@]}" \
     >"$output_file" 2>&1 &
   pid=$!
+  # Disable command tracing
   # Construct filename after getting PID
   echo "[SUCCESS] local PID=$pid"
   wait_cmd="ps -p $pid"

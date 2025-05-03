@@ -376,6 +376,9 @@ class RingAttentionHelper:
         valid_len = tensor.shape[-1]
         padded = _pad_to_block(tensor, pad_len, dim=-1).contiguous()
 
+        print(f"[Rank {rank}][START] tensor.shape={tuple(tensor.shape)}")
+
+
         if not tensor.is_cuda:
             """
             Performs a ring shift of a tensor using torch.distributed.
@@ -405,7 +408,7 @@ class RingAttentionHelper:
             for req in reqs:
                 req.wait()
 
-            # print(f"[Rank {rank}][CPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
+            print(f"[Rank {rank}][CPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
 
             return tensor_recv, recv_len.item()
 
@@ -438,7 +441,7 @@ class RingAttentionHelper:
             tensor_recv = recv_list[recv_rank]
 
             # 6) debug print matches CPU’s: shape of the full padded buffer + the true block count
-            # print(f"[Rank {rank}][GPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
+            print(f"[Rank {rank}][GPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
 
             # 7) return (full padded buffer, true block count)
             return tensor_recv, recv_len

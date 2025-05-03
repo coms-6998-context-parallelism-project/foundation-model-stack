@@ -143,7 +143,7 @@ def forward_ring(
                 debug_info[k] = v # Directly assign without adding another suffix
         
         # --- ENGINE PATH FOR COMPARISON ---
-        if False and debug_verbosity > 0:
+        if debug_verbosity > 0:
             # Gather the ORIGINAL block input for the engine comparison path
             # Pad x_original to the block size before gathering, similar to how
             # RingAttentionStrategy pads tensors before communication.
@@ -158,20 +158,22 @@ def forward_ring(
                 padded_x_original = torch.cat([x_original, pad], dim=1)
             x_gathered_original = distributed_strategy.gather_output(padded_x_original)
             rank = dist.get_rank() if dist.is_initialized() else 0
-            output_engine_gathered = self._forward_engine_attention(
-                x_gathered_original, # Pass the gathered original input
-                mask=mask,
-                position_ids=position_ids,
-                past_key_value_state=past_key_value_state,
-                use_cache=False,
-                is_causal_mask=is_causal_mask,
-                verbosity=debug_verbosity, # Pass verbosity level
-            )
-            # Log the gathered input that was actually passed (optional, but good for clarity)
-            # Note: _forward_engine_attention already logs this internally as x_input_r{rank}
-            # debug_info[f"engine_x_gathered_input_r{rank}"] = x_gathered_original.clone().detach().cpu()
+            # output_engine_gathered = self._forward_engine_attention(
+            #     x_gathered_original, # Pass the gathered original input
+            #     mask=mask,
+            #     position_ids=position_ids,
+            #     past_key_value_state=past_key_value_state,
+            #     use_cache=False,
+            #     is_causal_mask=is_causal_mask,
+            #     verbosity=debug_verbosity, # Pass verbosity level
+            # )
+            # # Log the gathered input that was actually passed (optional, but good for clarity)
+            # # Note: _forward_engine_attention already logs this internally as x_input_r{rank}
+            # # debug_info[f"engine_x_gathered_input_r{rank}"] = x_gathered_original.clone().detach().cpu()
 
-            _, _, debug_engine = output_engine_gathered
+            # _, _, debug_engine = output_engine_gathered
+
+            debug_engine = {}
 
             if debug_engine:
                 for k, v in debug_engine.items(): # Keys already have prefix and rank suffix from _forward_engine_attention

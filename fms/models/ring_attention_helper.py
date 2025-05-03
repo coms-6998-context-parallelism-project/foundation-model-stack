@@ -413,35 +413,28 @@ class RingAttentionHelper:
             return tensor_recv, recv_len.item()
 
         else:
-            # GPU: pure‑collective version that mirrors the CPU branch exactly
+            # GPU: collective ring shift mirroring CPU behavior exactly
 
-            # 1) determine how many blocks we really have, then pad that block axis
-            #    tensor is [..., blocks, block_size]
-            valid_len = tensor.size(-2)  
-            padded    = _pad_to_block(tensor, pad_len, dim=-2).contiguous()
-            # now padded.shape[-2] == pad_len, padded.shape[-1] == block_size
+            # 1) determine true length, pad along block axis
+            valid_len = tensor.size(-2)
+            padded = _pad_to_block(tensor, pad_len, dim=-2).contiguous()
 
-            # 2) exchange block‑counts via all_gather
-            len_t    = torch.tensor([valid_len], dtype=torch.int32, device=tensor.device)
+            # 2) exchange lengths collectively
+            len_t = torch.tensor([valid_len], dtype=torch.int32, device=tensor.device)
             len_list = [torch.empty_like(len_t) for _ in range(world)]
             dist.all_gather(len_list, len_t)
             recv_len = int(len_list[recv_rank].item())
 
-            # 3) build uniform‐shape send/recv lists
-            send_list = [
-                padded.clone() if r == send_rank else torch.zeros_like(padded)
-                for r in range(world)
-            ]
+            # 3) collective send/recv buffers (only neighbor slot has data)
+            send_list = [torch.empty_like(padded) for _ in range(world)]
             recv_list = [torch.empty_like(padded) for _ in range(world)]
+            send_list[send_rank].copy_(padded)
 
-            # 4) do the all_to_all
+            # 4) collective exchange
             dist.all_to_all(recv_list, send_list)
 
-            # 5) pick exactly the CPU‐style return values
+            # 5) extract neighbor's block and return
             tensor_recv = recv_list[recv_rank]
-
-            # 6) debug print matches CPU’s: shape of the full padded buffer + the true block count
             print(f"[Rank {rank}][GPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
-
-            # 7) return (full padded buffer, true block count)
             return tensor_recv, recv_len
+

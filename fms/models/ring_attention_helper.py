@@ -466,5 +466,5 @@ class RingAttentionHelper:
             print(f"[Rank {rank}][GPU] tensor_recv.shape={tuple(tensor_recv.shape)}, recv_len={recv_len}")
 
         dist.barrier()
-        exit(0)
+        # exit(0)
         return tensor_recv, recv_len

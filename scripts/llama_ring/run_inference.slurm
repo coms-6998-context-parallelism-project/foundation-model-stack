@@ -35,7 +35,7 @@ torchrun --nproc_per_node=2 \
   --model_source hf \
   --tokenizer /insomnia001/depts/edu/COMSE6998/sg3790/llama-hf/tokenizer.model \
   --device_type cuda \
-  --default_dtype fp16 \
+  --default_dtype fp32 \
   --distributed_strategy ring \
   --no_use_cache \
   --distributed \

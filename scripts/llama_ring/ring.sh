@@ -90,7 +90,7 @@ if [[ "$RUN_LOCATION" != "insomnia" ]]; then
   torchrun --nproc_per_node=2 \
     "$CURRENT_REPO_DIR/scripts/inference.py" \
     --architecture llama --variant 7b \
-    --device_type cpu --default_dtype fp16 \
+    --device_type cpu --default_dtype fp32 \
     --model_source hf --no_use_cache \
     --distributed --distributed_strategy ring \
     "${script_args[@]}" \

@@ -112,7 +112,7 @@ def forward_ring(
     # 2: Level 1 + Missing keys
     # 3: Level 2 + Detailed diff values
     # 4: Level 3 + Enable internal helper debug logs
-    debug_verbosity = 0 # Set desired level here (0-4)
+    debug_verbosity = 4 # Set desired level here (0-4)
     debug_info = {} if debug_verbosity > 0 else None # Init debug dict only if verbosity > 0
     x_original = x # Store the original input for debug comparison
 
@@ -143,7 +143,7 @@ def forward_ring(
                 debug_info[k] = v # Directly assign without adding another suffix
         
         # --- ENGINE PATH FOR COMPARISON ---
-        if False and debug_verbosity > 0:
+        if debug_verbosity > 0:
             # Gather the ORIGINAL block input for the engine comparison path
             # Pad x_original to the block size before gathering, similar to how
             # RingAttentionStrategy pads tensors before communication.

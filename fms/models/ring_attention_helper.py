@@ -543,7 +543,7 @@ class RingAttentionHelper:
                 # Fix 5: Verify Mask Application Consistency (using -torch.inf for float types)
                 # The mask from SDPA is often additive (0 for keep, -inf for mask).
                 # .masked_fill uses a boolean mask.
-                scores = scores.masked_fill(causal_mask, -torch.inf) # Use -torch.inf for float32
+                scores = scores.masked_fill(causal_mask_bool, -torch.inf) # Use -torch.inf for float32
 
 
         # Clamp scores for stability before softmax calculation

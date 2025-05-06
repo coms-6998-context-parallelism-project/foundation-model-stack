@@ -103,8 +103,9 @@ def run_generation_benchmark(model, tokenizer, initial_ids, num_tokens_to_gen, l
         logits = model.forward(
             input_ids_step,
             past_key_value_states=past_key_value_states,
-            use_cache=False # Use KV cache for efficient generation
-        )
+            use_cache=False
+        )[0]  # Unpack the logits
+
 
         next_token_id = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
 

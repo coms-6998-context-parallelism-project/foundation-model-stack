@@ -1,4 +1,5 @@
 from typing import List, Tuple, Dict, Optional, Union, Any
+from fms.modules.attention import MultiHeadAttention
 import torch
 import torch.distributed as dist
 from torch.distributed import P2POp

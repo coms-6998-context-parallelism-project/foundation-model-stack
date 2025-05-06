@@ -278,6 +278,8 @@ class RingAttentionHelper:
         dev, dtype = v_compute.device, q_compute.dtype
         num = torch.zeros(B, H, T, Dv, device=dev, dtype=dtype)
         den = torch.zeros(B, H, T, 1, device=dev, dtype=dtype)
+        num_comp = torch.zeros_like(num)
+        den_comp = torch.zeros_like(den)
         q_idx = torch.arange(
             q_start_global, q_start_global + T, device=dev
         )
@@ -301,8 +303,21 @@ class RingAttentionHelper:
                     q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m
                 )
                 e = torch.exp((s - max_score).clamp(min=exp_min, max=exp_max))
-                num += torch.einsum("bhqk,bhkd->bhqd", e, v_blk[:, :, :k_len])
-                den += e.sum(-1, keepdim=True)
+                contrib_num = torch.einsum("bhqk,bhkd->bhqd", e, v_blk[:, :, :k_len])
+                contrib_den = e.sum(-1, keepdim=True)
+
+                # Kahan summation for numerator
+                y_num = contrib_num - num_comp
+                t_num = num + y_num
+                num_comp = (t_num - num) - y_num
+                num = t_num
+
+                # Kahan summation for denominator
+                y_den = contrib_den - den_comp
+                t_den = den + y_den
+                den_comp = (t_den - den) - y_den
+                den = t_den
+
             if i < self.world_size - 1:
                 valid = k_len
                 k_blk, k_len = self._ring_shift_tensor(

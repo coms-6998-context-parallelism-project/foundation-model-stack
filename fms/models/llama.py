@@ -66,13 +66,14 @@ class LLaMAConfig(ModelConfig):
 
 class LLaMABlock(nn.Module):
 
-    forward                     = forward_ring
-    _forward_ring_attention     = _forward_ring_attention
     def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
         super(LLaMABlock, self).__init__()
         self.config = config
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
+
+        # Make _forward_ring_attention available as an instance method
+        self._forward_ring_attention = _forward_ring_attention.__get__(self, LLaMABlock)
 
         self.ln = LayerNormParameterized(
             self.config.emb_dim,
@@ -136,18 +137,17 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
         distributed_strategy: Optional[DistributedStrategy] = None,
-        # Add a debug_label for clarity
-        debug_label: str = "LLaMABlock",
-        # Add layer_idx for context
+        debug_label: str = "LLaMABlock", # Less relevant now, but kept for signature
         layer_idx: int = -1,
-
     ):
-        # print(x.shape)
+        # If RingAttentionStrategy is active, dispatch to the ring-specific forward
         if isinstance(distributed_strategy, RingAttentionStrategy):
-
+            # forward_ring is imported from fms.models.llama_ring
+            # It handles RingAttentionHelper instantiation and returns (output, cache, debug_dict_sharded)
+            # Note: 'x' passed to forward_ring is expected to be already sharded by LLaMA._helper
             return forward_ring(
-                self,
-                x,
+                self, # Pass the LLaMABlock instance
+                x,    # This 'x' is the sharded input for Ring Attention
                 mask=mask,
                 position_ids=position_ids,
                 past_key_value_state=past_key_value_state,
@@ -155,76 +155,88 @@ class LLaMABlock(nn.Module):
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
                 distributed_strategy=distributed_strategy,
-                # Pass debug info to ring forward
-                debug_label=debug_label,
-                layer_idx=layer_idx,
+                debug_label="RingAttentionBlockViaForwardRing", # More specific label
+                layer_idx=layer_idx
+            )
+        else: # Standard attention path (e.g., NoOpStrategy or None)
+              # This path is taken by compare_attn.py for the standard model.
+              # 'x' here is the full, unsharded input.
+            self_attn_past_key_value = past_key_value_state
+            debug_info = {} # Will be populated if layer_idx == 0
+            
+            if layer_idx == 0: # Collect detailed debug info only for layer 0
+                 debug_info['input_to_block'] = x.clone()
+
+            residual = x
+            x_norm = self.ln(x)
+            if layer_idx == 0:
+                debug_info['x_norm_pre_attn'] = x_norm.clone()
+
+            # Call MHA. It should handle return_raw_scores=False correctly.
+            # Pass return_raw_scores=True only if layer_idx is 0 for debug collection.
+            attn_out_tuple = self.attn(
+                q=x_norm,
+                mask=mask,
+                position_ids=position_ids,
+                attn_algorithm=attn_algorithm,
+                past_key_value_state=self_attn_past_key_value,
+                use_cache=use_cache,
+                is_self=True,
+                is_causal_mask=is_causal_mask,
+                return_raw_scores=(layer_idx == 0) # Only get scores for layer 0
             )
 
-        # if the cache is not empty, we need to get the kv cache for self and cross attention
-        self_attn_past_key_value = past_key_value_state
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        # if past_key_value_state is not None:
-        #     self_attn_past_key_value = past_key_value_state[:2]
-        # else:
-        #     self_attn_past_key_value = None
+            attn_x_output = None
+            attn_cache = None
+            attn_scores = None # Initialize
 
-        # first we do MHA and Add&Norm
-        residual = x
-        x = self.ln(x)
-        # Store x before attention for debugging
-        x_before_attn = x.clone()
+            # Unpack based on use_cache and whether scores were requested
+            if use_cache:
+                if layer_idx == 0: # Expected (output, cache, scores, present_kv)
+                    attn_x_output, attn_cache, attn_scores, _ = attn_out_tuple
+                else: # Expected (output, cache)
+                    attn_x_output, attn_cache = attn_out_tuple
+            else: # use_cache is False
+                if layer_idx == 0: # Expected (output, None, scores, None)
+                    attn_x_output, _, attn_scores, _ = attn_out_tuple
+                else: # Expected (output)
+                    attn_x_output = attn_out_tuple
+            
+            if layer_idx == 0: # Store debug info if collected
+                debug_info['attn_scores'] = attn_scores.clone() if attn_scores is not None else None
+                debug_info['attn_output_raw'] = attn_x_output.clone()
 
-        attn_out = self.attn(
-            q=x,
-            mask=mask,
-            position_ids=position_ids,
-            attn_algorithm=attn_algorithm,
-            past_key_value_state=self_attn_past_key_value,
-            use_cache=use_cache,
-            is_self=True,
-            is_causal_mask=is_causal_mask,
-        )
-        cache = None
-        if use_cache: # attn_out is a tuple (output, cache)
-            x_after_attn, cache = attn_out
-        else: # attn_out is just the output tensor
-            x_after_attn = attn_out
+            if self.config.p_dropout != 0:
+                attn_x_output = self.dropout(attn_x_output)
+            
+            x_after_attn_res = attn_x_output + residual
+            if layer_idx == 0:
+                debug_info['x_after_attn_res'] = x_after_attn_res.clone()
 
-        if rank == 0 and layer_idx == 0: # Print for the first layer only
-            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_before_attn): norm = {torch.linalg.norm(x_before_attn.float()).item()}")
-            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_after_attn_raw): norm = {torch.linalg.norm(x_after_attn.float()).item()}")
-            pass
+            residual_ff = x_after_attn_res
+            x_norm_ff = self.ff_ln(x_after_attn_res)
+            if layer_idx == 0:
+                debug_info['x_norm_pre_ff'] = x_norm_ff.clone()
 
-        if self.config.p_dropout != 0:
-            x_after_attn = self.dropout(x_after_attn)
-        # residual connection
-        x = x_after_attn + residual
-        if rank == 0 and layer_idx == 0:
-            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_after_attn_residual): norm = {torch.linalg.norm(x.float()).item()}")
-            pass
+            ff_output = self.ff_sub_layer(x_norm_ff)
+            
+            if self.config.p_dropout != 0:
+                ff_output = self.dropout(ff_output)
+            
+            if layer_idx == 0:
+                debug_info['ff_output_raw_after_dropout'] = ff_output.clone()
+            
+            x_final_block_output = ff_output + residual_ff
+            if layer_idx == 0:
+                debug_info['x_final_block_output'] = x_final_block_output.clone()
 
-        # then we do FF and Add&Norm
-        residual = x
-        x = self.ff_ln(x)
-        x_after_ff = self.ff_sub_layer(x)
-        if rank == 0 and layer_idx == 0:
-            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_after_ff_raw): norm = {torch.linalg.norm(x_after_ff.float()).item()}")
-            pass
-
-        if self.config.p_dropout != 0:
-            x_after_ff = self.dropout(x_after_ff)
-        # another residual
-        x = x_after_ff + residual
-
-        first_block_debug_out = None
-        if rank == 0 and layer_idx == 0:
-            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: LLaMABlock_final_output): norm = {torch.linalg.norm(x.float()).item()}")
-            first_block_debug_out = x.clone() # Collect the final output of the block
-
-        if use_cache:
-            return x, cache, first_block_debug_out
-        else:
-            return x, first_block_debug_out
+            # Return output and debug_info (if layer_idx == 0, otherwise debug_info is empty or None)
+            # LLaMA._helper expects the debug info as the third/second element.
+            final_debug_payload = debug_info if layer_idx == 0 and debug_info else None
+            if use_cache:
+                return (x_final_block_output, attn_cache, final_debug_payload)
+            else:
+                return (x_final_block_output, final_debug_payload)
 
 
 class LLaMA(nn.Module):

@@ -105,8 +105,12 @@ def run_generation_benchmark(model, tokenizer, initial_ids, num_tokens_to_gen, l
             use_cache=False
         )[0]  # Unpack the logits
 
+        if logits.size(1) == 0:
+            pad_id = getattr(tokenizer, 'pad_token_id', getattr(tokenizer, 'bos_token_id', 0))
+            next_token_id = torch.full((logits.size(0), 1), pad_id, dtype=torch.long, device=logits.device)
+        else:
+            next_token_id = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
 
-        next_token_id = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
 
         if device.type == "cuda":
             torch.cuda.synchronize() # Sync after forward pass

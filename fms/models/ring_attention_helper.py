@@ -35,8 +35,16 @@ def compute_local_qkv_and_rope(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     B, T, E = q.shape
-    q_out, k_out, v_out = attn_data.in_proj(q, k, v)
+    if T == 0:
+        # Generate empty shaped tensors with correct dimensions
+        H_q, H_kv = attn_data.nheads, attn_data.kvheads
+        D_kq, D_v = attn_data.emb_kq_per_head, attn_data.emb_v_per_head
+        empty_q = torch.empty(B, H_q, 0, D_kq, device=q.device, dtype=q.dtype)
+        empty_k = torch.empty(B, H_kv, 0, D_kq, device=q.device, dtype=q.dtype)
+        empty_v = torch.empty(B, H_kv, 0, D_v, device=q.device, dtype=q.dtype)
+        return empty_q, empty_k, empty_v
 
+    q_out, k_out, v_out = attn_data.in_proj(q, k, v)
     H_q, H_kv = attn_data.nheads, attn_data.kvheads
     D_kq, D_v = attn_data.emb_kq_per_head, attn_data.emb_v_per_head
 
@@ -154,7 +162,16 @@ class RingAttentionHelper:
     def _ring_shift_tensor(self, tensor, valid_len):
         # If world_size is 1, no shifting is needed.
         if self.world_size == 1:
+            # Still slice for consistency
             return tensor[:, :, :valid_len].contiguous(), valid_len
+
+        # Ensure send/recv always happens, even if valid_len == 0
+        send_tensor = tensor[:, :, :valid_len].contiguous()
+        send_len = torch.tensor([valid_len], dtype=torch.int32, device=tensor.device)
+        recv_tensor = torch.empty((tensor.size(0), tensor.size(1), self.block_size, *tensor.shape[3:]),
+                                dtype=tensor.dtype, device=tensor.device)
+        recv_len = torch.empty(1, dtype=torch.int32, device=tensor.device)
+
 
         rank, world = self.rank, self.world_size
         send, recv = (rank + 1) % world, (rank - 1 + world) % world

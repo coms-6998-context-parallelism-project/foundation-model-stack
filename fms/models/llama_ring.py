@@ -153,8 +153,7 @@ def _forward_ring_attention(
         residual=residual,
         # rank=strategy.rank # Pass rank if RingAttentionHelper.forward expects it
     )
-    # Based on RingAttentionHelper.forward returning (result, None, {}),
-    # output is the tensor, cache from helper is None. The third value is debug_info.
-    x = output 
+    # The first value returned by self.ring_helper.forward is the main tensor output,
+    # which is already assigned to 'x' in the unpacking above.
     # cache is None from ring_helper.forward's second return value
     return x, cache

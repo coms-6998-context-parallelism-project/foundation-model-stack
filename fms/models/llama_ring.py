@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from fms.models.ring_attention_helper import RingAttentionHelper
 from fms.distributed.strategy import DistributedStrategy, RingAttentionStrategy
+import torch.distributed as dist
 
 
 def forward_ring(
@@ -38,6 +39,7 @@ def forward_ring(
     if isinstance(distributed_strategy, RingAttentionStrategy):
         if distributed_strategy.rank == 0 and layer_idx == 0:
             first_block_debug_out_ring = x_out.clone()
+    # print(f"[Rank {dist.get_rank()}] 🔁 Finished generation step")
 
     return (x_out, cache_out, first_block_debug_out_ring) if use_cache else (x_out, first_block_debug_out_ring)
 
@@ -83,10 +85,10 @@ def _forward_ring_attention(
     output, cache_out, debug_extra = self.ring_helper.forward(
         x_norm_local,
         mask=mask,
-        strategy=strategy,
         position_ids=position_ids,
         past_key_value_state=past_key_value_state,
         is_causal_mask=is_causal_mask,
+        strategy=strategy,
         valid_len=valid_len,
         residual=residual,
     )

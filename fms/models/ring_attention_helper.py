@@ -101,7 +101,8 @@ class RingAttentionHelper:
 
         self.head_dim = attn_module.emb_kq_per_head
         self.scale = attn_module.scale_factor or math.sqrt(self.head_dim)
-        self._accum_dtype = _get_accum_dtype(attn_module.dtype)
+        self._accum_dtype = torch.float32
+
 
     def forward(
         self,

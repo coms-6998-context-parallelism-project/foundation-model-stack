@@ -81,14 +81,17 @@ class RingAttentionHelper:
         attn_out_h = numerator / (denominator + 1e-10)
         attn_out = attn_out_h.to(q_local.dtype)
         assert attn_out.shape == (B, H, T_q_local, D_v), f"Unexpected attn_out shape: {attn_out.shape}"
+
         attn_out = attn_out.transpose(1, 2).contiguous().reshape(B, T_q_local, H * D_v)
         attn_out = self.attn.dense(attn_out)
         residual_1 = x_block + attn_out
-        residual_1_padded = _pad_to_block(residual_1, self.strategy.block_size, dim=1)
-        ff_ln_out_padded = self.ff_norm(residual_1_padded)
-        ff_out_padded = self.ff(ff_ln_out_padded)
-        ff_out_trimmed = ff_out_padded[:, :T_q_local, :]
-        x = ff_out_trimmed + residual_1
+
+        # Apply norm and FF only to the valid part (T_q_local)
+        ff_ln_out = self.ff_norm(residual_1)
+        ff_out = self.ff(ff_ln_out)
+        # Add residual to the valid part
+        x = ff_out + residual_1
+        # No padding needed here, subsequent layers or gather will handle it.
         return x
 
     def _compute_max_score_pass(self, q_local, k_local, mask_global, q_start_global, valid_len_local, debug_info):
@@ -155,12 +158,17 @@ class RingAttentionHelper:
 
     def _compute_attention_scores(self, q, k, q_indices_global, k_indices_global, mask=None,
                                   apply_mask=True, keep_causal=True):
-        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        # Cast to float32 for matmul to preserve precision, then scale
+        scores = torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32)) / self.scale
+        # scores are now float32
+
         if apply_mask and mask is not None:
+            # Ensure mask is compatible with float32 scores
             scores = scores + mask.to(scores.dtype)
         if apply_mask and keep_causal:
             causal_mask = (k_indices_global[None, :] > q_indices_global[:, None]).unsqueeze(0).unsqueeze(0)
-            scores = scores.masked_fill(causal_mask, -torch.inf)
+            # Use float('-inf') for float32
+            scores = scores.masked_fill(causal_mask, -float("inf"))
         return scores
 
     def _update_max_score(self, scores, current_max):

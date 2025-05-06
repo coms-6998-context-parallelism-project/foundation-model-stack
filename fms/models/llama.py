@@ -136,6 +136,11 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
         distributed_strategy: Optional[DistributedStrategy] = None,
+        # Add a debug_label for clarity
+        debug_label: str = "LLaMABlock",
+        # Add layer_idx for context
+        layer_idx: int = -1,
+
     ):
         
         if isinstance(distributed_strategy, RingAttentionStrategy):
@@ -150,10 +155,14 @@ class LLaMABlock(nn.Module):
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
                 distributed_strategy=distributed_strategy,
+                # Pass debug info to ring forward
+                debug_label=debug_label,
+                layer_idx=layer_idx,
             )
 
         # if the cache is not empty, we need to get the kv cache for self and cross attention
         self_attn_past_key_value = past_key_value_state
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         # if past_key_value_state is not None:
         #     self_attn_past_key_value = past_key_value_state[:2]
         # else:
@@ -162,7 +171,10 @@ class LLaMABlock(nn.Module):
         # first we do MHA and Add&Norm
         residual = x
         x = self.ln(x)
-        x = self.attn(
+        # Store x before attention for debugging
+        x_before_attn = x.clone()
+
+        attn_out = self.attn(
             q=x,
             mask=mask,
             position_ids=position_ids,
@@ -173,24 +185,37 @@ class LLaMABlock(nn.Module):
             is_causal_mask=is_causal_mask,
         )
         cache = None
-        if use_cache:
-            x, cache = x
+        if use_cache: # attn_out is a tuple (output, cache)
+            x_after_attn, cache = attn_out
+        else: # attn_out is just the output tensor
+            x_after_attn = attn_out
+
+        if rank == 0 and layer_idx == 0: # Print for the first layer only
+            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}): x_before_attn norm = {torch.linalg.norm(x_before_attn.float()).item()}")
+            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}): x_after_attn (raw) norm = {torch.linalg.norm(x_after_attn.float()).item()}")
+
         if self.config.p_dropout != 0:
-            x = self.dropout(x)
+            x_after_attn = self.dropout(x_after_attn)
         # residual connection
-        x = x + residual
+        x = x_after_attn + residual
+        if rank == 0 and layer_idx == 0:
+            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}): x_after_attn_residual norm = {torch.linalg.norm(x.float()).item()}")
 
         # then we do FF and Add&Norm
         residual = x
         x = self.ff_ln(x)
-        x = self.ff_sub_layer(x)
-        if self.config.p_dropout != 0:
-            x = self.dropout(x)
-        # another residual
-        x = x + residual
+        x_after_ff = self.ff_sub_layer(x)
+        if rank == 0 and layer_idx == 0:
+            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}): x_after_ff (raw) norm = {torch.linalg.norm(x_after_ff.float()).item()}")
 
+        if self.config.p_dropout != 0:
+            x_after_ff = self.dropout(x_after_ff)
+        # another residual
+        x = x_after_ff + residual
+        if rank == 0 and layer_idx == 0:
+            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}): x_after_ff_residual (Block Output) norm = {torch.linalg.norm(x.float()).item()}")
         if use_cache:
-            return (x, cache)
+            return x, cache
         else:
             return x
 
@@ -376,6 +401,7 @@ class LLaMA(nn.Module):
         # x_in: batch_size x seq_len
         # mask: batch_size x seq_len x seq_len
         # bias: nheads x seq_len x seq_len
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         original_seq_len = x_in.size(1) # Capture original sequence length
         if past_key_value_states is None or len(past_key_value_states) == 0:
             past_key_value_states = [None for _ in range(len(self.layers))]
@@ -399,10 +425,14 @@ class LLaMA(nn.Module):
             is_causal_mask = False
 
         x_in = self.shared(x_in)
+        if rank == 0:
+            print(f"DEBUG (LLaMA._helper, Rank {rank}): x_in after embedding norm = {torch.linalg.norm(x_in.float()).item()}")
 
         if isinstance(distributed_strategy, RingAttentionStrategy):
             x_in = self.distributed_strategy.shard_input(x_in)
-
+            if rank == 0:
+                 # For Ring, this is sharded input
+                print(f"DEBUG (LLaMA._helper, Rank {rank}): x_in after Ring sharding (Rank 0 portion) norm = {torch.linalg.norm(x_in.float()).item()}")
 
         # this is the output cache for all the decoder layers
         present_key_value_states = []
@@ -417,6 +447,8 @@ class LLaMA(nn.Module):
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
                 distributed_strategy=distributed_strategy, # Pass strategy to the block
+                debug_label="RingAttention" if isinstance(distributed_strategy, RingAttentionStrategy) else "RegularAttention",
+                layer_idx=i,
             )
 
             if use_cache:
@@ -427,7 +459,12 @@ class LLaMA(nn.Module):
                 x_in = output
 
         dec_out = x_in
+        if rank == 0:
+            # For Ring, this is sharded input to dec_norm
+            print(f"DEBUG (LLaMA._helper, Rank {rank}): input to dec_norm (Rank 0 portion for Ring) norm = {torch.linalg.norm(dec_out.float()).item()}")
         dec_out = self.dec_norm(dec_out)
+        if rank == 0:
+            print(f"DEBUG (LLaMA._helper, Rank {rank}): output of dec_norm (Rank 0 portion for Ring) norm = {torch.linalg.norm(dec_out.float()).item()}")
         if self.config.p_dropout:
             dec_out = self.dropout(dec_out)
 
@@ -436,6 +473,8 @@ class LLaMA(nn.Module):
             gathered_dec_out = distributed_strategy.gather_tensor(dec_out, dim=1)
             # Slice back to the original sequence length
             dec_out = gathered_dec_out[:, :original_seq_len, :]
+            if rank == 0:
+                print(f"DEBUG (LLaMA._helper, Rank {rank}): final gathered output (Ring) norm = {torch.linalg.norm(dec_out.float()).item()}")
 
         return dec_out, present_key_value_states
 
@@ -450,7 +489,6 @@ class LLaMA(nn.Module):
         attn_algorithm: Optional[str] = None,
     ):
         
-        print(x.shape)
         output, cache = self._helper(
             x,
             mask,

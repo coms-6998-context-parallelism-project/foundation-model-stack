@@ -280,12 +280,17 @@ class RingAttentionHelper:
         B, H, T_q_local, D_head = q_local.shape
         D_v = v_local.shape[-1]
         device = q_local.device
+        # Rank is available via self.rank
 
         # Fix 6: Numerical Precision Control
         compute_dtype = q_local.dtype if q_local.dtype in [torch.float32, torch.bfloat16, torch.float16] else torch.float32
         q_compute = q_local.to(compute_dtype)
         k_compute = k_local.to(compute_dtype)
         v_compute = v_local.to(compute_dtype)
+
+        if self.rank == 0: # Assuming llama_block.layer_idx is not directly available here, print based on rank
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): q_compute norm = {torch.linalg.norm(q_compute.float()).item()}")
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): k_compute norm = {torch.linalg.norm(k_compute.float()).item()}")
 
         # Compute max scores (Pass 1)
         max_score = self._compute_max_score_pass(
@@ -295,6 +300,8 @@ class RingAttentionHelper:
             q_start_global,
             valid_len,
         )
+        if self.rank == 0:
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): max_score norm = {torch.linalg.norm(max_score.float()).item()}")
 
         # Fix 7: Softmax Implementation (Option to use F.softmax)
         # If choosing to use F.softmax for closer matching, the two-pass logic changes.
@@ -311,10 +318,15 @@ class RingAttentionHelper:
             valid_len,
             max_score, # max_score is already in compute_dtype
         )
+        if self.rank == 0:
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): numerator norm = {torch.linalg.norm(numerator.float()).item()}")
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): denominator norm = {torch.linalg.norm(denominator.float()).item()}")
 
         # Compute attention output in compute_dtype
         attn_out_h = numerator / (denominator + 1e-10) # Division in compute_dtype
         attn_out_h = attn_out_h.to(q_local.dtype) # Cast result back to original dtype
+        if self.rank == 0:
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): attn_out_h (raw) norm = {torch.linalg.norm(attn_out_h.float()).item()}")
 
         # Fix 2: Match Dropout Behavior
         if self.attn.p_dropout and self.llama_block.training: # Check training mode of the parent LLaMABlock
@@ -326,16 +338,25 @@ class RingAttentionHelper:
         # Reshape and apply dense layer
         attn_out = attn_out_h.transpose(1, 2).contiguous().view(B, T_q_local, H * D_v)
         attn_out = self.attn.dense(attn_out)
+        if self.rank == 0:
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): attn_out after dense norm = {torch.linalg.norm(attn_out.float()).item()}")
 
         # First residual connection
         residual_1 = x_block + attn_out # x_block is residual_local_valid (B, T_q_local, E)
+        if self.rank == 0:
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): residual_1 (after attn) norm = {torch.linalg.norm(residual_1.float()).item()}")
 
         # Apply FF norm and FF
         ff_ln_out = self.ff_norm(residual_1)
         ff_out = self.ff(ff_ln_out)
+        if self.rank == 0:
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): ff_out (raw) norm = {torch.linalg.norm(ff_out.float()).item()}")
 
         # Second residual connection
         x = ff_out + residual_1
+        if self.rank == 0:
+            print(f"DEBUG (RingAttentionHelper.forward_full, Rank {self.rank}): x final (RingHelper output for valid_len) norm = {torch.linalg.norm(x.float()).item()}")
+
 
         # Return processed valid local tokens
         return x

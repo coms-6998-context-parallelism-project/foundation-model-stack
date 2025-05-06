@@ -21,6 +21,9 @@ def forward_ring(
     is_causal_mask: bool = False,
     attn_algorithm: Optional[str] = None,
     distributed_strategy: Optional[DistributedStrategy] = None, # Expected RingAttentionStrategy
+    # Add debug passthrough
+    debug_label: str = "RingAttentionBlock",
+    layer_idx: int = -1,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
 
     # Dispatch to helper function assigned to the block
@@ -33,6 +36,8 @@ def forward_ring(
         use_cache=use_cache,
         is_causal_mask=is_causal_mask,
         strategy=distributed_strategy,
+        debug_label=debug_label,
+        layer_idx=layer_idx,
     )
 
     # Return based on the use_cache flag
@@ -50,6 +55,9 @@ def _forward_ring_attention(
     use_cache: bool,
     is_causal_mask: bool,
     strategy: DistributedStrategy, # Expected RingAttentionStrategy
+    # Add debug passthrough
+    debug_label: str = "RingAttentionBlock", # Default, will be overridden
+    layer_idx: int = -1, # Default, will be overridden
 ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Any]: # Returns (output, cache, extra)
 
     assert isinstance(strategy, RingAttentionStrategy), f"Expected RingAttentionStrategy, got {type(strategy)}"
@@ -57,6 +65,7 @@ def _forward_ring_attention(
     residual = x
     x_norm_local = self.ln(x)
 
+    rank = strategy.rank # Get rank from strategy
     correct_valid_len = strategy.get_local_valid_len() # Valid tokens on this rank
 
     # Lazy init RingAttentionHelper on first call with this strategy
@@ -70,6 +79,10 @@ def _forward_ring_attention(
             ff_norm=self.ff_ln,
         )
 
+    # Debug print for input to RingAttentionHelper.forward (Rank 0's portion)
+    if rank == 0 and layer_idx == 0:
+        print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}): Input to RingHelper.forward (x_norm_local) norm = {torch.linalg.norm(x_norm_local.float()).item()}")
+
     # Call helper's core logic
     output, cache_from_helper, extra_output = self.ring_helper.forward(
         x_norm_local,
@@ -81,6 +94,10 @@ def _forward_ring_attention(
         valid_len=correct_valid_len,
         residual=residual,
     )
+    
+    # Debug print for output of RingAttentionHelper.forward (Rank 0's portion)
+    # This 'output' is the block's final output for this rank, padded.
+    if rank == 0 and layer_idx == 0:
+        print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}): Output from RingHelper.forward (Block Output, Rank 0 portion) norm = {torch.linalg.norm(output.float()).item()}")
 
     return output, cache_from_helper, extra_output
-

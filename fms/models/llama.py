@@ -486,7 +486,7 @@ class LLaMA(nn.Module):
         current_world_size = 1
         if isinstance(distributed_strategy, RingAttentionStrategy):
             current_world_size = distributed_strategy.world_size
-        if isinstance(distributed_strategy, RingAttentionStrategy) and world_size > 1:
+        if isinstance(distributed_strategy, RingAttentionStrategy) and current_world_size > 1:
             # Gather the potentially padded tensor
             gathered_output = distributed_strategy.gather_tensor(output_after_norm, dim=1)
             # Slice back to the original sequence length

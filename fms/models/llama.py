@@ -142,7 +142,7 @@ class LLaMABlock(nn.Module):
         layer_idx: int = -1,
 
     ):
-        
+        # print(x.shape)
         if isinstance(distributed_strategy, RingAttentionStrategy):
 
             return forward_ring(
@@ -511,7 +511,7 @@ class LLaMA(nn.Module):
         only_last_token: bool = False,
         attn_algorithm: Optional[str] = None,
     ):
-        
+        print(x.shape)
         output_for_head, cache, norm_output_raw_from_helper, first_block_debug_out = self._helper(
             x,
             mask,

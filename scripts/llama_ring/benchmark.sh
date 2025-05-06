@@ -63,35 +63,53 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 # --- Script Args ---
-script_args=(); script_args+=("$@")
-if ! printf '%s\n' "${script_args[@]}" | grep -q -- '--model_path'; then
-  script_args+=(--model_path "$DEFAULT_MODEL_ABS_PATH")
+passthrough_args=()
+nproc_value=2 # Default value for nproc_per_node
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --nproc)
+      nproc_value="$2"
+      shift 2
+      ;;
+    *)
+      passthrough_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if ! printf '%s\n' "${passthrough_args[@]}" | grep -q -- '--model_path'; then
+  passthrough_args+=(--model_path "$DEFAULT_MODEL_ABS_PATH")
 fi
-if ! printf '%s\n' "${script_args[@]}" | grep -q -- '--tokenizer'; then
-  script_args+=(--tokenizer "$DEFAULT_TOKENIZER_ABS_PATH")
+if ! printf '%s\n' "${passthrough_args[@]}" | grep -q -- '--tokenizer'; then
+  passthrough_args+=(--tokenizer "$DEFAULT_TOKENIZER_ABS_PATH")
 fi
 
-echo "[INFO] Launching benchmark with args: ${script_args[*]}"
+if [[ "$RUN_LOCATION" == "local" ]]; then
+  echo "[INFO] Using nproc_per_node: $nproc_value for local run."
+fi
+echo "[INFO] Launching benchmark with passthrough args: ${passthrough_args[*]}"
 
 job_id=""; pid=""
 
 if [[ "$RUN_LOCATION" == "local" ]]; then
   timestamp=$(date +%Y%m%d_%H%M%S)
   output_file="${CURRENT_REPO_DIR}/testing/inference_local_${timestamp}.out"
-  echo "[INFO] torchrun (nproc=2) → $output_file"
+  echo "[INFO] torchrun (nproc=$nproc_value) → $output_file"
 
-  torchrun --nproc_per_node=2 \
+  torchrun --nproc_per_node="$nproc_value" \
     "$CURRENT_REPO_DIR/scripts/llama_ring/benchmark_ring.py" \
     --architecture llama --variant 7b \
     --device_type cpu --dtype float16 \
-    "${script_args[@]}" \
+    "${passthrough_args[@]}" \
     >"$output_file" 2>&1 &
   pid=$!
   echo "[SUCCESS] Local PID=$pid"
   wait_cmd="ps -p $pid"
 else
   echo "[INFO] sbatch ${SLURM_SCRIPT_PATH} ${script_args[*]}"
-  sbatch_out=$(sbatch "$SLURM_SCRIPT_PATH" "${script_args[@]}" 2>&1) || {
+  sbatch_out=$(sbatch "$SLURM_SCRIPT_PATH" "${passthrough_args[@]}" 2>&1) || {
     echo "[ERROR] sbatch failed: $sbatch_out"; exit 1
   }
   job_id=$(echo "$sbatch_out" | grep -oP 'Submitted batch job \K[0-9]+')

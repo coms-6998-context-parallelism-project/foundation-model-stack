@@ -167,13 +167,19 @@ import torch.distributed as dist
 class RingAttentionStrategy(DistributedStrategy):
     """Distributed strategy for ring attention with fixed block size."""
 
-    def __init__(self, block_size: int = 2048, group: Optional[dist.ProcessGroup] = None, from_meta: bool = False):
+    def __init__(self, block_size: int = 32, group: Optional[dist.ProcessGroup] = None, from_meta: bool = False):
         super().__init__(from_meta)
-        assert dist.is_initialized(), "Requires initialized process group"
         self.block_size = block_size
-        self.group = group if group is not None else dist.GroupMember.WORLD
-        self.rank: int = self.group.rank()
-        self.world_size: int = self.group.size()
+        
+        if dist.is_initialized():
+            self.group = group if group is not None else dist.GroupMember.WORLD
+            self.rank: int = self.group.rank()
+            self.world_size: int = self.group.size()
+        else: # Handle non-distributed case (e.g. nproc=1 local run)
+            self.group = None # type: ignore
+            self.rank = 0
+            self.world_size = 1
+            # print0("[INFO] RingAttentionStrategy: torch.distributed not initialized. Defaulting to world_size=1, rank=0.")
 
         # State tracked per forward pass
         self._original_seq_len: Optional[int] = None

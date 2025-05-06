@@ -115,10 +115,19 @@ class RingAttentionHelper:
             v = v.unsqueeze(2).expand(-1, -1, e, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_v_per_head)
 
         out_valid = self.forward_full(q, k, v, mask, valid_len, res_trim, x_trim, start)
-        return _pad_to_block(out_valid, self.block_size, dim=1), None, None
+        if self.world_size == 1: # If not distributed, no need to pad to block_size
+            return out_valid, None, None
+        else: # Otherwise, pad for consistency in distributed setting before potential gather
+            return _pad_to_block(out_valid, self.block_size, dim=1), None, None
 
     def forward_full(self, q, k, v, mask, valid_len, x_block, x_norm_block, q_start_global):
         B, H, T, D = q.shape
+        
+        # If T (valid_len for this shard) is 0, return an appropriately shaped empty tensor.
+        # x_block is the residual, which would also have T=0 in this case.
+        if T == 0:
+            return torch.empty(B, 0, self.attn.emb_dim, device=q.device, dtype=q.dtype)
+
         dtype = q.dtype if q.dtype in [torch.float32, torch.bfloat16, torch.float16] else torch.float32
         q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
         max_score = self._compute_max_score_pass(q, k, mask, q_start_global, valid_len)

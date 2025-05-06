@@ -31,15 +31,15 @@ def parse_args():
     model_dir = repo_dir.parent / "llama-hf"
     tokenizer_path = model_dir / "tokenizer.model"
 
-    parser.add_argument("--device_type", type=str, default="cuda")
+    parser.add_argument("--device_type", type=str, default="cuda", choices=["cuda", "cpu", "mps"], help="Device to use for benchmark (cuda, cpu, mps)")
     parser.add_argument("--architecture", type=str, default="llama")
     parser.add_argument("--variant", type=str, default="7b")
     parser.add_argument("--model_path", type=str, default=str(model_dir))
     parser.add_argument("--tokenizer", type=str, default=str(tokenizer_path), help="Full path to the tokenizer.model file")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--prompt", type=str, default=", ".join([str(i) for i in range(0,600)]),
+    parser.add_argument("--prompt", type=str, default=", ".join([str(i) for i in range(0,400)]),
                     help="Optional specific prompt text to use instead of random tokens.")
-    parser.add_argument("--num_tokens_to_benchmark", type=int, default=3, help="Number of tokens to generate and benchmark.")
+    parser.add_argument("--num_tokens_to_benchmark", type=int, default=10, help="Number of tokens to generate and benchmark.")
     parser.add_argument("--run_ring_first", action="store_true", help="Explicitly run Ring Attention first (default). Set --no-run_ring_first to run Regular first.")
     parser.add_argument("--no-run_ring_first", dest="run_ring_first", action="store_false")
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"], help="Data type to use for model computations (float32, float16, bfloat16)")
@@ -60,11 +60,10 @@ def set_determinism():
 def setup_model(args, strategy=None, dtype=None):
     # Map strategy string to actual strategy object if needed by get_model
     dist_strategy_param = strategy # Pass the strategy object ('ring' string or NoOpStrategy class)
-    if strategy == "ring":
-        # Ensure distributed is initialized before strategy instantiation attempt
-        if not dist.is_initialized():
-             # This should ideally not be reached if the main loop logic is correct
-             raise RuntimeError("Attempted to setup Ring Attention without initialized torch.distributed")
+    if strategy == "ring": # 'ring' string is passed to models.get_model
+        # models.get_model will instantiate RingAttentionStrategy.
+        # RingAttentionStrategy itself handles the case where dist is not initialized.
+        pass
     elif strategy is NoOpStrategy:
         # Pass the class type itself to get_model
         dist_strategy_param = NoOpStrategy
@@ -154,11 +153,18 @@ def main():
     rank = int(os.getenv("RANK", 0))
 
     distributed_backend = None
-    if world_size > 1:
+    if args.device_type == "mps":
+        if not torch.backends.mps.is_available():
+            raise EnvironmentError("MPS requested but not available on this system.")
+        if world_size > 1:
+            raise RuntimeError("MPS device type can only be used with nproc=1 (world_size=1). Distributed MPS is not supported.")
+        device = torch.device("mps")
+        print0(f"[INFO] Using MPS device.")
+    elif world_size > 1:
         if args.device_type == "cuda":
             if not torch.cuda.is_available():
                  raise EnvironmentError("CUDA requested but not available")
-            torch.cuda.set_device(local_rank)
+            torch.cuda.set_device(local_rank) # local_rank will be 0 if world_size > 1 but torchrun was with nproc=1 on a single machine
             distributed_backend = "nccl"
         else:
             distributed_backend = "gloo"
@@ -246,11 +252,13 @@ def main():
         is_regular_run = (strategy is NoOpStrategy)
         should_run_this_rank = not (is_regular_run and rank != 0)
 
-        # Skip Ring Attention if not running distributed
-        if strategy == "ring" and not dist.is_initialized():
-             print0(f"\n[WARNING] Skipping '{label}' because torch.distributed is not initialized.")
-             print0("[INFO] This usually requires running with torchrun or within a Slurm job launched with torchrun.")
-             continue
+        # Skip Ring Attention only if it's a multi-GPU scenario (world_size > 1) 
+        # AND torch.distributed is not initialized.
+        # If world_size is 1 (e.g., nproc 1 local run), RingAttentionStrategy will handle it.
+        if strategy == "ring" and world_size > 1 and not dist.is_initialized():
+            print0(f"\n[WARNING] Skipping '{label}' for world_size={world_size} because torch.distributed is not initialized.")
+            print0("[INFO] This usually requires running with torchrun or within a Slurm job launched with torchrun for multi-GPU.")
+            continue
 
         model = None
         if should_run_this_rank:

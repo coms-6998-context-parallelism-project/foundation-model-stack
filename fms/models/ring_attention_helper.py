@@ -103,8 +103,8 @@ class RingAttentionHelper:
         ff_out = self.ff(ff_ln_out)
         x = ff_out + residual_1
 
-        if x.dtype == torch.float16:
-            x = torch.clamp(x, min=-5.0, max=5.0)
+        # if x.dtype == torch.float16:
+        x = torch.clamp(x, min=-10.0, max=10.0)
 
         if self.debug_mode and debug_info is not None:
             debug_info[f"block_output_r{self.rank}"] = x.clone().detach().cpu()

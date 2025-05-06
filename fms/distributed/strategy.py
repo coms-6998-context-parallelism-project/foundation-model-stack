@@ -171,14 +171,14 @@ class RingAttentionStrategy(DistributedStrategy):
     Distributed strategy for ring attention with automatic input padding.
     Ensures tensors gathered across ranks are the same shape.
     """
-
-    def __init__(self, block_size: int, group=None, from_meta=False):
+    block_size = 1024
+    def __init__(self, group=None, from_meta=False):
         super().__init__(from_meta)
         assert torch.distributed.is_initialized(), "Requires initialized process group"
+        # self.block_size = 4096
         self.group = group or torch.distributed.GroupMember.WORLD
         self.rank = self.group.rank()
         self.world_size = self.group.size()
-        self.block_size = block_size
         self._original_seq_len = None
 
     def _distribute_module(self, module: nn.Module, final_layers: bool = False) -> nn.Module:
@@ -208,7 +208,7 @@ class RingAttentionStrategy(DistributedStrategy):
         start = self.rank * self.block_size
         end = min(start + self.block_size, seq_len)
 
-        self._local_valid_len = end - start  # 👈 Fix is here
+        self._local_valid_len = max(end - start,0)  # 👈 Fix is here
         shard = x[:, start:end, :]
         return self._pad_to_block_size(shard, dim=1)
 

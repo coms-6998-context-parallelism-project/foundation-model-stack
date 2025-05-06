@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Tuple
 
+from fms.models.ring_attention_helper import RingAttentionHelper
 import torch
 import torch.nn as nn
 
@@ -16,12 +17,8 @@ from fms.distributed.strategy import (
 
 from fms.models.llama_ring import (
     compute_local_qkv_and_rope,
-    compute_qkv_and_rope_thread,
     forward_ring,
-    _diff_debug_dicts,
-    _gather_debug_tensors,
     _forward_ring_attention,
-    _forward_engine_attention,
 )
 
 
@@ -71,12 +68,8 @@ class LLaMAConfig(ModelConfig):
 class LLaMABlock(nn.Module):
 
     compute_local_qkv_and_rope  = compute_local_qkv_and_rope
-    compute_qkv_and_rope_thread = compute_qkv_and_rope_thread
     forward                     = forward_ring
-    _diff_debug_dicts           = _diff_debug_dicts
-    _gather_debug_tensors       = _gather_debug_tensors
     _forward_ring_attention     = _forward_ring_attention
-    _forward_engine_attention   = _forward_engine_attention
     def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
         super(LLaMABlock, self).__init__()
         self.config = config
@@ -131,6 +124,15 @@ class LLaMABlock(nn.Module):
 
         if self.config.p_dropout != 0:
             self.dropout = nn.Dropout(self.config.p_dropout)
+
+        self.ring_helper = RingAttentionHelper(
+            attn_module=self.attn,
+            strategy=RingAttentionStrategy,
+            llama_block=self,
+            use_cache=False,
+            ff=self.ff_sub_layer,
+            ff_norm=self.ff_ln,
+        )
 
     def forward(
         self,
@@ -456,6 +458,8 @@ class LLaMA(nn.Module):
         only_last_token: bool = False,
         attn_algorithm: Optional[str] = None,
     ):
+        
+        print(x.shape)
         output, cache = self._helper(
             x,
             mask,

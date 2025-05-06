@@ -10,23 +10,40 @@ from fms.distributed.strategy import RingAttentionStrategy # Import RingAttentio
 # from fms.modules.feedforward import GatedLinearUnit
 # from fms.modules.layernorm import LayerNormParameterized
 
+# Constants for numerical stability
+EXP_CLAMP_MIN = -10.0
+EXP_CLAMP_MAX = 10.0
+
 
 def _pad_to_block(t: torch.Tensor, target_len: int, dim: int = 2) -> torch.Tensor:
     """Pads tensor along a dimension to target_len."""
     length = t.size(dim)
     if length >= target_len:
         # Assert if already too large, should not happen if target_len is block_size and input is shard
-        assert length == target_len, f"Tensor length {length} along dim {dim} is >= target {target_len} and not equal."
+        assert length == target_len, f"Tensor length {length} along dim {dim} is >= target {target_len} and not equal. Tensor shape: {t.shape}"
         return t
+    
+    # Normalize dim to be positive for the check
+    actual_dim = dim
+    if actual_dim < 0:
+        actual_dim += t.ndim
+
     pad_shape = list(t.shape)
-    pad_shape[dim] = target_len - length
+    # Ensure the dimension to pad is valid
+    if not (0 <= actual_dim < len(pad_shape)):
+        raise IndexError(f"Dimension {dim} (normalized to {actual_dim}) is out of bounds for tensor with shape {t.shape}")
+    pad_shape[actual_dim] = target_len - length # Use actual_dim for modifying pad_shape
     pad = torch.zeros(*pad_shape, dtype=t.dtype, device=t.device)
-    return torch.cat([t, pad], dim=dim)
+    return torch.cat([t, pad], dim=dim) # torch.cat handles original dim correctly
 
 
 class RingAttentionHelper:
     """
     Helper class to perform the distributed Ring Attention computation within a block.
+    It handles the two-pass algorithm for stable softmax calculation in a distributed
+    manner, including communication of K/V blocks around the ring.
+    The `forward` method is the main entry point, orchestrating QKV computation,
+    RoPE application, and the two-pass attention followed by feed-forward layers.
     """
     def __init__(
         self,
@@ -69,7 +86,16 @@ class RingAttentionHelper:
         valid_len: int = 0, # Actual number of tokens on this rank
         residual: Optional[torch.Tensor] = None, # Residual connection before LN+Attn
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Any]: # Returns (output, cache, extra)
-
+        """
+        Main forward pass for the RingAttentionHelper.
+        Args:
+            x_norm: Local normalized input shard, padded to block_size.
+            strategy: The RingAttentionStrategy instance.
+            mask: Global attention mask.
+            position_ids: Global position_ids.
+            valid_len: The number of actual (non-padding) tokens in x_norm for this rank.
+            residual: The original input tensor (before normalization) for the residual connection.
+        """
         assert isinstance(strategy, RingAttentionStrategy), f"Rank {self.rank}: Helper forward expected RingAttentionStrategy, got {type(strategy)}"
         assert self.strategy is strategy, f"Rank {self.rank}: Helper strategy mismatch. Init strategy {self.strategy} != Forward strategy {strategy}"
         assert valid_len >= 0 and valid_len <= self.block_size, f"Rank {self.rank}: Invalid valid_len: {valid_len}"
@@ -96,7 +122,8 @@ class RingAttentionHelper:
         residual_for_rope = residual[:, :valid_len, :] if residual is not None else None
 
         # Compute local QKV and apply RoPE
-        q_local_padded, k_local_padded, v_local_padded = self.llama_block.compute_local_qkv_and_rope(
+        # These will be of shape (B, H, valid_len, D_head) as inputs were trimmed
+        q_local_unpadded, k_local_unpadded, v_local_unpadded = self.llama_block.compute_local_qkv_and_rope(
             self.attn, # Pass self.attn
             q=x_norm_for_rope, k=x_norm_for_rope, v=x_norm_for_rope, # Use trimmed inputs
             position_ids=position_ids_for_rope, # Pass trimmed position_ids
@@ -104,14 +131,14 @@ class RingAttentionHelper:
             past_key_value_state=None,
             is_self=True
         )
-        B, H, T_padded, D_head = q_local_padded.shape
-        assert T_padded == self.block_size, f"Rank {self.rank}: QKV after compute_local_qkv_and_rope must be padded to block_size: {T_padded} != {self.block_size}"
+        B, H, T_qkv_local, D_head = q_local_unpadded.shape
+        assert T_qkv_local == valid_len, f"Rank {self.rank}: QKV length {T_qkv_local} after compute_local_qkv_and_rope does not match valid_len {valid_len}"
 
         # QKV from compute_local_qkv_and_rope are already effectively valid_len long
         # because inputs to it were trimmed.
-        q_local = q_local_padded[:, :, :valid_len, :]
-        k_local = k_local_padded[:, :, :valid_len, :]
-        v_local = v_local_padded[:, :, :valid_len, :]
+        q_local = q_local_unpadded
+        k_local = k_local_unpadded
+        v_local = v_local_unpadded
 
         # x_norm_local for forward_full should be the trimmed version used for RoPE.
         # residual_local for forward_full is the trimmed residual_for_rope.
@@ -136,7 +163,8 @@ class RingAttentionHelper:
         output_padded = _pad_to_block(attn_out_local_valid, self.block_size, dim=1)
         assert output_padded.size(1) == self.block_size, f"Rank {self.rank}: Output padding after forward_full failed: {output_padded.size(1)} != {self.block_size}"
 
-        # In the current RingAttentionHelper code, cache and extra output are None
+        # Cache and extra output are None because Ring Attention, in this implementation,
+        # does not support KV caching between forward passes (it's designed for training or full recomputation).
         return output_padded, None, None # Return padded output, None cache, None extra
 
 
@@ -151,16 +179,34 @@ class RingAttentionHelper:
         x_norm_block: torch.Tensor, # Normalized input slice (B, T_q_local, E)
         q_start_global: int # Global start index for Q block
     ) -> torch.Tensor: # Returns processed tensor for valid local tokens (B, T_q_local, E)
+        """
+        Performs the core two-pass ring attention computation (max_score and sums passes)
+        and applies post-attention layers (dense, residual, FF norm, FF, residual).
+        Operates on the 'valid_len' portion of the local shard.
+        Args:
+            q_local, k_local, v_local: Local Q, K, V tensors for valid tokens.
+            mask_global: Global attention mask.
+            valid_len: Actual length of local Q, K, V.
+            x_block: Residual connection slice (original input for this block).
+            x_norm_block: Normalized input slice (used for QKV computation).
+            q_start_global: Global start index for the Q block.
+        Returns:
+            Processed tensor for valid local tokens.
+        """
 
         B, H, T_q_local, D_head = q_local.shape
         D_v = v_local.shape[-1]
         device = q_local.device
 
         # Principle: Numerical Stability & Dtype Casting
+        q_local_f32 = q_local.to(torch.float32)
+        k_local_f32 = k_local.to(torch.float32)
+        v_local_f32 = v_local.to(torch.float32)
+
         # Compute max scores (Pass 1)
         max_score = self._compute_max_score_pass(
-            q_local.to(torch.float32), # Cast Q to float32 for computation
-            k_local.to(torch.float32), # Cast K to float32
+            q_local_f32,
+            k_local_f32,
             mask_global,
             q_start_global,
             valid_len,
@@ -168,9 +214,7 @@ class RingAttentionHelper:
 
         # Compute sums (Pass 2)
         numerator, denominator = self._compute_sums_pass(
-            q_local.to(torch.float32), # Cast Q to float32
-            k_local.to(torch.float32), # Cast K to float32
-            v_local.to(torch.float32), # Cast V to float32
+            q_local_f32, k_local_f32, v_local_f32,
             mask_global,
             q_start_global,
             valid_len,
@@ -178,7 +222,7 @@ class RingAttentionHelper:
         )
 
         # Compute attention output
-        attn_out_h = numerator / (denominator + 1e-10) # Use float32 for division
+        attn_out_h = numerator / (denominator + 1e-10) # Division in float32
         attn_out_h = attn_out_h.to(q_local.dtype) # Cast result back to original dtype
 
         # Assert shape after attention calculation
@@ -209,6 +253,18 @@ class RingAttentionHelper:
         q_start_global: int, # Global start index for Q block
         valid_len_local: int, # Actual length of local Q
     ) -> torch.Tensor: # Returns max scores (float32) (B, H, T_q_local, 1)
+        """
+        Pass 1 of Ring Attention: Compute maximum attention scores.
+        Iteratively shifts K blocks around the ring and computes partial max scores.
+        Args:
+            q_local_f32: Local Q tensor (float32).
+            k_local_f32: Local K tensor (float32).
+            mask_global: Global attention mask.
+            q_start_global: Global start index for the Q block.
+            valid_len_local: Actual length of the local Q tensor.
+        Returns:
+            Maximum scores tensor (float32).
+        """
 
         B, H, T_q_local, _ = q_local_f32.shape
         device = q_local_f32.device
@@ -229,7 +285,12 @@ class RingAttentionHelper:
             k_indices_global = torch.arange(k_start_global, k_start_global + current_k_len, device=device)
 
             # Slice global mask relevant to current Q block and current K block
-            current_mask = mask_global[:, :, q_start_global:q_start_global+T_q_local, k_start_global:k_start_global+current_k_len] if mask_global is not None else None
+            if mask_global is not None:
+                current_mask = mask_global[:, :, q_start_global:q_start_global+T_q_local, k_start_global:k_start_global+current_k_len]
+                assert current_mask.shape[-2] == T_q_local and current_mask.shape[-1] == current_k_len, \
+                    f"Rank {self.rank}: Sliced mask shape {current_mask.shape} mismatch with Q_len {T_q_local}, K_len {current_k_len}"
+            else:
+                current_mask = None
 
             # Only compute scores if the current K block has elements
             if current_k_len > 0:
@@ -249,7 +310,7 @@ class RingAttentionHelper:
 
             # Ring shift K block (and V block in the sums pass)
             if i < self.world_size - 1:
-                current_k_block, current_k_len = self._ring_shift_tensor(current_k_block, self.block_size)
+                current_k_block, current_k_len = self._ring_shift_tensor(current_k_block, self.block_size, current_k_len)
 
         return max_score
 
@@ -263,6 +324,20 @@ class RingAttentionHelper:
         valid_len_local: int, # Actual length of local Q, K, V
         max_score: torch.Tensor, # Max scores from Pass 1 (float32) (B, H, T_q_local, 1)
     ) -> Tuple[torch.Tensor, torch.Tensor]: # Returns numerator, denominator (float32) (B, H, T_q_local, D_v), (B, H, T_q_local, 1)
+        """
+        Pass 2 of Ring Attention: Compute numerator and denominator for softmax.
+        Iteratively shifts K and V blocks around the ring.
+        Args:
+            q_local_f32: Local Q tensor (float32).
+            k_local_f32: Local K tensor (float32).
+            v_local_f32: Local V tensor (float32).
+            mask_global: Global attention mask.
+            q_start_global: Global start index for the Q block.
+            valid_len_local: Actual length of local Q, K, V.
+            max_score: Max scores from Pass 1 (float32).
+        Returns:
+            Tuple of (numerator, denominator) tensors (float32).
+        """
 
         B, H, T_q_local, D_head = q_local_f32.shape
         D_v = v_local_f32.shape[-1]
@@ -286,7 +361,12 @@ class RingAttentionHelper:
             k_indices_global = torch.arange(k_start_global, k_start_global + current_k_len, device=device)
 
              # Slice global mask relevant to current Q block and current K block
-            current_mask = mask_global[:, :, q_start_global:q_start_global+T_q_local, k_start_global:k_start_global+current_k_len] if mask_global is not None else None
+            if mask_global is not None:
+                current_mask = mask_global[:, :, q_start_global:q_start_global+T_q_local, k_start_global:k_start_global+current_k_len]
+                assert current_mask.shape[-2] == T_q_local and current_mask.shape[-1] == current_k_len, \
+                    f"Rank {self.rank}: Sliced mask shape {current_mask.shape} mismatch with Q_len {T_q_local}, K_len {current_k_len} in sums pass"
+            else:
+                current_mask = None
 
             # Only compute scores if the current K block has elements
             if current_k_len > 0:
@@ -302,7 +382,7 @@ class RingAttentionHelper:
 
                 # Compute stable exponentiated scores
                 stable_scores = scores - max_score # Use max_score from Pass 1
-                exp_scores = torch.exp(stable_scores.clamp(min=-10.0, max=10.0)) # Clamp exp input for safety
+                exp_scores = torch.exp(stable_scores.clamp(min=EXP_CLAMP_MIN, max=EXP_CLAMP_MAX)) # Clamp exp input for safety
 
                 # Update numerator and denominator
                 numerator += torch.einsum("bhqk,bhkd->bhqd", exp_scores, current_v_block[:, :, :current_k_len, :]) # Use sliced V block
@@ -310,9 +390,14 @@ class RingAttentionHelper:
 
             # Ring shift K and V blocks
             if i < self.world_size - 1:
-                current_k_block, current_k_len = self._ring_shift_tensor(current_k_block, self.block_size)
-                current_v_block, _ = self._ring_shift_tensor(current_v_block, self.block_size) # V has same length dim as K
+                # Store the valid length of the K/V pair *before* K is shifted.
+                # This is the length that both current_k_block and current_v_block have.
+                valid_len_of_current_kv_to_send = current_k_len
 
+                current_k_block, current_k_len = self._ring_shift_tensor(current_k_block, self.block_size, valid_len_of_current_kv_to_send)
+                # Now current_k_len is the length of the newly received K block.
+                # We must send the *old* V block, which had length valid_len_of_current_kv_to_send.
+                current_v_block, _ = self._ring_shift_tensor(current_v_block, self.block_size, valid_len_of_current_kv_to_send)
         return numerator, denominator
 
     def _compute_attention_scores(
@@ -325,6 +410,21 @@ class RingAttentionHelper:
         apply_mask: bool = True,
         keep_causal: bool = True # Apply causal mask based on global indices
     ) -> torch.Tensor: # Returns scores (float32) (B, H, T_q_local, T_k_block)
+        """
+        Computes attention scores (Q @ K.T / sqrt(D_head)) and applies masks.
+        Args:
+            q: Q tensor (float32).
+            k: K tensor (float32).
+            q_indices_global: Global indices for Q.
+            k_indices_global: Global indices for K.
+            mask: Sliced global mask (padding/attention mask).
+            apply_mask: Whether to apply the `mask`.
+            keep_causal: Whether to apply the causal mask based on global indices.
+        Returns:
+            Attention scores tensor (float32).
+        """
+        B, H, T_q_local, D_head_q = q.shape
+        _, _, T_k_block, D_head_k = k.shape
 
         # Compute QK^T scaled by head_dim
         # Ensure K is broadcastable if H != H_kv (GQA)
@@ -334,7 +434,12 @@ class RingAttentionHelper:
         # Apply masks
         if apply_mask:
              if mask is not None:
-                scores = scores + mask.to(scores.dtype) # Apply padding/attention mask
+                expected_mask_shape_full = (B, H, T_q_local, T_k_block)
+                expected_mask_shape_broadcast_H = (B, 1, T_q_local, T_k_block)
+                assert mask.shape == expected_mask_shape_full or mask.shape == expected_mask_shape_broadcast_H, \
+                    f"Rank {self.rank}: Mask shape {mask.shape} is not compatible with scores shape {scores.shape}. Expected {expected_mask_shape_full} or {expected_mask_shape_broadcast_H}."
+                scores = scores + mask.to(scores.dtype) # Apply padding/attention mask, ensure mask is broadcastable
+
 
              if keep_causal:
                 # Apply causal mask based on global indices
@@ -377,7 +482,7 @@ class RingAttentionHelper:
 
         # Compute stable exponentiated scores using max_score from Pass 1
         stable_scores = scores - max_score # Shape (B, H, T_q_local, T_k_block)
-        exp_scores = torch.exp(stable_scores.clamp(min=-10.0, max=10.0)) # Clamp exp input for stability
+        exp_scores = torch.exp(stable_scores.clamp(min=EXP_CLAMP_MIN, max=EXP_CLAMP_MAX)) # Clamp exp input for stability
 
         # Update numerator (sum of exp(score - max) * V)
         # einsum handles broadcasting for GQA if H != H_kv
@@ -392,15 +497,24 @@ class RingAttentionHelper:
     def _ring_shift_tensor(
         self,
         tensor: torch.Tensor, # Tensor to shift (e.g., K or V block) (B, H, T_block, D) padded to block_size
-        pad_len: int # Expected padded length (self.block_size)
+        pad_len: int, # Expected padded length (self.block_size)
+        valid_len_to_send: int # The actual number of valid elements in the tensor being sent
     ) -> Tuple[torch.Tensor, int]: # Returns received tensor and its valid length
+        """
+        Shifts a tensor block to the next rank in the ring and receives a block from the previous rank.
+        Handles padding for sending and slicing after receiving.
+        Args:
+            tensor: The tensor block to send (e.g., K or V). This tensor should contain `valid_len_to_send`
+                    actual data elements along its sequence dimension, and the rest can be padding.
+            pad_len: The target length to pad the tensor to for communication (self.block_size).
+            valid_len_to_send: The number of valid (non-padding) elements in the `tensor` to be sent.
+        Returns:
+            A tuple containing the received tensor (sliced to its valid length) and its valid length.
+        """
 
         rank, world = self.rank, self.world_size
         send_rank = (rank + 1) % world
         recv_rank = (rank - 1 + world) % world
-
-        # The input tensor should already be padded to block_size
-        assert tensor.shape[-2] == pad_len, f"Rank {self.rank}: _ring_shift_tensor input not padded to {pad_len}: got {tensor.shape[-2]}"
 
         # Get the *actual* number of elements in the sequence dimension *before* padding
         # This assumes the tensor was padded from a valid_len size
@@ -431,46 +545,61 @@ class RingAttentionHelper:
         # These `valid_len` slices are what need to be padded *back* to `block_size` for sending.
 
         # Corrected logic based on how _ring_shift_tensor is called and what it likely does:
-        # input `tensor` is a block of K or V (B, H, T_current, D) where T_current is the valid length of this block
+        # input `tensor` is a block of K or V (B, H, T_input, D) where T_input is the current length of this block,
+        # which might already be padded or might be exactly valid_len_to_send.
         # We need to pad it to `pad_len` (block_size) for sending.
-        valid_len_current = tensor.shape[-2] # The actual non-padded length of the input tensor
+        # The `valid_len_to_send` argument explicitly tells us how many elements are valid.
+
+        assert tensor.shape[-2] >= valid_len_to_send, \
+            f"Rank {self.rank}: Tensor sequence length {tensor.shape[-2]} is less than valid_len_to_send {valid_len_to_send}"
+
+        # Slice to valid_len_to_send before padding, if tensor is larger (e.g. if it was a previously received padded block)
+        tensor_to_send = tensor[:, :, :valid_len_to_send, :]
 
         # Pad the current tensor block to block_size for communication
-        padded_for_send = _pad_to_block(tensor, pad_len, dim=-2).contiguous()
-        assert padded_for_send.shape[-2] == pad_len, f"Rank {self.rank}: Padding for send failed: got {padded_for_send.shape[-2]}, expected {pad_len}"
-
+        padded_for_send = _pad_to_block(tensor_to_send, pad_len, dim=-2).contiguous()
+        assert padded_for_send.shape[-2] == pad_len, \
+            f"Rank {self.rank}: Padding for send failed. Expected dim -2 to be {pad_len}, got {padded_for_send.shape[-2]}. Original tensor shape: {tensor.shape}, valid_len_to_send: {valid_len_to_send}"
 
         device = tensor.device
 
         # Create buffers for receiving
         recv_len_tensor = torch.empty(1, dtype=torch.int32, device=device)
         tensor_recv_padded = torch.empty_like(padded_for_send) # Received padded tensor
-
+        assert tensor_recv_padded.shape == padded_for_send.shape, \
+            f"Rank {self.rank}: Shape mismatch between send buffer {padded_for_send.shape} and recv buffer {tensor_recv_padded.shape}"
 
         # Prepare send/recv ops
         ops = [
             # Send the actual number of valid elements in the tensor being sent
-            P2POp(op=dist.isend, tensor=torch.tensor([valid_len_current], dtype=torch.int32, device=device), peer=send_rank),
+            P2POp(op=dist.isend, tensor=torch.tensor([valid_len_to_send], dtype=torch.int32, device=device), peer=send_rank),
             # Receive the valid length of the tensor from the previous rank
             P2POp(op=dist.irecv, tensor=recv_len_tensor, peer=recv_rank),
             # Send the padded tensor block
             P2POp(op=dist.isend, tensor=padded_for_send, peer=send_rank),
             # Receive the padded tensor block
-            P2POp(op=dist.irecv, tensor=tensor_recv_padded, peer=recv_rank),
+            P2POp(op=dist.irecv, tensor=tensor_recv_padded, peer=recv_rank)
         ]
 
         # Execute async, then wait
         reqs = dist.batch_isend_irecv(ops)
         for req in reqs:
             req.wait()
+            # Consider adding a timeout to req.wait(timeout_sec) if the API supports it,
+            # or wrap in a try-except for dist.DistError for more robust error handling.
+            # For now, relying on default error propagation.
+            # Example:
+            # try:
+            #     req.wait(timeout=datetime.timedelta(seconds=30)) # Requires appropriate timeout value
+            # except dist.DistError as e:
+            #     raise RuntimeError(f"Rank {self.rank}: Distributed operation failed: {e}") from e
 
         recv_len = recv_len_tensor.item() # The valid length of the received block
 
         # Assert received length makes sense
         assert recv_len >= 0 and recv_len <= pad_len, f"Rank {self.rank}: Received invalid length: {recv_len}, expected <= {pad_len}"
-
         # Slice the received padded tensor to its actual valid length
         tensor_recv = tensor_recv_padded[:, :, :recv_len, :].contiguous()
-
+        assert tensor_recv.shape[-2] == recv_len, f"Rank {self.rank}: Slicing received tensor failed. Expected dim -2 to be {recv_len}, got {tensor_recv.shape[-2]}. Received padded shape: {tensor_recv_padded.shape}"
         # Return the received tensor (sliced) and its valid length
         return tensor_recv, recv_len

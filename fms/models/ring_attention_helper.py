@@ -3,11 +3,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import P2POp
 import math
+import torch.nn as nn
 
 # Assuming necessary imports like MultiHeadAttention, GatedLinearUnit, LayerNormParameterized
-# and DistributedStrategy, RingAttentionStrategy are available in the environment.
-# from fms.distributed.strategy import RingAttentionStrategy, DistributedStrategy
-# from fms.modules.attention import MultiHeadAttention
+from fms.distributed.strategy import RingAttentionStrategy # Import RingAttentionStrategy
 # from fms.modules.feedforward import GatedLinearUnit
 # from fms.modules.layernorm import LayerNormParameterized
 

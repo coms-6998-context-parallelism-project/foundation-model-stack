@@ -174,8 +174,14 @@ class RingAttentionHelper:
                 num += torch.einsum("bhqk,bhkd->bhqd", e, v_blk[:, :, :k_len])
                 den += e.sum(-1, keepdim=True)
             if i < self.world_size - 1:
-                k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, k_len)
-                v_blk, _ = self._ring_shift_tensor(v_blk, self.block_size, k_len)
+                # Store the valid length of the K/V pair *before* K is shifted.
+                # This is the length that both current k_blk and v_blk have.
+                valid_len_of_current_kv_to_send = k_len
+
+                k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, valid_len_of_current_kv_to_send)
+                # Now k_len is the length of the newly received K block.
+                # We must send the *old* V block, which had length valid_len_of_current_kv_to_send.
+                v_blk, _ = self._ring_shift_tensor(v_blk, self.block_size, valid_len_of_current_kv_to_send)
         return num, den
 
     def _compute_attention_scores(self, q, k, q_idx, k_idx, mask=None, apply_mask=True, keep_causal=True):

@@ -191,31 +191,34 @@ class LLaMABlock(nn.Module):
             x_after_attn = attn_out
 
         if rank == 0 and layer_idx == 0: # Print for the first layer only
-            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_before_attn): norm = {torch.linalg.norm(x_before_attn.float()).item()}")
-            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_after_attn_raw): norm = {torch.linalg.norm(x_after_attn.float()).item()}")
+            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_before_attn): norm = {torch.linalg.norm(x_before_attn.float()).item()}")
+            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_after_attn_raw): norm = {torch.linalg.norm(x_after_attn.float()).item()}")
+            pass
 
         if self.config.p_dropout != 0:
             x_after_attn = self.dropout(x_after_attn)
         # residual connection
         x = x_after_attn + residual
         if rank == 0 and layer_idx == 0:
-            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_after_attn_residual): norm = {torch.linalg.norm(x.float()).item()}")
+            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_after_attn_residual): norm = {torch.linalg.norm(x.float()).item()}")
+            pass
 
         # then we do FF and Add&Norm
         residual = x
         x = self.ff_ln(x)
         x_after_ff = self.ff_sub_layer(x)
         if rank == 0 and layer_idx == 0:
-            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_after_ff_raw): norm = {torch.linalg.norm(x_after_ff.float()).item()}")
+            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: x_after_ff_raw): norm = {torch.linalg.norm(x_after_ff.float()).item()}")
+            pass
 
         if self.config.p_dropout != 0:
             x_after_ff = self.dropout(x_after_ff)
         # another residual
         x = x_after_ff + residual
-        
+
         first_block_debug_out = None
         if rank == 0 and layer_idx == 0:
-            print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: LLaMABlock_final_output): norm = {torch.linalg.norm(x.float()).item()}")
+            # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: LLaMABlock_final_output): norm = {torch.linalg.norm(x.float()).item()}")
             first_block_debug_out = x.clone() # Collect the final output of the block
 
         if use_cache:
@@ -431,12 +434,14 @@ class LLaMA(nn.Module):
 
         x_in = self.shared(x_in)
         if rank == 0:
-            print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: x_in_after_embedding): norm = {torch.linalg.norm(x_in.float()).item()}")
+            # print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: x_in_after_embedding): norm = {torch.linalg.norm(x_in.float()).item()}")
+            pass
 
         if isinstance(distributed_strategy, RingAttentionStrategy):
             x_in = self.distributed_strategy.shard_input(x_in)
             if rank == 0:
-                print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: x_in_after_ring_sharding_Rank0): norm = {torch.linalg.norm(x_in.float()).item()}")
+                # print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: x_in_after_ring_sharding_Rank0): norm = {torch.linalg.norm(x_in.float()).item()}")
+                pass
 
         # this is the output cache for all the decoder layers
         present_key_value_states = []
@@ -470,12 +475,12 @@ class LLaMA(nn.Module):
         dec_out = x_in
         if rank == 0:
             # For Ring, this is sharded input to dec_norm
-            print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: input_to_dec_norm_Rank0_for_Ring): norm = {torch.linalg.norm(dec_out.float()).item()}")
-        
+            # print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: input_to_dec_norm_Rank0_for_Ring): norm = {torch.linalg.norm(dec_out.float()).item()}")
+            pass
         norm_output_raw = self.dec_norm(dec_out) # This is the raw output of dec_norm
         if rank == 0:
-            print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: output_of_dec_norm_Rank0_for_Ring): norm = {torch.linalg.norm(norm_output_raw.float()).item()}")
-        
+            # print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: output_of_dec_norm_Rank0_for_Ring): norm = {torch.linalg.norm(norm_output_raw.float()).item()}")
+            pass
         output_after_norm = norm_output_raw
         if self.config.p_dropout:
             output_after_norm = self.dropout(output_after_norm)
@@ -491,8 +496,8 @@ class LLaMA(nn.Module):
             gathered_output = distributed_strategy.gather_tensor(output_after_norm, dim=1)
             # Slice back to the original sequence length
             final_output_for_head = gathered_output[:, :original_seq_len, :]
-            if rank == 0:
-                print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: final_gathered_output_Ring): norm = {torch.linalg.norm(final_output_for_head.float()).item()}")
+            # if rank == 0:
+                # print(f"DEBUG (LLaMA._helper, Rank {rank}, Tensor: final_gathered_output_Ring): norm = {torch.linalg.norm(final_output_for_head.float()).item()}")
 
         return final_output_for_head, present_key_value_states, norm_output_raw, first_block_output_debug_layer0
 

@@ -333,7 +333,8 @@ class RingAttentionHelper:
     ):
         B, H, Tq, D = q.shape
         Tk = k.shape[2]
-        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        q = q / self.scale
+        scores = torch.matmul(q, k.transpose(-2, -1))
 
         if apply_mask:
             if mask is not None:
@@ -342,7 +343,9 @@ class RingAttentionHelper:
                 causal = (
                     k_idx[None, None, None, :] > q_idx[None, None, :, None]
                 )
-                scores = scores.masked_fill(causal, -torch.inf)
+                min_val = torch.finfo(scores.dtype).min
+                scores = scores.masked_fill(causal, min_val)
+
 
         return scores.clamp(min=torch.finfo(scores.dtype).min)
 

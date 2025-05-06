@@ -4,27 +4,27 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-# Keep only FMS components used *in these functions*
+# Keep only FMS components used directly in these functions or their type hints
 from fms.models.ring_attention_helper import RingAttentionHelper
-from fms.distributed.strategy import DistributedStrategy, RingAttentionStrategy
-from fms.modules.attention import MultiHeadAttention
-from fms.modules.positions import RotaryEmbedding
+from fms.distributed.strategy import DistributedStrategy, RingAttentionStrategy # Need both for type hints
+from fms.modules.attention import MultiHeadAttention # Needed for attn_data type hint
+from fms.modules.positions import RotaryEmbedding # Needed for type hint in compute_local_qkv_and_rope
 
 
 # These functions are assigned as methods to the LLaMABlock class.
 # `self` refers to the LLaMABlock instance.
 
 def compute_local_qkv_and_rope(
-    self: nn.Module, # LLaMABlock
-    attn_data: MultiHeadAttention, # self.attn
+    self: nn.Module, # LLaMABlock instance
+    attn_data: MultiHeadAttention, # self.attn module
     q: torch.Tensor,
     k: Optional[torch.Tensor] = None,
     v: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
-    use_cache: bool = False,
-    past_key_value_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    is_self: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # Q, K, V tensors
+    use_cache: bool = False, # Likely ignored in ring context
+    past_key_value_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # Likely ignored
+    is_self: bool = True # Always True for self-attention
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # Returns Q, K, V tensors
 
     B, T, E = q.shape
     q_out, k_out, v_out = attn_data.in_proj(q, k, v)
@@ -70,7 +70,6 @@ def compute_local_qkv_and_rope(
                 queries = torch.where(mask_qkv, queries_rope, queries)
                 keys    = torch.where(mask_qkv.expand_as(keys), keys_rope, keys)
 
-
     return (
         queries.permute(0, 2, 1, 3),
         keys.permute(0, 2, 1, 3),
@@ -78,9 +77,9 @@ def compute_local_qkv_and_rope(
     )
 
 
-# Assigned to LLaMABlock.forward for RingAttentionStrategy
+# Assigned to LLaMABlock.forward when RingAttentionStrategy is used
 def forward_ring(
-    self: nn.Module, # LLaMABlock
+    self: nn.Module, # LLaMABlock instance
     x: torch.Tensor,
     *,
     mask: Optional[torch.Tensor] = None,
@@ -92,13 +91,9 @@ def forward_ring(
     distributed_strategy: Optional[DistributedStrategy] = None, # Expected RingAttentionStrategy
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
 
-    # Warn if use_cache is true, as it's likely not supported by the helper
-    if use_cache:
-         # logger.warning(f"Rank {dist.get_rank()}: use_cache=True passed to RingAttention forward. Caching is likely not fully supported.")
-         pass # Keeping warning minimal or removed
-
     # Dispatch to helper function assigned to the block
-    x_out, cache_out, _ = self._forward_ring_attention( # Unpack 3 values
+    # Unpacks 3 values from _forward_ring_attention
+    x_out, cache_out, _ = self._forward_ring_attention(
         x,
         mask=mask,
         position_ids=position_ids,
@@ -108,12 +103,13 @@ def forward_ring(
         strategy=distributed_strategy,
     )
 
+    # Return based on the use_cache flag
     return (x_out, cache_out) if use_cache else x_out
 
 
 # Assigned to LLaMABlock._forward_ring_attention
 def _forward_ring_attention(
-    self: nn.Module, # LLaMABlock
+    self: nn.Module, # LLaMABlock instance
     x: torch.Tensor, # Sharded, padded input
     *,
     mask: Optional[torch.Tensor],
@@ -122,7 +118,7 @@ def _forward_ring_attention(
     use_cache: bool,
     is_causal_mask: bool,
     strategy: DistributedStrategy, # Expected RingAttentionStrategy
-) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Any]: # (output, cache, extra)
+) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Any]: # Returns (output, cache, extra)
 
     assert isinstance(strategy, RingAttentionStrategy), f"Expected RingAttentionStrategy, got {type(strategy)}"
 
@@ -132,7 +128,7 @@ def _forward_ring_attention(
     correct_valid_len = strategy.get_local_valid_len() # Valid tokens on this rank
 
     # Lazy init RingAttentionHelper on first call with this strategy
-    if self.ring_helper is None or self.ring_helper.strategy is not strategy: # Check if strategy changed
+    if self.ring_helper is None or self.ring_helper.strategy is not strategy:
         self.ring_helper = RingAttentionHelper(
             attn_module=self.attn,
             strategy=strategy,
@@ -154,4 +150,9 @@ def _forward_ring_attention(
         residual=residual,
     )
 
-    return output, cache_from_helper, extra_output # Helper returns (x, None, None) for ring case
+    return output, cache_from_helper, extra_output
+
+# These functions are typically assigned to LLaMABlock in llama.py
+# LLaMABlock.compute_local_qkv_and_rope = compute_local_qkv_and_rope
+# LLaMABlock.forward = forward_ring # Overrides nn.Module.forward for ring case
+# LLaMABlock._forward_ring_attention = _forward_ring_attention

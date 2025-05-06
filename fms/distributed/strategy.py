@@ -167,7 +167,7 @@ import torch.distributed as dist
 class RingAttentionStrategy(DistributedStrategy):
     """Distributed strategy for ring attention with fixed block size."""
 
-    def __init__(self, block_size: int = 32, group: Optional[dist.ProcessGroup] = None, from_meta: bool = False):
+    def __init__(self, block_size: int = 1024, group: Optional[dist.ProcessGroup] = None, from_meta: bool = False):
         super().__init__(from_meta)
         self.block_size = block_size
         

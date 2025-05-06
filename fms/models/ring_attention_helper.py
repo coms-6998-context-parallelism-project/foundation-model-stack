@@ -30,10 +30,10 @@ class RingAttentionHelper:
         self.world_size = dist.get_world_size()
         self.head_dim = attn_module.emb_kq_per_head
         self.scale = math.sqrt(self.head_dim)
-        # Ensure block_size is set
-        if not hasattr(self.strategy, 'block_size'):
-             print("Warning: strategy object does not have 'block_size'. Using a default of 128.")
-             self.strategy.block_size = 512
+        # # Ensure block_size is set
+        # if not hasattr(self.strategy, 'block_size'):
+        #      print("Warning: strategy object does not have 'block_size'. Using a default of 128.")
+        #      self.strategy.block_size = 512
 
     def forward(self, x_norm, strategy, mask=None, position_ids=None, past_key_value_state=None,
             is_causal_mask=False, rank=0, minimal_debug_prints: bool = False, valid_len=0, 
@@ -51,26 +51,31 @@ class RingAttentionHelper:
                 valid_pos = torch.arange(start_idx_global, start_idx_global + valid_len, device=x_norm.device)
                 position_ids[:, :valid_len] = valid_pos.unsqueeze(0)  # Broadcast to all batches
 
+        # Suggestion 2: Clip position_ids to valid_len BEFORE RoPE
+        # Also, trim x_norm and residual to valid_len before passing to QKV computation
+        position_ids_for_rope = position_ids[:, :valid_len]
+        x_norm_for_rope = x_norm[:, :valid_len, :]
+        residual_for_rope = residual[:, :valid_len, :] if residual is not None else None
+
+        # Suggestion 1: Log the actual position_ids being used for RoPE
+        if self.debug_mode:
+            # Ensure rank is available for printing, self.rank should be set in __init__
+            print(f"[Rank {self.rank}] position_ids used for RoPE: {position_ids_for_rope[0, :].tolist() if position_ids_for_rope.numel() > 0 else '[]'}")
 
         # Compute local QKV aligned to global rotary positions
         q_local, k_local, v_local = self.llama_block.compute_local_qkv_and_rope(
             self.attn,
-            q=x_norm, k=x_norm, v=x_norm,
-            position_ids=position_ids,
+            q=x_norm_for_rope, k=x_norm_for_rope, v=x_norm_for_rope, # Use trimmed inputs
+            position_ids=position_ids_for_rope, # Use trimmed position_ids
             use_cache=False,
             past_key_value_state=past_key_value_state,
             is_self=True
         )
 
-        # Trim QKV tensors to valid_len (not block_size)
-        q_local = q_local[:, :, :valid_len, :]
-        k_local = k_local[:, :, :valid_len, :]
-        v_local = v_local[:, :, :valid_len, :]
-
-        # Ensure x_norm and residual are trimmed to valid_len if they weren't already
-        # (They should be based on how _forward_ring_attention calls this)
-        x_norm_local = x_norm[:, :valid_len, :]
-        residual_local = residual[:, :valid_len, :] if residual is not None else None
+        # QKV are now naturally of valid_len due to trimmed inputs to compute_local_qkv_and_rope
+        # x_norm_local and residual_local for forward_full should also be the trimmed versions
+        x_norm_local = x_norm_for_rope
+        residual_local = residual_for_rope
 
         # Forward full with locally computed Q/K/V
         result = self.forward_full(

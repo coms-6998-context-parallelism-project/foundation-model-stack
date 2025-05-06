@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--num_tokens_to_benchmark", type=int, default=30, help="Number of tokens to generate and benchmark.")
     parser.add_argument("--run_ring_first", action="store_true", help="Explicitly run Ring Attention first (default). Set --no-run_ring_first to run Regular first.")
     parser.add_argument("--no-run_ring_first", dest="run_ring_first", action="store_false")
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"], help="Data type to use for model computations (float32, float16, bfloat16)")
     parser.set_defaults(run_ring_first=True) # Default to Ring first
 
     return parser.parse_args()
@@ -56,7 +57,7 @@ def set_determinism():
     # torch.use_deterministic_algorithms(True)
 
 
-def setup_model(args, strategy=None):
+def setup_model(args, strategy=None, dtype=None):
     # Map strategy string to actual strategy object if needed by get_model
     dist_strategy_param = strategy # Pass the strategy object ('ring' string or NoOpStrategy class)
     if strategy == "ring":
@@ -75,6 +76,7 @@ def setup_model(args, strategy=None):
         device_type=args.device_type,
         source="hf", # Assuming HF source
         distributed_strategy=dist_strategy_param,
+        data_type=dtype, # Explicitly pass the desired dtype
     )
     model.eval()
     torch.set_grad_enabled(False)
@@ -169,7 +171,16 @@ def main():
 
 
     device = torch.device(args.device_type, local_rank if local_rank != -1 and args.device_type == "cuda" else 0)
-    torch.set_default_dtype(torch.float16)
+
+    # Convert dtype string to torch.dtype
+    try:
+        parsed_dtype = getattr(torch, args.dtype)
+    except AttributeError:
+        print0(f"[ERROR] Invalid dtype '{args.dtype}' specified. Must be one of 'float32', 'float16', 'bfloat16'.")
+        # Exit or default? Let's default and warn for now.
+        parsed_dtype = torch.float32
+        print0(f"[WARNING] Falling back to default dtype: {parsed_dtype}")
+    torch.set_default_dtype(parsed_dtype)
 
     # Load tokenizer only on rank 0 to avoid redundant downloads/loads if applicable
     tokenizer = None
@@ -249,7 +260,7 @@ def main():
 
             # Suppress the specific warning about inv_freq keys
             warnings.filterwarnings("ignore", message=r"Keys from checkpoint \(adapted to FMS\) not copied into model:.*rotary_emb\.inv_freq")
-            model = setup_model(args, strategy)
+            model = setup_model(args, strategy, dtype=parsed_dtype) # Pass dtype to setup
             warnings.resetwarnings() # Reset warnings filter after model setup
 
         # Barrier to ensure all ranks wait for model setup on active ranks

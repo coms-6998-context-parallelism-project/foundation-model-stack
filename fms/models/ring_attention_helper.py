@@ -164,37 +164,53 @@ class RingAttentionHelper:
         attn_out = self.attn.dense(attn_out)
         # if hasattr(self.llama_block, 'dropout') and self.llama_block.config.p_dropout != 0:
         #     attn_out = self.llama_block.dropout(attn_out)
+        
+        # Suggestion 1: Trim attn_out to valid_len (T_q_local) before residual connection
+        attn_out = attn_out[:, :T_q_local, :]
 
         if self.debug_mode and debug_info is not None:
-            debug_info[f"attn_out_raw_r{self.rank}"] = attn_out.clone().detach().cpu()
+            # Suggestion 4: Log trimmed tensor
+            debug_info[f"attn_out_raw_r{self.rank}"] = attn_out.clone().detach().cpu() 
 
         # Add residual connection for attention output (using trimmed tensors)
         residual_1 = x_block + attn_out
         if self.debug_mode and debug_info is not None:
-            debug_info[f"attn_out_residual_r{self.rank}"] = residual_1.clone().detach().cpu()
+            # Suggestion 4: Log trimmed tensor (already trimmed as inputs were)
+            debug_info[f"attn_out_residual_r{self.rank}"] = residual_1.clone().detach().cpu() 
 
         # --- Feedforward Network ---
-        # Pad residual_1 before FF Norm and FF layer
-        residual_1_padded = _pad_to_block(residual_1, self.strategy.block_size, dim=1)
-
-        ff_ln_out_padded = self.ff_norm(residual_1_padded)
+        # Suggestion 5: Apply FF norm and FF layers to unpadded (trimmed) residual_1
+        # residual_1 is already trimmed to T_q_local (valid_len)
+        ff_ln_out = self.ff_norm(residual_1) 
         if self.debug_mode and debug_info is not None:
-            # Log the padded version going into FF
-            debug_info[f"ff_ln_out_padded_r{self.rank}"] = ff_ln_out_padded.clone().detach().cpu()
+            # Log unpadded tensor
+            debug_info[f"ff_ln_out_r{self.rank}"] = ff_ln_out.clone().detach().cpu()
 
-        ff_out_padded = self.ff(ff_ln_out_padded)
+        ff_out_raw = self.ff(ff_ln_out) # ff_ln_out is also trimmed
         if self.debug_mode and debug_info is not None:
-            debug_info[f"ff_out_raw_padded_r{self.rank}"] = ff_out_padded.clone().detach().cpu()
+            # Log unpadded tensor
+            debug_info[f"ff_out_raw_r{self.rank}"] = ff_out_raw.clone().detach().cpu()
 
         # if hasattr(self.llama_block, 'dropout') and self.llama_block.config.p_dropout != 0:
         #     ff_out_raw = self.llama_block.dropout(ff_out_raw)
 
-        # Slice FF output back to valid_len before adding residual
-        ff_out_trimmed = ff_out_padded[:, :T_q_local, :]
-        x = ff_out_trimmed + residual_1 # Add trimmed tensors
+        # Add residual (all tensors are already trimmed to T_q_local)
+        x = ff_out_raw + residual_1 
+
+        # Suggestion 1: Ensure final output x is explicitly trimmed (already done by operating on trimmed inputs)
+        # x = x[:, :T_q_local, :] # This should be redundant now but safe to keep if unsure
+
+        # Suggestion 2: Optional clamping for FP16 stability
+        if x.dtype == torch.float16:
+            x = torch.clamp(x, min=-5.0, max=5.0) # Example clamp range
+
+        # Suggestion 7: Optional normalization for final output
+        # if self.debug_mode: # Or a separate flag for this specific normalization
+        #     x = x / (x.norm(dim=-1, keepdim=True) + 1e-5)
 
         if self.debug_mode and debug_info is not None:
-            debug_info[f"block_output_r{self.rank}"] = x.clone().detach().cpu()
+            # Suggestion 4: Log trimmed tensor
+            debug_info[f"block_output_r{self.rank}"] = x.clone().detach().cpu() 
 
         return (x, debug_info) if self.debug_mode else x
 
@@ -468,3 +484,17 @@ class RingAttentionHelper:
         dist.barrier()
         # exit(0)
         return tensor_recv, recv_len
+
+    # Suggestion 3: Add Relative Tolerance-Based Comparison helper
+    def _log_diff_stats(self, tag: str, a: torch.Tensor, b: torch.Tensor, tol=1e-4):
+        if not self.debug_mode: # Check if debug_mode is enabled for this helper instance
+            return
+        # Ensure tensors are on CPU and float for comparison, and match shapes if necessary
+        a_comp = a.detach().cpu().float()
+        b_comp = b.detach().cpu().float()
+        # Add more sophisticated shape handling if needed for comparison (e.g., trim to min length)
+        diff = (a_comp - b_comp).abs()
+        max_diff = diff.max().item()
+        offending = (diff > tol).sum().item()
+        total = diff.numel()
+        print(f"[{tag} Rank {self.rank}] MaxDiff={max_diff:.6f}, Offending(>{tol:.1e})={offending}/{total} ({100*offending/total:.2f}%)")

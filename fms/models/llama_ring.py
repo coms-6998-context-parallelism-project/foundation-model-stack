@@ -112,7 +112,7 @@ def forward_ring(
     # 2: Level 1 + Missing keys
     # 3: Level 2 + Detailed diff values
     # 4: Level 3 + Enable internal helper debug logs
-    debug_verbosity = 4 # Set desired level here (0-4)
+    debug_verbosity = 0 # Set desired level here (0-4)
     debug_info = {} if debug_verbosity > 0 else None # Init debug dict only if verbosity > 0
     x_original = x # Store the original input for debug comparison
 
@@ -521,69 +521,71 @@ def _forward_engine_attention(
     is_causal_mask,
     verbosity: int, # Add verbosity
 ):
-    debug = {}
+    debug_engine = {} # Use a more specific name for clarity
     enable_debug_info = verbosity > 0 # Use verbosity to determine if debug is enabled
+    current_rank_for_print = dist.get_rank() if dist.is_initialized() else 0
+
     # Log the input x received by this function
     if enable_debug_info:
-        debug[f"engine_x_input_r{dist.get_rank() if dist.is_initialized() else 0}"] = x.clone().detach().cpu() # Add engine_ prefix
-    x_norm = self.ln(x) # This is the global x_norm
-    if enable_debug_info:
-        debug[f"engine_x_norm_r{dist.get_rank() if dist.is_initialized() else 0}"] = x_norm.clone().detach().cpu() # Add engine_ prefix
+        debug_engine[f"engine_x_block_r{current_rank_for_print}"] = x.clone().detach().cpu() # Renamed to match helper's "residual input"
 
-    queries, keys, values = self.compute_qkv_and_rope_thread(
-        self.attn,
-        q=x_norm,
-        k=x_norm,
-        v=x_norm,
+    # Standard LLaMA block forward pass
+    residual = x
+    x_norm = self.ln(x)
+    if enable_debug_info:
+        debug_engine[f"engine_x_norm_r{current_rank_for_print}"] = x_norm.clone().detach().cpu() # Matches helper's "normalized input"
+
+    # Attention part
+    # Note: compute_qkv_and_rope_thread is not the standard one from llama.py's MHA.
+    # We'll use self.attn directly as in the original LLaMABlock.forward.
+    attn_out = self.attn(
+        q=x_norm, # Pass x_norm as q, k, and v for self-attention
+        # k=x_norm, # Implicitly handled by self.attn if k,v are None
+        # v=x_norm, # Implicitly handled by self.attn if k,v are None
         position_ids=position_ids,
-        use_cache=use_cache,
+        mask=mask,
         past_key_value_state=past_key_value_state,
+        use_cache=use_cache,
         is_self=True,
+        is_causal_mask=is_causal_mask,
+        # attn_algorithm can be passed if needed, but often None for standard LLaMA
     )
 
-    if use_cache and past_key_value_state and past_key_value_state[0].numel() > 0:
-        keys = torch.cat((past_key_value_state[0], keys), dim=2)
-        values = torch.cat((past_key_value_state[1], values), dim=2)
+    cache = None
+    if use_cache:
+        attn_out, cache = attn_out # Unpack if use_cache is True
+    
+    if enable_debug_info:
+        debug_engine[f"engine_attn_out_raw_r{current_rank_for_print}"] = attn_out.clone().detach().cpu() # Matches helper
 
-    expansion = self.attn.nheads // self.attn.kvheads
-    keys_e = keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else keys
-    values_e = values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2) if expansion != 1 else values
+    # Dropout and residual for attention
+    if hasattr(self.config, 'p_dropout') and self.config.p_dropout != 0: # Check if dropout is configured
+        attn_out_dropped = self.dropout(attn_out) # Assuming self.dropout exists if p_dropout > 0
+        x = attn_out_dropped + residual
+    else:
+        x = attn_out + residual
+    
+    if enable_debug_info:
+        debug_engine[f"engine_attn_out_residual_r{current_rank_for_print}"] = x.clone().detach().cpu() # Matches helper
 
-    engine = ThreadedRingAttentionEngine(
-        block_size=32,
-        attn=self.attn,
-        ff=self.ff_sub_layer,
-        ff_norm=self.ff_ln,
-        is_causal=is_causal_mask and mask is None,
-        debug_mode=(verbosity >= 1), # Enable internal debug only at level 4
-    )
+    # Feed-forward part
+    residual_ff = x
+    x_ff_norm = self.ff_ln(x)
+    if enable_debug_info:
+        debug_engine[f"engine_ff_ln_out_r{current_rank_for_print}"] = x_ff_norm.clone().detach().cpu() # Engine uses unpadded
+    
+    x_ff = self.ff_sub_layer(x_ff_norm)
+    if enable_debug_info:
+        debug_engine[f"engine_ff_out_raw_r{current_rank_for_print}"] = x_ff.clone().detach().cpu() # Engine uses unpadded
 
-
-    engine_output = engine.forward_full(
-        q_global=queries,
-        k_global=keys_e,
-        v_global=values_e,
-        mask_global=mask,
-        x_global=x,
-        x_norm_global=x_norm, # Pass global x_norm
-    )
-
+    # Dropout and residual for feed-forward
+    if hasattr(self.config, 'p_dropout') and self.config.p_dropout != 0:
+        x_ff_dropped = self.dropout(x_ff)
+        x = x_ff_dropped + residual_ff
+    else:
+        x = x_ff + residual_ff
 
     if enable_debug_info:
-        if verbosity >= 1: # Corrected: Only unpack debug data if engine's debug mode was enabled
-            x, engine_debug_data = engine_output
-        else:
-            x = engine_output # Otherwise, only the output tensor is returned
-            engine_debug_data = None # Set to None as it wasn't returned
+        debug_engine[f"engine_block_output_r{current_rank_for_print}"] = x.clone().detach().cpu() # Matches helper
 
-        if engine_debug_data: # Check if debug data exists before processing
-            # Add engine prefix to keys coming from the engine's debug buffer
-            for k, v in engine_debug_data.items():
-                debug[f"engine_{k}"] = v
-
-    else:
-        x = engine_output
-
-
-    cache = (keys, values) if use_cache else None
-    return x, cache, debug
+    return x, cache, debug_engine

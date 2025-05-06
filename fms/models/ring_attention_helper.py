@@ -152,16 +152,22 @@ class RingAttentionHelper:
         return scores.clamp(min=torch.finfo(scores.dtype).min)
 
     def _ring_shift_tensor(self, tensor, valid_len):
+        # If world_size is 1, no shifting is needed.
+        if self.world_size == 1:
+            return tensor[:, :, :valid_len].contiguous(), valid_len
+
         rank, world = self.rank, self.world_size
         send, recv = (rank + 1) % world, (rank - 1 + world) % world
         device = tensor.device
-
+        print(f"[DEBUG Rank {rank}] _ring_shift_tensor: Sending to {send}, Receiving from {recv}. Input tensor shape: {tensor.shape}, valid_len to send: {valid_len}")
         send_tensor = tensor[:, :, :valid_len].contiguous()
         send_len = torch.tensor([valid_len], dtype=torch.int32, device=device)
         max_recv_len = self.block_size
         recv_tensor = torch.empty((tensor.size(0), tensor.size(1), max_recv_len, *tensor.shape[3:]),
                                   dtype=tensor.dtype, device=device)
         recv_len = torch.empty(1, dtype=torch.int32, device=device)
+
+        print(f"[DEBUG Rank {rank}] _ring_shift_tensor: send_tensor shape: {send_tensor.shape}, send_len: {send_len.item()}, recv_tensor buffer shape: {recv_tensor.shape}")
 
         ops = [
             P2POp(dist.isend, send_len, peer=send),
@@ -170,7 +176,10 @@ class RingAttentionHelper:
             P2POp(dist.irecv, recv_tensor, peer=recv)
         ]
         for op in dist.batch_isend_irecv(ops):
+            print(f"[DEBUG Rank {rank}] _ring_shift_tensor: Waiting for op: {op}")
             op.wait()
+            print(f"[DEBUG Rank {rank}] _ring_shift_tensor: Op completed: {op}")
 
         r_len = recv_len.item()
+        print(f"[DEBUG Rank {rank}] _ring_shift_tensor: Received r_len: {r_len}. Slicing recv_tensor to this length.")
         return recv_tensor[:, :, :r_len].contiguous(), r_len

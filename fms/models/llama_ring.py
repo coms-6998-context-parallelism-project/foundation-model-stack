@@ -116,13 +116,28 @@ def _forward_ring_attention(
     is_causal_mask,
     strategy,
     # verbosity: int, # Suggestion 6: Remove verbosity
+    # rank argument was removed in a previous step, ensure it's not expected by helper.forward
 ):
     residual = x
     x_norm_local = self.ln(x)
 
     # Suggestion 8: Inline _local_valid_len (already effectively done)
-    # Assuming strategy object has _local_valid_len computed based on input x
-    correct_valid_len = strategy._local_valid_len # Keep as is
+    # Ensure strategy.get_local_valid_len() is the correct way to get this.
+    # This method was added to RingAttentionStrategy in fms/distributed/strategy.py
+    correct_valid_len = strategy.get_local_valid_len()
+
+    # Lazily initialize self.ring_helper or re-initialize if strategy instance changes
+    if self.ring_helper is None or self.ring_helper.strategy is not strategy:
+        if not isinstance(strategy, RingAttentionStrategy):
+            raise TypeError(f"Expected RingAttentionStrategy, got {type(strategy)}")
+        self.ring_helper = RingAttentionHelper(
+            attn_module=self.attn,
+            strategy=strategy, # Use the strategy passed into this forward method
+            llama_block=self,  # Pass self (the LLaMABlock instance)
+            use_cache=use_cache, # Pass current use_cache state
+            ff=self.ff_sub_layer,
+            ff_norm=self.ff_ln,
+        )
 
     # Suggestion 1: Keep helper creation here as strategy is needed
     # Note: The provided llama.py initializes self.ring_helper incorrectly.
@@ -136,5 +151,10 @@ def _forward_ring_attention(
         is_causal_mask=is_causal_mask,
         valid_len=correct_valid_len, # Pass the calculated valid length
         residual=residual,
+        # rank=strategy.rank # Pass rank if RingAttentionHelper.forward expects it
     )
-    return x, cache # Suggestion 7: Drop third return value
+    # Based on RingAttentionHelper.forward returning (result, None, {}),
+    # output is the tensor, cache from helper is None. The third value is debug_info.
+    x = output 
+    # cache is None from ring_helper.forward's second return value
+    return x, cache

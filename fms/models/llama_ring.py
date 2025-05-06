@@ -98,7 +98,7 @@ def forward_ring(
          pass # Keeping warning minimal or removed
 
     # Dispatch to helper function assigned to the block
-    x_out, cache_out = self._forward_ring_attention(
+    x_out, cache_out, _ = self._forward_ring_attention( # Unpack 3 values
         x,
         mask=mask,
         position_ids=position_ids,

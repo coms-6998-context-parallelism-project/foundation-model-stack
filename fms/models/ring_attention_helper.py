@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import P2POp
 import math
+import torch.nn.functional as F
 import torch.nn as nn
 
 # Assuming necessary imports like MultiHeadAttention, GatedLinearUnit, LayerNormParameterized
@@ -134,8 +135,9 @@ class RingAttentionHelper:
         self.world_size: int = self.strategy.world_size
         self.block_size: int = self.strategy.block_size
 
-        self.head_dim: int = self.attn.emb_kq_per_head # Assuming this attribute exists
-        self.scale: float = math.sqrt(self.head_dim)
+        self.head_dim: int = self.attn.emb_kq_per_head
+        # Fix 1: Match Scaling Behavior
+        self.scale: float = self.attn.scale_factor or math.sqrt(self.head_dim)
 
         # Principle: Prevent Usage Bugs - Ensure FF modules are provided if needed
         if self.ff is None or self.ff_norm is None:
@@ -194,11 +196,24 @@ class RingAttentionHelper:
         q_local_unpadded, k_local_unpadded, v_local_unpadded = compute_local_qkv_and_rope(
             self.attn, # Pass self.attn
             q=x_norm_for_rope, k=x_norm_for_rope, v=x_norm_for_rope, # Use trimmed inputs
-            position_ids=position_ids_for_rope, # Pass trimmed position_ids
+            position_ids=position_ids_for_rope, # Pass trimmed position_ids (RoPE applied here)
             use_cache=False,
             past_key_value_state=None,
             is_self=True
         )
+        # q_local_unpadded, k_local_unpadded, v_local_unpadded are (B, H_orig_kv, valid_len, D_head/D_v)
+        # Note: compute_local_qkv_and_rope already permutes to (B, H, S, D)
+
+        # Fix 4: Ensure Matching KV Expansion
+        # This needs to happen *after* RoPE and *before* passing to attention computation logic
+        # if the original K/V heads are different from Q heads.
+        kv_expansion = self.attn.nheads // self.attn.kvheads
+        if kv_expansion != 1:
+            # k_local_unpadded and v_local_unpadded are (B, H_kv, valid_len, D_head/D_v)
+            # We need to expand H_kv to H_q for the attention computation if it's GQA/MQA
+            k_local_unpadded = k_local_unpadded.unsqueeze(2).expand(-1, -1, kv_expansion, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_kq_per_head)
+            v_local_unpadded = v_local_unpadded.unsqueeze(2).expand(-1, -1, kv_expansion, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_v_per_head)
+
         B, H, T_qkv_local, D_head = q_local_unpadded.shape
         assert T_qkv_local == valid_len, f"Rank {self.rank}: QKV length {T_qkv_local} after compute_local_qkv_and_rope does not match valid_len {valid_len}"
 
@@ -266,32 +281,44 @@ class RingAttentionHelper:
         D_v = v_local.shape[-1]
         device = q_local.device
 
-        # Principle: Numerical Stability & Dtype Casting
-        q_local_f32 = q_local.to(torch.float32)
-        k_local_f32 = k_local.to(torch.float32)
-        v_local_f32 = v_local.to(torch.float32)
+        # Fix 6: Numerical Precision Control
+        compute_dtype = q_local.dtype if q_local.dtype in [torch.float32, torch.bfloat16, torch.float16] else torch.float32
+        q_compute = q_local.to(compute_dtype)
+        k_compute = k_local.to(compute_dtype)
+        v_compute = v_local.to(compute_dtype)
 
         # Compute max scores (Pass 1)
         max_score = self._compute_max_score_pass(
-            q_local_f32,
-            k_local_f32,
+            q_compute,
+            k_compute,
             mask_global,
             q_start_global,
             valid_len,
         )
 
-        # Compute sums (Pass 2)
+        # Fix 7: Softmax Implementation (Option to use F.softmax)
+        # If choosing to use F.softmax for closer matching, the two-pass logic changes.
+        # For now, let's keep the two-pass for numerical stability but ensure dtypes are handled.
+        # If you want to switch, you'd compute all scores, then apply F.softmax.
+        # The current two-pass is generally more robust for distributed settings.
+        # We will apply the dtype change to the existing two-pass.
+
+        # Compute sums (Pass 2) using compute_dtype
         numerator, denominator = self._compute_sums_pass(
-            q_local_f32, k_local_f32, v_local_f32,
+            q_compute, k_compute, v_compute,
             mask_global,
             q_start_global,
             valid_len,
-            max_score,
+            max_score, # max_score is already in compute_dtype
         )
 
-        # Compute attention output
-        attn_out_h = numerator / (denominator + 1e-10) # Division in float32
+        # Compute attention output in compute_dtype
+        attn_out_h = numerator / (denominator + 1e-10) # Division in compute_dtype
         attn_out_h = attn_out_h.to(q_local.dtype) # Cast result back to original dtype
+
+        # Fix 2: Match Dropout Behavior
+        if self.attn.p_dropout and self.llama_block.training: # Check training mode of the parent LLaMABlock
+            attn_out_h = F.dropout(attn_out_h, p=self.attn.p_dropout, training=True)
 
         # Assert shape after attention calculation
         assert attn_out_h.shape == (B, H, T_q_local, D_v), f"Rank {self.rank}: Attn head output shape mismatch: {attn_out_h.shape} vs {(B, H, T_q_local, D_v)}"
@@ -315,36 +342,36 @@ class RingAttentionHelper:
 
     def _compute_max_score_pass(
         self,
-        q_local_f32: torch.Tensor, # Q (float32) (B, H, T_q_local, D_head)
-        k_local_f32: torch.Tensor, # K (float32) (B, H_kv, T_q_local, D_head)
+        q_compute: torch.Tensor, # Q (compute_dtype) (B, H, T_q_local, D_head)
+        k_compute: torch.Tensor, # K (compute_dtype) (B, H, T_q_local, D_head) - H should match Q after expansion
         mask_global: Optional[torch.Tensor], # Global mask
         q_start_global: int, # Global start index for Q block
         valid_len_local: int, # Actual length of local Q
-    ) -> torch.Tensor: # Returns max scores (float32) (B, H, T_q_local, 1)
+    ) -> torch.Tensor: # Returns max scores (compute_dtype) (B, H, T_q_local, 1)
         """
         Pass 1 of Ring Attention: Compute maximum attention scores.
         Iteratively shifts K blocks around the ring and computes partial max scores.
         Args:
-            q_local_f32: Local Q tensor (float32).
-            k_local_f32: Local K tensor (float32).
+            q_compute: Local Q tensor (compute_dtype).
+            k_compute: Local K tensor (compute_dtype), already expanded if GQA/MQA.
             mask_global: Global attention mask.
             q_start_global: Global start index for the Q block.
             valid_len_local: Actual length of the local Q tensor.
         Returns:
-            Maximum scores tensor (float32).
+            Maximum scores tensor (compute_dtype).
         """
 
-        B, H, T_q_local, _ = q_local_f32.shape
-        device = q_local_f32.device
-        dtype = torch.float32
+        B, H, T_q_local, _ = q_compute.shape
+        device = q_compute.device
+        dtype = q_compute.dtype # Use compute_dtype
 
         max_score = torch.full((B, H, T_q_local, 1), -torch.inf, device=device, dtype=dtype) # Use torch.inf
 
         # Indices for the local Q block in the global sequence
         q_indices_global = torch.arange(q_start_global, q_start_global + T_q_local, device=device)
 
-        current_k_block = k_local_f32
-        current_k_len = k_local_f32.shape[2]
+        current_k_block = k_compute # Use the correctly typed variable
+        current_k_len = k_compute.shape[2]
 
         for i in range(self.world_size):
             # Global start index for the current K block in the ring
@@ -363,7 +390,7 @@ class RingAttentionHelper:
             # Only compute scores if the current K block has elements
             if current_k_len > 0:
                  scores = self._compute_attention_scores(
-                    q_local_f32,
+                    q_compute,
                     current_k_block[:, :, :current_k_len, :], # Use sliced K block
                     q_indices_global,
                     k_indices_global,
@@ -384,33 +411,33 @@ class RingAttentionHelper:
 
     def _compute_sums_pass(
         self,
-        q_local_f32: torch.Tensor, # Q (float32) (B, H, T_q_local, D_head)
-        k_local_f32: torch.Tensor, # K (float32) (B, H_kv, T_q_local, D_head)
-        v_local_f32: torch.Tensor, # V (float32) (B, H_kv, T_q_local, D_v)
+        q_compute: torch.Tensor, # Q (compute_dtype) (B, H, T_q_local, D_head)
+        k_compute: torch.Tensor, # K (compute_dtype) (B, H, T_q_local, D_head)
+        v_compute: torch.Tensor, # V (compute_dtype) (B, H, T_q_local, D_v)
         mask_global: Optional[torch.Tensor], # Global mask
         q_start_global: int, # Global start index for Q block
         valid_len_local: int, # Actual length of local Q, K, V
-        max_score: torch.Tensor, # Max scores from Pass 1 (float32) (B, H, T_q_local, 1)
-    ) -> Tuple[torch.Tensor, torch.Tensor]: # Returns numerator, denominator (float32) (B, H, T_q_local, D_v), (B, H, T_q_local, 1)
+        max_score: torch.Tensor, # Max scores from Pass 1 (compute_dtype) (B, H, T_q_local, 1)
+    ) -> Tuple[torch.Tensor, torch.Tensor]: # Returns numerator, denominator (compute_dtype)
         """
         Pass 2 of Ring Attention: Compute numerator and denominator for softmax.
         Iteratively shifts K and V blocks around the ring.
         Args:
-            q_local_f32: Local Q tensor (float32).
-            k_local_f32: Local K tensor (float32).
-            v_local_f32: Local V tensor (float32).
+            q_compute: Local Q tensor (compute_dtype).
+            k_compute: Local K tensor (compute_dtype).
+            v_compute: Local V tensor (compute_dtype).
             mask_global: Global attention mask.
             q_start_global: Global start index for the Q block.
             valid_len_local: Actual length of local Q, K, V.
-            max_score: Max scores from Pass 1 (float32).
+            max_score: Max scores from Pass 1 (compute_dtype).
         Returns:
-            Tuple of (numerator, denominator) tensors (float32).
+            Tuple of (numerator, denominator) tensors (compute_dtype).
         """
 
-        B, H, T_q_local, D_head = q_local_f32.shape
-        D_v = v_local_f32.shape[-1]
-        device = q_local_f32.device
-        dtype = torch.float32 # Accumulation dtype
+        B, H, T_q_local, D_head = q_compute.shape
+        D_v = v_compute.shape[-1]
+        device = q_compute.device
+        dtype = q_compute.dtype # Accumulation dtype
 
         numerator = torch.zeros(B, H, T_q_local, D_v, device=device, dtype=dtype)
         denominator = torch.zeros(B, H, T_q_local, 1, device=device, dtype=dtype)
@@ -418,9 +445,9 @@ class RingAttentionHelper:
         # Indices for the local Q block in the global sequence
         q_indices_global = torch.arange(q_start_global, q_start_global + T_q_local, device=device)
 
-        current_k_block = k_local_f32
-        current_v_block = v_local_f32
-        current_k_len = k_local_f32.shape[2] # K and V should have the same sequence length dimension
+        current_k_block = k_compute
+        current_v_block = v_compute
+        current_k_len = k_compute.shape[2] # K and V should have the same sequence length dimension
 
         for i in range(self.world_size):
             # Global start index for the current K/V block in the ring
@@ -439,7 +466,7 @@ class RingAttentionHelper:
             # Only compute scores if the current K block has elements
             if current_k_len > 0:
                 scores = self._compute_attention_scores(
-                    q_local_f32,
+                    q_compute,
                     current_k_block[:, :, :current_k_len, :], # Use sliced K block
                     q_indices_global,
                     k_indices_global,
@@ -470,14 +497,14 @@ class RingAttentionHelper:
 
     def _compute_attention_scores(
         self,
-        q: torch.Tensor, # Q tensor (float32) (B, H, T_q_local, D_head)
-        k: torch.Tensor, # K tensor (float32) (B, H_kv, T_k_block, D_head)
+        q: torch.Tensor, # Q tensor (compute_dtype) (B, H, T_q_local, D_head)
+        k: torch.Tensor, # K tensor (compute_dtype) (B, H, T_k_block, D_head) - H should match Q
         q_indices_global: torch.Tensor, # Global indices for Q (T_q_local)
         k_indices_global: torch.Tensor, # Global indices for K block (T_k_block)
         mask: Optional[torch.Tensor] = None, # Sliced global mask (B, 1, T_q_local, T_k_block)
         apply_mask: bool = True,
         keep_causal: bool = True # Apply causal mask based on global indices
-    ) -> torch.Tensor: # Returns scores (float32) (B, H, T_q_local, T_k_block)
+    ) -> torch.Tensor: # Returns scores (compute_dtype) (B, H, T_q_local, T_k_block)
         """
         Computes attention scores (Q @ K.T / sqrt(D_head)) and applies masks.
         Args:
@@ -489,7 +516,7 @@ class RingAttentionHelper:
             apply_mask: Whether to apply the `mask`.
             keep_causal: Whether to apply the causal mask based on global indices.
         Returns:
-            Attention scores tensor (float32).
+            Attention scores tensor (compute_dtype).
         """
         B, H, T_q_local, D_head_q = q.shape
         _, _, T_k_block, D_head_k = k.shape
@@ -497,7 +524,7 @@ class RingAttentionHelper:
         # Compute QK^T scaled by head_dim
         # Ensure K is broadcastable if H != H_kv (GQA)
         scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
-        # scores are float32
+        # scores are compute_dtype
 
         # Apply masks
         if apply_mask:
@@ -511,7 +538,11 @@ class RingAttentionHelper:
 
              if keep_causal:
                 # Apply causal mask based on global indices
-                causal_mask = (k_indices_global[None, None, None, :] > q_indices_global[None, None, :, None]) # Shape (1, 1, T_q_local, T_k_block)
+                # Ensure mask is on the same device and boolean
+                causal_mask_bool = (k_indices_global.to(device=q_indices_global.device)[None, None, None, :] > q_indices_global[None, None, :, None])
+                # Fix 5: Verify Mask Application Consistency (using -torch.inf for float types)
+                # The mask from SDPA is often additive (0 for keep, -inf for mask).
+                # .masked_fill uses a boolean mask.
                 scores = scores.masked_fill(causal_mask, -torch.inf) # Use -torch.inf for float32
 
 
@@ -526,9 +557,9 @@ class RingAttentionHelper:
 
     def _update_max_score(
         self,
-        scores: torch.Tensor, # Scores from _compute_attention_scores (float32) (B, H, T_q_local, T_k_block)
-        current_max: torch.Tensor # Current max score (float32) (B, H, T_q_local, 1)
-    ) -> torch.Tensor: # Returns updated max score (float32) (B, H, T_q_local, 1)
+        scores: torch.Tensor, # Scores from _compute_attention_scores (compute_dtype) (B, H, T_q_local, T_k_block)
+        current_max: torch.Tensor # Current max score (compute_dtype) (B, H, T_q_local, 1)
+    ) -> torch.Tensor: # Returns updated max score (compute_dtype) (B, H, T_q_local, 1)
 
         # Compute max for the current block of scores
         # Replace -inf with a very small number before max to avoid issues if all scores are -inf
@@ -541,11 +572,11 @@ class RingAttentionHelper:
 
     def _update_totals(
         self,
-        scores: torch.Tensor, # Scores from _compute_attention_scores (float32) (B, H, T_q_local, T_k_block)
-        v: torch.Tensor, # V block (float32) (B, H_kv, T_k_block, D_v)
-        max_score: torch.Tensor, # Max score from Pass 1 (float32) (B, H, T_q_local, 1)
-        numerator: torch.Tensor, # Current numerator sum (float32) (B, H, T_q_local, D_v)
-        denominator: torch.Tensor # Current denominator sum (float32) (B, H, T_q_local, 1)
+        scores: torch.Tensor, # Scores from _compute_attention_scores (compute_dtype) (B, H, T_q_local, T_k_block)
+        v: torch.Tensor, # V block (compute_dtype) (B, H, T_k_block, D_v) - H should match Q
+        max_score: torch.Tensor, # Max score from Pass 1 (compute_dtype) (B, H, T_q_local, 1)
+        numerator: torch.Tensor, # Current numerator sum (compute_dtype) (B, H, T_q_local, D_v)
+        denominator: torch.Tensor # Current denominator sum (compute_dtype) (B, H, T_q_local, 1)
     ) -> Tuple[torch.Tensor, torch.Tensor]: # Returns updated numerator, denominator
 
         # Compute stable exponentiated scores using max_score from Pass 1

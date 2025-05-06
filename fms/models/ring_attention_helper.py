@@ -75,14 +75,31 @@ class RingAttentionHelper:
         assert valid_len >= 0 and valid_len <= self.block_size, f"Rank {self.rank}: Invalid valid_len: {valid_len}"
 
         B, T_padded, _ = x_norm.shape
-        assert T_padded == self.block_size, f"Rank {self.rank}: Input x_norm to helper forward must be padded to block_size: {T_padded} != {self.block_size}"
+        # T_padded might not always be self.block_size if world_size=1 and seq_len < block_size
+        # However, for ring attention (world_size > 1), inputs to helper.forward are expected to be padded.
+        if self.world_size > 1:
+            assert T_padded == self.block_size, f"Rank {self.rank}: Input x_norm to helper forward must be padded to block_size for multi-GPU: {T_padded} != {self.block_size}"
+
+        # Fix 2.A: Create position_ids if None
+        start_idx_global = self.rank * self.block_size
+        if position_ids is None:
+            # Create position_ids for the padded block, then fill valid part
+            position_ids = torch.full((B, T_padded), fill_value=-1, dtype=torch.long, device=x_norm.device)
+            if valid_len > 0:
+                valid_global_positions = torch.arange(start_idx_global, start_idx_global + valid_len, device=x_norm.device)
+                position_ids[:, :valid_len] = valid_global_positions.unsqueeze(0) # Broadcast if B > 1
+
+        # Fix 2.B: Trim inputs to valid_len BEFORE RoPE computation
+        x_norm_for_rope = x_norm[:, :valid_len, :]
+        position_ids_for_rope = position_ids[:, :valid_len]
+        # residual_for_rope will be used for forward_full's x_block
+        residual_for_rope = residual[:, :valid_len, :] if residual is not None else None
 
         # Compute local QKV and apply RoPE
         q_local_padded, k_local_padded, v_local_padded = self.llama_block.compute_local_qkv_and_rope(
             self.attn, # Pass self.attn
-            q=x_norm, k=x_norm, v=x_norm, # Compute QKV from normalized input shard
-            position_ids=position_ids, # Pass global position_ids
-            # use_cache and past_key_value_state are likely ignored by compute_local_qkv_and_rope in ring context
+            q=x_norm_for_rope, k=x_norm_for_rope, v=x_norm_for_rope, # Use trimmed inputs
+            position_ids=position_ids_for_rope, # Pass trimmed position_ids
             use_cache=False,
             past_key_value_state=None,
             is_self=True
@@ -90,14 +107,16 @@ class RingAttentionHelper:
         B, H, T_padded, D_head = q_local_padded.shape
         assert T_padded == self.block_size, f"Rank {self.rank}: QKV after compute_local_qkv_and_rope must be padded to block_size: {T_padded} != {self.block_size}"
 
-        # Slice to valid length *before* attention computation passes
+        # QKV from compute_local_qkv_and_rope are already effectively valid_len long
+        # because inputs to it were trimmed.
         q_local = q_local_padded[:, :, :valid_len, :]
         k_local = k_local_padded[:, :, :valid_len, :]
         v_local = v_local_padded[:, :, :valid_len, :]
 
-        # Slice x_norm and residual to valid length for post-attention steps
-        x_norm_local_valid = x_norm[:, :valid_len, :]
-        residual_local_valid = residual[:, :valid_len, :] if residual is not None else None
+        # x_norm_local for forward_full should be the trimmed version used for RoPE.
+        # residual_local for forward_full is the trimmed residual_for_rope.
+        x_norm_local_for_ffull = x_norm_for_rope
+        residual_local_for_ffull = residual_for_rope
 
         # Perform the two-pass ring attention computation and post-attention layers
         # forward_full handles the residual connection and FF internally for the valid part
@@ -107,8 +126,8 @@ class RingAttentionHelper:
             v_local=v_local,
             mask_global=mask, # Pass global mask
             valid_len=valid_len, # Pass actual valid length
-            x_block=residual_local_valid, # Pass residual sliced to valid length
-            x_norm_block=x_norm_local_valid, # Pass x_norm sliced to valid length
+            x_block=residual_local_for_ffull, # Pass trimmed residual
+            x_norm_block=x_norm_local_for_ffull, # Pass trimmed x_norm
             q_start_global=self.rank * self.block_size # Pass global start index for Q
         )
 

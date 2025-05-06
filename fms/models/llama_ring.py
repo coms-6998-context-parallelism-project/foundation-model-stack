@@ -7,9 +7,6 @@ import torch.distributed as dist
 # Keep only FMS components used directly in these functions or their type hints
 from fms.models.ring_attention_helper import RingAttentionHelper
 from fms.distributed.strategy import DistributedStrategy, RingAttentionStrategy # Need both for type hints
-from fms.modules.attention import MultiHeadAttention # Needed for attn_data type hint
-from fms.modules.positions import RotaryEmbedding # Needed for type hint in compute_local_qkv_and_rope
-
 
 
 # Assigned to LLaMABlock.forward when RingAttentionStrategy is used
@@ -87,7 +84,3 @@ def _forward_ring_attention(
 
     return output, cache_from_helper, extra_output
 
-# These functions are typically assigned to LLaMABlock in llama.py
-# LLaMABlock.compute_local_qkv_and_rope = compute_local_qkv_and_rope
-# LLaMABlock.forward = forward_ring # Overrides nn.Module.forward for ring case
-# LLaMABlock._forward_ring_attention = _forward_ring_attention

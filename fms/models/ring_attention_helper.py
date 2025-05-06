@@ -21,7 +21,6 @@ EXP_CLAMP_MAX = 10.0
 # `self` refers to the LLaMABlock instance.
 
 def compute_local_qkv_and_rope(
-    self: nn.Module, # LLaMABlock instance
     attn_data: MultiHeadAttention, # self.attn module
     q: torch.Tensor,
     k: Optional[torch.Tensor] = None,
@@ -192,7 +191,7 @@ class RingAttentionHelper:
 
         # Compute local QKV and apply RoPE
         # These will be of shape (B, H, valid_len, D_head) as inputs were trimmed
-        q_local_unpadded, k_local_unpadded, v_local_unpadded = self.llama_block.compute_local_qkv_and_rope(
+        q_local_unpadded, k_local_unpadded, v_local_unpadded = compute_local_qkv_and_rope(
             self.attn, # Pass self.attn
             q=x_norm_for_rope, k=x_norm_for_rope, v=x_norm_for_rope, # Use trimmed inputs
             position_ids=position_ids_for_rope, # Pass trimmed position_ids

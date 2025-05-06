@@ -16,7 +16,6 @@ from fms.distributed.strategy import (
 )
 
 from fms.models.llama_ring import (
-    compute_local_qkv_and_rope,
     forward_ring,
     _forward_ring_attention,
 )
@@ -67,7 +66,6 @@ class LLaMAConfig(ModelConfig):
 
 class LLaMABlock(nn.Module):
 
-    compute_local_qkv_and_rope  = compute_local_qkv_and_rope
     forward                     = forward_ring
     _forward_ring_attention     = _forward_ring_attention
     def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):

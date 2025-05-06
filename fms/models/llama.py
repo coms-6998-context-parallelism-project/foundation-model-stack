@@ -481,6 +481,11 @@ class LLaMA(nn.Module):
             output_after_norm = self.dropout(output_after_norm)
 
         final_output_for_head = output_after_norm
+        
+        # Define world_size for the gather logic
+        current_world_size = 1
+        if isinstance(distributed_strategy, RingAttentionStrategy):
+            current_world_size = distributed_strategy.world_size
         if isinstance(distributed_strategy, RingAttentionStrategy) and world_size > 1:
             # Gather the potentially padded tensor
             gathered_output = distributed_strategy.gather_tensor(output_after_norm, dim=1)

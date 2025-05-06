@@ -28,7 +28,7 @@ DEFAULT_TOKENIZER_REL_PATH = Path("../llama-hf/tokenizer.model")
 if RUN_LOCATION == "insomnia":
     INSOMNIA_BASE_DIR = Path("/insomnia001/depts/edu/COMSE6998/sg3790")
     CURRENT_REPO_DIR = INSOMNIA_BASE_DIR / "foundation-model-stack"
-    SLURM_SCRIPT_PATH = CURRENT_REPO_DIR / "scripts/llama_ring/run_inference.slurm"
+    SLURM_SCRIPT_PATH = CURRENT_REPO_DIR / "scripts/llama_ring/benchmark.slurm" # Use benchmark.slurm
     DEFAULT_MODEL_ABS_PATH = INSOMNIA_BASE_DIR / "llama-hf"
     DEFAULT_TOKENIZER_ABS_PATH = INSOMNIA_BASE_DIR / "llama-hf/tokenizer.model"
 else:
@@ -58,9 +58,9 @@ except Exception:
 home = Path.home()
 
 print("[INFO] Cleaning old outputs…")
-for f in home.glob("inference_insomnia_*.out"):
+for f in home.glob("inference_insomnia_*.out"): # Keep old name pattern for now, or change if desired
     f.unlink(missing_ok=True)
-for f in (CURRENT_REPO_DIR / "testing").glob("inference_local_*.out"):
+for f in (CURRENT_REPO_DIR / "testing").glob("benchmark_local_*.out"): # Change local output name pattern
     f.unlink(missing_ok=True)
 
 # Cleanup handler
@@ -85,7 +85,7 @@ if "--model_path" not in script_args:
 if "--tokenizer" not in script_args:
     script_args += ["--tokenizer", str(DEFAULT_TOKENIZER_ABS_PATH)]
 
-print(f"[INFO] Launching inference with args: {' '.join(script_args)}")
+print(f"[INFO] Launching benchmark with args: {' '.join(script_args)}")
 
 pid = None
 job_id = None
@@ -93,15 +93,13 @@ job_id = None
 if RUN_LOCATION != "insomnia":
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = CURRENT_REPO_DIR / "testing" / f"inference_local_{timestamp}.out"
-    print(f"[INFO] torchrun (nproc=2) → {output_file}")
+    print(f"[INFO] torchrun (nproc=2) benchmark_ring.py → {output_file}")
     with open(output_file, "w") as f:
         process = subprocess.Popen(
             ["torchrun", "--nproc_per_node=2",
-             str(CURRENT_REPO_DIR / "scripts/inference.py"),
+             str(CURRENT_REPO_DIR / "scripts/llama_ring/benchmark_ring.py"), # Target benchmark script
              "--architecture", "llama", "--variant", "7b",
-             "--device_type", "cpu", "--default_dtype", "fp16",
-             "--model_source", "hf", "--no_use_cache",
-             "--distributed", "--distributed_strategy", "ring",
+             "--device_type", "cpu", "--dtype", "float16", # Use --dtype, remove unsupported args
              *script_args],
             stdout=f,
             stderr=subprocess.STDOUT

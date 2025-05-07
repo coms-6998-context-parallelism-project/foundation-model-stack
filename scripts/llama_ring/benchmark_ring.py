@@ -194,7 +194,7 @@ def main():
             print0(f"[INFO] Using prompt: '{prompt}'")
             tokens = tokenizer.tokenize(prompt)
             prompt_ids_list = tokenizer.convert_tokens_to_ids(tokens)
-            prompt_len = len(prompt_ids_list)
+            prompt_len = len(prompt_ids_list[:args.prompt_len])
             print0(f"[INFO] Using prompt length: {prompt_len}")
             # Directly use the tokenized prompt without padding/truncation
             ids_tensor = torch.tensor(prompt_ids_list, dtype=torch.long).unsqueeze(0).repeat(args.batch_size, 1)

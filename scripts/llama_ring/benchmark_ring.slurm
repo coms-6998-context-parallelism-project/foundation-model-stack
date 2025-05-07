@@ -38,4 +38,4 @@ torchrun --nproc_per_node=2 \
   --num_tokens_to_benchmark 30 \
   --batch_size 1 \
   --run_ring_first \
-  --prompt_len 100
+  --prompt_len $1

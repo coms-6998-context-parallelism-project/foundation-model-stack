@@ -167,16 +167,18 @@ class RingAttentionStrategy(DistributedStrategy):
     Ensures tensors gathered across ranks have consistent shapes before concatenation
     and slices the final gathered tensor back to the original input sequence length.
     """
-    block_size = 4096
+    
     def __init__(self, group=None, from_meta=False):
         super().__init__(from_meta)
         assert dist.is_initialized(), "Requires initialized process group"
-        self.block_size = 4096
         self.group = group or dist.GroupMember.WORLD
         self.rank = self.group.rank()
         self.world_size = self.group.size()
         self._original_seq_len = None
         self._local_valid_len = None
+        
+        # Chosen default
+        self.block_size = 4096 
 
     def _distribute_module(self, module: nn.Module, final_layers: bool = False) -> nn.Module:
         return module
@@ -189,8 +191,7 @@ class RingAttentionStrategy(DistributedStrategy):
         target_len = self.block_size
         current_len = x.size(dim)
 
-        if current_len >= target_len:
-            return x
+        assert(current_len <= target_len)
 
         pad_shape = list(x.shape)
         pad_shape[dim] = target_len - current_len
@@ -206,6 +207,8 @@ class RingAttentionStrategy(DistributedStrategy):
 
         batch_size, seq_len = x.size(0), x.size(1)
         self._original_seq_len = seq_len
+        
+        self.block_size = (self._original_seq_len + self.world_size - 1) // self.world_size
 
         start_idx = self.rank * self.block_size
         end_idx = min(start_idx + self.block_size, seq_len)

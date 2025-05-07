@@ -40,20 +40,18 @@ def compute_local_qkv_and_rope(
 
     if attn_data.position_encoder and T > 0:
         assert position_ids is not None
+        # T is valid_len here, and position_ids are the global indices for these valid tokens.
+        # These position_ids (pos_trim from caller) do not contain -1 padding markers.
         if position_ids.shape != (B, T) and not (T == 0 and position_ids.shape == (B, 0)):
             raise AssertionError(f"Expected shape {(B, T)}, got {position_ids.shape}")
-        valid_mask = position_ids != -1
-        if valid_mask.any():
-            max_pos = getattr(attn_data.position_encoder, 'max_position_embeddings', 2048)
-            position_ids_safe = position_ids.clone()
-            position_ids_safe[valid_mask] = position_ids_safe[valid_mask].clamp(0, max_pos - 1)
-            q_rope, k_rope = attn_data.position_encoder.adjusted_qk(queries, keys, position_ids_safe)
-            if valid_mask.all():
-                queries, keys = q_rope, k_rope
-            else:
-                mask = valid_mask.unsqueeze(-1).unsqueeze(-1).expand_as(queries)
-                queries = torch.where(mask, q_rope, queries)
-                keys = torch.where(mask.expand_as(keys), k_rope, keys)
+
+        # Clamp global positions to be within RoPE's precomputed range.
+        # attn_data.position_encoder is an instance of fms.modules.positions.RotaryEmbedding
+        max_len_for_rope = attn_data.position_encoder.max_seq_len
+        position_ids_clamped = position_ids.clamp(0, max_len_for_rope - 1)
+
+        q_rope, k_rope = attn_data.position_encoder.adjusted_qk(queries, keys, position_ids_clamped)
+        queries, keys = q_rope, k_rope # Direct assignment as all tokens in x_trim are valid
 
     return (
         queries.permute(0, 2, 1, 3),
@@ -140,15 +138,19 @@ class RingAttentionHelper:
         if T == 0:
             return torch.empty(B, 0, self.attn.emb_dim, device=q.device, dtype=q.dtype)
 
+        dev = q.device
         accum_dtype = self._accum_dtype
         exp_min, exp_max = _get_clamp_bounds(accum_dtype)
         q_compute = q.to(accum_dtype)
         k_compute = k.to(accum_dtype)
         v_compute = v.to(accum_dtype)
 
-        max_score = self._compute_max_score_pass(q_compute, k_compute, mask, q_start_global, valid_len)
+        # Hoist q_idx computation as it's constant for these passes
+        q_idx = torch.arange(q_start_global, q_start_global + T, device=dev)
+
+        max_score = self._compute_max_score_pass(q_compute, k_compute, mask, q_idx, valid_len)
         num, denom = self._compute_sums_pass(
-            q_compute, k_compute, v_compute, mask, q_start_global, valid_len, max_score, exp_min, exp_max
+            q_compute, k_compute, v_compute, mask, q_idx, valid_len, max_score, exp_min, exp_max
         )
 
         eps = torch.finfo(denom.dtype).eps
@@ -161,18 +163,17 @@ class RingAttentionHelper:
         x = x_block + attn_out
         return self.ff(self.ff_norm(x)) + x
 
-    def _compute_max_score_pass(self, q_compute, k_compute, mask_global, q_start_global, valid_len_local):
+    def _compute_max_score_pass(self, q_compute, k_compute, mask_global, q_idx, valid_len_local):
         B, H, T, _ = q_compute.shape
         dtype = q_compute.dtype
         dev = q_compute.device
         max_score = torch.full((B, H, T, 1), torch.finfo(dtype).min, device=dev, dtype=dtype)
-        q_idx = torch.arange(q_start_global, q_start_global + T, device=dev)
         k_blk, k_len = k_compute, k_compute.shape[2]
 
         for i in range(self.world_size):
             k_start = ((self.rank - i + self.world_size) % self.world_size) * self.block_size
             k_idx = torch.arange(k_start, k_start + k_len, device=dev)
-            m = mask_global[:, :, q_start_global:q_start_global + T, k_start:k_start + k_len] if mask_global is not None else None
+            m = mask_global[:, :, q_idx[0]:q_idx[-1]+1, k_start:k_start + k_len] if mask_global is not None else None
             if k_len > 0:
                 s = self._compute_attention_scores(q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m)
                 max_score = torch.maximum(max_score, s.amax(-1, keepdim=True))
@@ -181,22 +182,21 @@ class RingAttentionHelper:
         return max_score
 
     def _compute_sums_pass(
-        self, q_compute, k_compute, v_compute, mask_global, q_start_global, valid_len_local, max_score, exp_min, exp_max
+        self, q_compute, k_compute, v_compute, mask_global, q_idx, valid_len_local, max_score, exp_min, exp_max
     ):
         B, H, T, Dv = q_compute.shape
         dev = q_compute.device
         dtype = self._accum_dtype
         num = torch.zeros(B, H, T, Dv, device=dev, dtype=dtype)
         den = torch.zeros(B, H, T, 1, device=dev, dtype=dtype)
-        num_comp = torch.zeros_like(num)
-        den_comp = torch.zeros_like(den)
-        q_idx = torch.arange(q_start_global, q_start_global + T, device=dev)
+        num_comp = torch.zeros_like(num) # Kahan summation compensator for numerator
+        den_comp = torch.zeros_like(den) # Kahan summation compensator for denominator
         k_blk, v_blk, k_len = k_compute, v_compute, k_compute.shape[2]
 
         for i in range(self.world_size):
             k_start = ((self.rank - i + self.world_size) % self.world_size) * self.block_size
             k_idx = torch.arange(k_start, k_start + k_len, device=dev)
-            m = mask_global[:, :, q_start_global:q_start_global + T, k_start:k_start + k_len] if mask_global is not None else None
+            m = mask_global[:, :, q_idx[0]:q_idx[-1]+1, k_start:k_start + k_len] if mask_global is not None else None
             if k_len > 0:
                 s = self._compute_attention_scores(q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m)
                 e = torch.exp((s - max_score).clamp(min=exp_min, max=exp_max))

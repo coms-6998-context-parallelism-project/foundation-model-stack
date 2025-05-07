@@ -62,6 +62,7 @@ class LLaMAConfig(ModelConfig):
     rope_theta: float = 10_000.0
     linear_config: Optional[Mapping[str, Any]] = None
     fused_weights: bool = True
+    debug_mode: bool = True # Add this for debugging ring attention
 
 
 class LLaMABlock(nn.Module):
@@ -137,6 +138,7 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
         distributed_strategy: Optional[DistributedStrategy] = None,
+        layer_idx: int = -1, # Added for debug
     ):
 
         if isinstance(distributed_strategy, RingAttentionStrategy):
@@ -151,6 +153,8 @@ class LLaMABlock(nn.Module):
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
                 distributed_strategy=distributed_strategy,
+                debug_label=f"LLaMABlock_Ring_Layer{layer_idx}",
+                layer_idx=layer_idx,
             )
         
 
@@ -420,6 +424,7 @@ class LLaMA(nn.Module):
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
                 distributed_strategy=distributed_strategy, # Pass strategy to the block
+                layer_idx=i, # Pass layer index for debugging
             )
 
             if use_cache:

@@ -98,6 +98,7 @@ class RingAttentionHelper:
         self.rank = strategy.rank
         self.world_size = strategy.world_size
         self.block_size = strategy.block_size
+        self.debug_mode = False # Will be set by LLaMABlock if config.debug_mode is True
 
         self.head_dim = attn_module.emb_kq_per_head
         self.scale = attn_module.scale_factor or math.sqrt(self.head_dim)
@@ -137,8 +138,13 @@ class RingAttentionHelper:
             k = k.unsqueeze(2).expand(-1, -1, e, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_kq_per_head)
             v = v.unsqueeze(2).expand(-1, -1, e, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_v_per_head)
 
-        out_valid = self.forward_full(q, k, v, mask, valid_len, res_trim, x_trim, start)
-        return (_pad_to_block(out_valid, self.block_size, dim=1), None, None) if self.world_size > 1 else (out_valid, None, None)
+        # forward_full now returns (output, debug_data_ring_if_any)
+        out_valid, debug_info_ring = self.forward_full(q, k, v, mask, valid_len, res_trim, x_trim, start)
+        
+        padded_output = _pad_to_block(out_valid, self.block_size, dim=1) if self.world_size > 1 else out_valid
+        
+        # The cache part is None for now.
+        return padded_output, None, debug_info_ring
 
     def forward_full(self, q, k, v, mask, valid_len, x_block, x_norm_block, q_start_global):
         B, H, T, D_kq = q.shape # T is the local query length for this rank
@@ -179,8 +185,53 @@ class RingAttentionHelper:
             attn_out = torch.empty(B, 0, self.attn.emb_dim, device=q.device, dtype=q.dtype)
 
         # x_block has shape (B, T, E). If T=0, it's (B, 0, E).
-        x = x_block + attn_out
-        return self.ff(self.ff_norm(x)) + x
+        # This is the first residual connection
+        residual1_ring = x_block + attn_out 
+        
+        # Feedforward part
+        ff_ln_out_ring = self.ff_norm(residual1_ring)
+        ff_out_raw_ring = self.ff(ff_ln_out_ring)
+
+        # Second residual connection
+        block_output_ring = residual1_ring + ff_out_raw_ring
+
+        debug_data_ring = None
+        if self.debug_mode:
+            debug_data_ring = {}
+            # Ensure tensors are detached, cloned, and on CPU for comparison
+            # These correspond to the keys in _compare_debug_data
+            if T > 0 or (x_norm_block is not None and x_norm_block.numel() == 0 and T == 0) : # Collect if valid tokens or explicitly empty for T=0
+                debug_data_ring["ring_x_norm_r0"] = x_norm_block.detach().clone().cpu()
+                debug_data_ring["ring_q_local_r0"] = q.detach().clone().cpu()
+                debug_data_ring["ring_k_local_r0"] = k.detach().clone().cpu()
+                debug_data_ring["ring_v_local_r0"] = v.detach().clone().cpu()
+                debug_data_ring["ring_attn_out_raw_r0"] = attn_out.detach().clone().cpu()
+                debug_data_ring["ring_attn_out_residual_r0"] = residual1_ring.detach().clone().cpu()
+                debug_data_ring["ring_ff_ln_out_r0"] = ff_ln_out_ring.detach().clone().cpu()
+                debug_data_ring["ring_ff_out_raw_r0"] = ff_out_raw_ring.detach().clone().cpu()
+                debug_data_ring["ring_block_output_r0"] = block_output_ring.detach().clone().cpu()
+            else: # Handle T=0 case by creating correctly shaped empty tensors if x_norm_block was None (should not happen if B>0)
+                  # This branch might be less critical if comparison handles missing keys or T=0 correctly based on numel()
+                _B_debug, _H_debug, _, _D_kq_debug = q.shape # Use actual B, H, D from q
+                _E_debug = self.attn.emb_dim if hasattr(self.attn, 'emb_dim') else (H * D_kq if H * D_kq > 0 else x_norm_block.shape[-1] if x_norm_block is not None else 0) # Infer E
+                
+                # Create empty tensors with correct rank and device/dtype based on actual inputs
+                cpu_dev = torch.device('cpu')
+                empty_bte = lambda dt: torch.empty(B, 0, _E_debug, device=cpu_dev, dtype=dt)
+                empty_bhtd_q = lambda dt: torch.empty(B, H, 0, D_kq, device=cpu_dev, dtype=dt) # q,k
+                empty_bhtd_v = lambda dt: torch.empty(B, H, 0, v.shape[-1], device=cpu_dev, dtype=v.dtype) # v
+
+                debug_data_ring["ring_x_norm_r0"] = empty_bte(x_norm_block.dtype) if x_norm_block is not None else torch.empty(0, device=cpu_dev)
+                debug_data_ring["ring_q_local_r0"] = empty_bhtd_q(q.dtype)
+                debug_data_ring["ring_k_local_r0"] = empty_bhtd_q(k.dtype)
+                debug_data_ring["ring_v_local_r0"] = empty_bhtd_v(v.dtype)
+                debug_data_ring["ring_attn_out_raw_r0"] = empty_bte(attn_out.dtype)
+                debug_data_ring["ring_attn_out_residual_r0"] = empty_bte(residual1_ring.dtype)
+                debug_data_ring["ring_ff_ln_out_r0"] = empty_bte(ff_ln_out_ring.dtype)
+                debug_data_ring["ring_ff_out_raw_r0"] = empty_bte(ff_out_raw_ring.dtype)
+                debug_data_ring["ring_block_output_r0"] = empty_bte(block_output_ring.dtype)
+
+        return block_output_ring, debug_data_ring
 
     def _compute_max_score_pass(self, q_compute, k_compute, mask_global, q_start_global, valid_len_local):
         B, H, T, _ = q_compute.shape

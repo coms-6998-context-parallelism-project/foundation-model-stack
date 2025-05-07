@@ -103,7 +103,7 @@ class RotaryEmbedding(PositionEncoder):
         self,
         dim: int,
         ratio: float = 10_000.0,
-        max_seq_len=2048,
+        max_seq_len=4096,
         ntk_scaling=False,
         partial_rope=1.0,
     ):

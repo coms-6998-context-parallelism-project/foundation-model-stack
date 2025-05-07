@@ -1,4 +1,4 @@
-from typing import List, Tuple, Dict, Optional, Union, Any
+from typing import Tuple, Optional, Any
 from fms.modules.attention import MultiHeadAttention
 import torch
 import torch.distributed as dist
@@ -25,8 +25,6 @@ def compute_local_qkv_and_rope(
     k: Optional[torch.Tensor] = None,
     v: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
-    use_cache: bool = False,
-    past_key_value_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     is_self: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, E = q.shape
@@ -84,7 +82,6 @@ class RingAttentionHelper:
         attn_module: nn.Module,
         strategy: Any,
         llama_block: nn.Module,
-        use_cache: bool = False,
         ff: Optional[nn.Module] = None,
         ff_norm: Optional[nn.Module] = None,
     ):
@@ -92,7 +89,6 @@ class RingAttentionHelper:
         self.ff = ff
         self.ff_norm = ff_norm
         self.strategy = strategy
-        self.use_cache = use_cache
         self.llama_block = llama_block
 
         self.rank = strategy.rank
@@ -110,11 +106,10 @@ class RingAttentionHelper:
         strategy,
         mask=None,
         position_ids=None,
-        past_key_value_state=None,
         is_causal_mask=False,
         valid_len=0,
         residual=None,
-    ):
+    ) -> torch.Tensor:
         assert isinstance(strategy, RingAttentionStrategy) and self.strategy is strategy
         B, T_padded, _ = x_norm.shape
         if self.world_size > 1:
@@ -138,7 +133,7 @@ class RingAttentionHelper:
             v = v.unsqueeze(2).expand(-1, -1, e, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_v_per_head)
 
         out_valid = self.forward_full(q, k, v, mask, valid_len, res_trim, x_trim, start)
-        return (_pad_to_block(out_valid, self.block_size, dim=1), None, None) if self.world_size > 1 else (out_valid, None, None)
+        return _pad_to_block(out_valid, self.block_size, dim=1) if self.world_size > 1 else out_valid
 
     def forward_full(self, q, k, v, mask, valid_len, x_block, x_norm_block, q_start_global):
         B, H, T, D = q.shape

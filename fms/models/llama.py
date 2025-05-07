@@ -17,7 +17,6 @@ from fms.distributed.strategy import (
 
 from fms.models.llama_ring import (
     forward_ring,
-    _forward_ring_attention,
 )
 
 
@@ -71,9 +70,6 @@ class LLaMABlock(nn.Module):
         self.config = config
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
-
-        # Make _forward_ring_attention available as an instance method
-        self._forward_ring_attention = _forward_ring_attention.__get__(self, LLaMABlock)
 
         self.ln = LayerNormParameterized(
             self.config.emb_dim,
@@ -137,6 +133,7 @@ class LLaMABlock(nn.Module):
         is_causal_mask=False,
         attn_algorithm=None,
         distributed_strategy: Optional[DistributedStrategy] = None,
+        layer_idx: Optional[int] = None, # Add layer_idx for debug purposes
     ):
         
         if isinstance(distributed_strategy, RingAttentionStrategy):
@@ -146,8 +143,6 @@ class LLaMABlock(nn.Module):
                 x,
                 mask=mask,
                 position_ids=position_ids,
-                past_key_value_state=past_key_value_state,
-                use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
                 distributed_strategy=distributed_strategy,
@@ -418,6 +413,7 @@ class LLaMA(nn.Module):
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
                 distributed_strategy=distributed_strategy, # Pass strategy to the block
+                layer_idx=i, # Pass the current layer index
             )
 
             if use_cache:

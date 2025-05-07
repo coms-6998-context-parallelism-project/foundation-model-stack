@@ -226,7 +226,6 @@ class RingAttentionHelper:
         k_blk, v_blk, k_len = k_full, v_full, k_full.shape[2]
         start_idx = ((self.rank) % self.world_size) * self.block_size
         total_min = total_max = 0
-        stats = {}
         for i in range(self.world_size):
             k_idx = torch.arange(start_idx, start_idx + k_len, device=dev)
             m = mask[:, :, q_start:q_start+T, start_idx:start_idx+k_len] if mask is not None else None
@@ -241,15 +240,19 @@ class RingAttentionHelper:
                 y = contrib_num - num_comp; t = num + y; num_comp = (t - num) - y; num = t
                 y = contrib_den - den_comp; t = den + y; den_comp = (t - den) - y; den = t
                 if can_debug and i == 0:
+                    # Populate the scores and probabilities for the first k-block
+                    # `prefix` is the main debug key prefix (e.g., "ring_r0")
+                    debug_dict[f"{prefix}_sdp_scores_kblock0"] = s.clone().cpu()
+                    debug_dict[f"{prefix}_sdp_probs_kblock0"] = e.clone().cpu() # `e` is P_unnorm = exp(S-max(S))
+
                     total_min += (clamp == exp_min).sum().item()
                     total_max += (clamp == exp_max).sum().item()
-                    if T > 0: # Guard against zero-sized dimension for reduction
-                        stats_updates = {
-                            'max': e.view(B, H, -1).max(-1)[0].mean(0).cpu(),
-                            'min': e.view(B, H, -1).min(-1)[0].mean(0).cpu(),
-                            'mean': e.view(B, H, -1).mean(-1).mean(0).cpu()
-                        }
-                        stats.update(stats_updates) # stats is initialized as {} before the loop
+                    # The 'stats' dictionary (max/min/mean of e) is not directly consumed by _compare_debug_data
+                    # for the _sdp_probs_kblock0 key. If these stats are needed for other debug purposes,
+                    # they should be stored under a different key.
+                    # For now, we remove the population of the 'stats' variable as it's not used for the
+                    # primary comparison keys and was the source of the AttributeError.
+
             if i < self.world_size - 1:
                 k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, k_len)
                 v_blk, _ = self._ring_shift_tensor(v_blk, self.block_size, k_len)
@@ -257,8 +260,8 @@ class RingAttentionHelper:
         if can_debug:
             debug_dict[f"{prefix}_clamped_min_total_count"] = torch.tensor(total_min).cpu()
             debug_dict[f"{prefix}_clamped_max_total_count"] = torch.tensor(total_max).cpu()
-            # Align key with what _compare_debug_data expects for SDP_Probs_K0
-            debug_dict[f"{prefix}_sdp_probs_kblock0"] = stats
+            # The keys _sdp_scores_kblock0 and _sdp_probs_kblock0 are now populated
+            # inside the loop when i == 0.
             debug_dict[f"{prefix}_kahan_num_comp_norm"] = torch.linalg.norm(num_comp.float()).cpu()
             debug_dict[f"{prefix}_kahan_den_comp_norm"] = torch.linalg.norm(den_comp.float()).cpu()
         return num, den

@@ -135,25 +135,29 @@ def _forward_ring_attention(self: nn.Module, x: torch.Tensor, *, mask: Optional[
     if self.config.debug_mode and layer_idx==self.config.debug_target_layer:
         nr_container = [None]
         # Gather shards
-        shards = [torch.empty_like(x) for _ in range(strategy.world_size)]
-        dist.all_gather(shards, x, group=strategy.group)
+        # x is the local activation shard, shape (B, T_block_size, E)
+        activation_shards_for_debug = [torch.empty_like(x) for _ in range(strategy.world_size)]
+        dist.all_gather(activation_shards_for_debug, x.contiguous(), group=strategy.group)
+
         # Gather position_ids shards
-        # Gather position_ids shards — make recv‑buffers match the dtype of what we send
+        # The local `position_ids` variable is (B, T_block_size), torch.long,
+        # or None if the argument `position_ids` was None and `valid_len` was 0.
+        # T is x.shape[1], which is strategy.block_size.
         if position_ids is not None:
-            gather_src = position_ids
-        else:
-            # explicit dtype=int64 so empty_like below has the right dtype
-            gather_src = torch.full((B, T), -1, dtype=torch.int64, device=x.device)
-        psh = [torch.empty_like(gather_src) for _ in range(strategy.world_size)]
-        dist.all_gather(psh, gather_src, group=strategy.group)
+            current_rank_pos_ids_tensor = position_ids
+        else: # This case occurs if arg position_ids was None AND valid_len was 0.
+            current_rank_pos_ids_tensor = torch.full((B, T), -1, dtype=torch.long, device=x.device)
+
+        pos_ids_shards_for_debug = [torch.empty_like(current_rank_pos_ids_tensor) for _ in range(strategy.world_size)]
+        dist.all_gather(pos_ids_shards_for_debug, current_rank_pos_ids_tensor.contiguous(), group=strategy.group)
 
         # On rank 0, reconstruct and compute shadow pass
         if rank == 0:
             orig_len = getattr(strategy, '_original_seq_len', None)
-            xg = torch.cat(shards, dim=1)
+            xg = torch.cat(activation_shards_for_debug, dim=1)
             if orig_len is not None and xg.size(1) > orig_len:
                 xg = xg[:, :orig_len, :]
-            pg = torch.cat(psh, dim=1)
+            pg = torch.cat(pos_ids_shards_for_debug, dim=1)
             if orig_len is not None and pg.size(1) > orig_len:
                 pg = pg[:, :orig_len]
             self.eval()

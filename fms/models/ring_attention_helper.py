@@ -280,7 +280,7 @@ class RingAttentionHelper:
             # log_stats(attn_manual, "ATTN_MANUAL")
             # log_stats(attn_sdpa, "ATTN_SDPA")
 
-            compare_tensors("ATTN_COMPARE",attn_manual, attn_sdpa, threshold=1e-7)
+            # compare_tensors("ATTN_COMPARE",attn_manual, attn_sdpa, threshold=1e-7)
 
             # diff = (attn_manual - attn_sdpa).abs()
             # print(f"[ATTN_DIFF] max={diff.max().item():.4e}, mean={diff.mean().item():.4e}, "

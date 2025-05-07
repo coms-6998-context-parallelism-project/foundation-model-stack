@@ -61,7 +61,8 @@ def _compare_debug_data(
     strategy: RingAttentionStrategy, 
     layer_idx: int, 
     tolerance: float, 
-    print_values: bool,
+    print_values: bool, # This was the 6th positional argument
+    print_matches: bool, # This should be the 7th positional argument
     current_rank_for_comparison: int, # New parameter
     current_rank_ring_key_prefix: str # New parameter (e.g., "ring_r0")
 ):
@@ -418,6 +419,7 @@ def _forward_ring_attention(
     layer_idx: int = -1, # Default, will be overridden
     # New debug parameters from forward_ring
     debug_dict_populate: Optional[dict] = None,
+    debug_print_matches: bool = False, # Add missing parameter
     debug_key_prefix_populate: str = "",
     debug_print_values: bool = False,
     debug_tolerance: float = 1e-3,
@@ -431,13 +433,14 @@ def _forward_ring_attention(
     rank = strategy.rank # Get rank from strategy
     correct_valid_len = strategy.get_local_valid_len() # Valid tokens on this rank
 
+    B, T_padded, _ = x.shape # Define B and T_padded from input x
+
     # Construct a debug label if needed for print statements, using layer_idx
     local_debug_label = f"L{layer_idx}_R{rank}"
 
-    # Handle position_ids consistently:
     # Rank 0 determines global position_ids if not provided, then all ranks get their shard.
-    # This ensures RoPE uses consistent positions.
-    if position_ids is None and valid_len > 0: # If this rank has valid tokens and no pos_ids
+    # This ensures RoPE uses consistent positions. # Use correct_valid_len here
+    if position_ids is None and correct_valid_len > 0: # If this rank has valid tokens and no pos_ids
         # Create local portion of global position_ids if they are None
         # This will be used by RingAttentionHelper.forward if it needs to construct them.
         # However, for the shadow pass, we need the true global ones.
@@ -449,7 +452,7 @@ def _forward_ring_attention(
             dtype=torch.long, device=x.device
         ).unsqueeze(0).expand(B, -1)
         # Mask out padding positions for these locally generated IDs
-        pad_mask = torch.arange(T_padded, device=x.device).expand(B, -1) >= valid_len
+        pad_mask = torch.arange(T_padded, device=x.device).expand(B, -1) >= correct_valid_len
         position_ids[pad_mask] = -1 # Mark padding positions
     
     # For the shadow pass, global_position_ids will be reconstructed/used on rank 0.
@@ -499,6 +502,7 @@ def _forward_ring_attention(
         # Pass the debug parameters
         debug_dict_populate=debug_dict_populate,
         debug_key_prefix_populate=debug_key_prefix_populate,
+        # debug_print_matches is not directly used by ring_helper.forward currently
         layer_idx=layer_idx, # Pass layer_idx 
         debug_print_values=debug_print_values,
         debug_tolerance=debug_tolerance,
@@ -531,15 +535,25 @@ def _forward_ring_attention(
         print(f"DEBUG ({local_debug_label}, Rank {rank}) AFTER all_gather for x_gathered_shards.")
         sys.stdout.flush()
 
-        pos_ids_gathered_shards_list = None # Use a list to handle None case for broadcast
-        if position_ids is not None:
-            pos_ids_gathered_shards = [torch.empty_like(position_ids) for _ in range(world_size)]
-            print(f"DEBUG ({local_debug_label}, Rank {rank}) BEFORE all_gather for pos_ids_gathered_shards.")
-            sys.stdout.flush()
-            dist.all_gather(pos_ids_gathered_shards, position_ids, group=strategy.group)
-            print(f"DEBUG ({local_debug_label}, Rank {rank}) AFTER all_gather for pos_ids_gathered_shards.")
-            sys.stdout.flush()
-            pos_ids_gathered_shards_list = pos_ids_gathered_shards # Store the list of tensors
+        # Ensure every rank has a tensor of the same shape for pos_ids all_gather
+        local_pos_ids_for_gather = position_ids
+        if local_pos_ids_for_gather is None:
+            # Create a dummy placeholder of shape [B, T_padded]
+            # B and T_padded are defined from x.shape earlier in the function
+            local_pos_ids_for_gather = torch.full(
+                (B, T_padded), 
+                -1, 
+                dtype=torch.long, 
+                device=x.device
+            )
+        
+        pos_ids_gathered_shards = [torch.empty_like(local_pos_ids_for_gather) for _ in range(world_size)]
+        print(f"DEBUG ({local_debug_label}, Rank {rank}) BEFORE all_gather for pos_ids_gathered_shards. Shape of local_pos_ids_for_gather: {local_pos_ids_for_gather.shape}")
+        sys.stdout.flush()
+        dist.all_gather(pos_ids_gathered_shards, local_pos_ids_for_gather, group=strategy.group)
+        print(f"DEBUG ({local_debug_label}, Rank {rank}) AFTER all_gather for pos_ids_gathered_shards.")
+        sys.stdout.flush()
+        pos_ids_gathered_shards_list = pos_ids_gathered_shards # This is now a list of tensors from all ranks
 
         if rank == 0: # Rank 0 performs the shadow pass
             orig_seq_len = strategy._original_seq_len if hasattr(strategy, '_original_seq_len') else -1
@@ -602,11 +616,12 @@ def _forward_ring_attention(
                 # and _compare_debug_data will prepend current_rank_ring_key_prefix.
                 _compare_debug_data(
                     debug_info_no_ring_for_comparison, 
-                    debug_dict_populate, # This is the current rank's populated dict
-                    strategy, 
-                    layer_idx, 
-                    debug_tolerance, 
-                    debug_print_values,
+                    debug_ring_current_rank=debug_dict_populate,
+                    strategy=strategy, 
+                    layer_idx=layer_idx, 
+                    tolerance=debug_tolerance,
+                    print_values=debug_print_values,
+                    print_matches=debug_print_matches, 
                     current_rank_for_comparison=rank, # Pass current rank
                     current_rank_ring_key_prefix=current_rank_ring_key_prefix # Pass the prefix
                 )

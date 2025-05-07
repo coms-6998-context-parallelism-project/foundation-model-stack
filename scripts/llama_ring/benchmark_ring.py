@@ -212,7 +212,7 @@ def main():
     ids = None
 
     # Define N values for prompt generation
-    prompt_n_values = [10, 20, 50, 100, 200, 300, 400, 500]
+    prompt_n_values = [10, 20, 50, 100, 200, 300, 400]
 
     # Define strategies to benchmark
     strategies_to_benchmark = [("Ring Attention", "ring"), ("Regular Attention", NoOpStrategy)]

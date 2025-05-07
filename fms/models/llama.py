@@ -1,8 +1,8 @@
 import logging
 import re
-from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional, Tuple
-
+from dataclasses import dataclass, field # Import field
+from typing import Any, List, Mapping, Optional, Tuple, Union # Added Union
+import sys # For flushing stdout, useful for debugging
 from fms.models.ring_attention_helper import RingAttentionHelper
 import torch
 import torch.nn as nn
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class LLaMAConfig(ModelConfig):
+class LLaMAConfig(ModelConfig): # type: ignore
     src_vocab_size: int = 32_000  # can be set by tokenizer
     emb_dim: int = 4096
     norm_eps: float = 1e-5
@@ -62,13 +62,19 @@ class LLaMAConfig(ModelConfig):
     rope_theta: float = 10_000.0
     linear_config: Optional[Mapping[str, Any]] = None
     fused_weights: bool = True
+    # Debugging fields
+    debug_mode: bool = field(default=True, metadata={"help": "Enable debug mode for tensor comparison"}) # Default to True for easier testing
+    debug_target_layer: Optional[int] = field(default=0, metadata={"help": "Specific layer to debug (e.g., 0 for the first layer)"}) # Default to 0
+    debug_print_values: bool = field(default=False, metadata={"help": "Print tensor values during debug comparison"})
+    debug_tolerance: float = field(default=1e-3, metadata={"help": "Tolerance for tensor comparison in debug mode"})
 
 
 class LLaMABlock(nn.Module):
 
-    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
+    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding, layer_idx: int = -1): # Added layer_idx
         super(LLaMABlock, self).__init__()
         self.config = config
+        self.layer_idx = layer_idx # Store layer index
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
 
@@ -128,39 +134,47 @@ class LLaMABlock(nn.Module):
 
     def forward(
         self,
-        x,
+        x: torch.Tensor,
         *,
-        mask=None,
-        position_ids=None,
-        past_key_value_state=None,
-        use_cache=False,
-        is_causal_mask=False,
-        attn_algorithm=None,
+        mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        is_causal_mask: bool = False,
+        attn_algorithm: Optional[str] = None,
         distributed_strategy: Optional[DistributedStrategy] = None,
-    ):
+        # New parameters for debug dict population (only used by forward_ring for now)
+        debug_dict_ring: Optional[dict] = None, 
+        debug_key_prefix_ring: str = "",
+        # layer_idx_for_debug is passed from LLaMA._helper
+        layer_idx_for_debug: int = -1
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
 
-        if isinstance(distributed_strategy, RingAttentionStrategy):
+        effective_strategy = distributed_strategy if distributed_strategy is not None else NoOpStrategy()
+
+        if isinstance(effective_strategy, RingAttentionStrategy):
             # print(torch.distributed.get_rank(), x.shape)
             return forward_ring(
-                self,
-                x,
+                self, # LLaMABlock instance
+                x,    # Expects sharded input
                 mask=mask,
-                position_ids=position_ids,
+                position_ids=position_ids, # Expects sharded position_ids
                 past_key_value_state=past_key_value_state,
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
-                distributed_strategy=distributed_strategy,
+                distributed_strategy=effective_strategy, # Pass the RingAttentionStrategy
+                # Pass the ring-specific debug dict and prefix for population
+                # These will be used by the _forward_ring_attention and RingAttentionHelper
+                debug_dict_populate=debug_dict_ring, 
+                debug_key_prefix_populate=debug_key_prefix_ring,
+                debug_print_values=self.config.debug_print_values, # from block's config
+                debug_tolerance=self.config.debug_tolerance,     # from block's config
+                layer_idx=self.layer_idx # Use the block's own layer_idx
             )
         
-
-
         # if the cache is not empty, we need to get the kv cache for self and cross attention
         self_attn_past_key_value = past_key_value_state
-        # if past_key_value_state is not None:
-        #     self_attn_past_key_value = past_key_value_state[:2]
-        # else:
-        #     self_attn_past_key_value = None
 
         # first we do MHA and Add&Norm
         residual = x
@@ -206,10 +220,14 @@ class LLaMA(nn.Module):
         **kwargs,
     ):
         super(LLaMA, self).__init__()
+        # Ensure NoOpStrategy is instanced if passed as class
+        if distributed_strategy == NoOpStrategy:
+            distributed_strategy = NoOpStrategy()
+
         if config is not None:
             self.config = config
         else:
-            self.config = LLaMAConfig()
+            self.config = LLaMAConfig() # Create default if None
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
 
@@ -246,21 +264,29 @@ class LLaMA(nn.Module):
             max_seq_len=self.config.max_expected_seq_len,
             ratio=self.config.rope_theta,
         )
-        # RoPE init
-        for device in set(
-            [param.device for param in self.parameters()]
-            + [buffer.device for buffer in self.buffers()]
-        ):
-            self.rot_emb.compute_freqs_cis(device, self.config.max_expected_seq_len)
+        # RoPE init should happen after model is moved to device, in post_init typically.
+        # Initializing on default device if available, post_init will handle proper device.
+        try:
+            # Check if parameters exist and get a device
+            # This might fail if called before model is fully initialized or moved to device
+            if len(list(self.parameters())) > 0:
+                 dev = next(self.parameters()).device
+                 if dev != torch.device("meta"): # Don't compute for meta device
+                    self.rot_emb.compute_freqs_cis(dev, self.config.max_expected_seq_len)
+        except StopIteration: # No parameters yet
+            pass # Will be handled in post_init
+
 
         layers = []
         for i in range(self.config.nlayers):
-            block: nn.Module = LLaMABlock(self.config, self.rot_emb)
+            # Pass layer_idx to LLaMABlock
+            block: nn.Module = LLaMABlock(self.config, self.rot_emb, layer_idx=i)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
 
         dec_norm = LayerNormParameterized(
+
             self.config.emb_dim,
             elementwise_scale=True,
             elementwise_shift=False,
@@ -272,7 +298,7 @@ class LLaMA(nn.Module):
             dec_norm, final_layers=True
         )
 
-        if self.config.p_dropout:
+        if self.config.p_dropout: # Use config.p_dropout consistently
             self.dropout = nn.Dropout(self.config.p_dropout)
 
     def get_config(self) -> LLaMAConfig:
@@ -335,7 +361,8 @@ class LLaMA(nn.Module):
         # remove meta tensors from cached_freqs
         for dev in list(cached_freqs.keys()):
             for alp in list(cached_freqs[dev].keys()):
-                if cached_freqs[dev][alp].device == torch.device("meta"):
+                # Check if the tensor is on meta device
+                if hasattr(cached_freqs[dev][alp], 'device') and cached_freqs[dev][alp].device == torch.device("meta"):
                     del cached_freqs[dev][alp]
                     if len(cached_freqs[dev]) == 0:
                         del cached_freqs[dev]
@@ -346,12 +373,14 @@ class LLaMA(nn.Module):
         # fully initalized on the correct device
 
         # if this model ties weights, they are tied here
-        if self.config.tie_heads:
-            # handle assignment of non-meta weights to meta parameters
-            if self.shared.head.weight.device == torch.device("meta"):
-                self.shared.head.weight = self.shared.emb.weight
-            else:
-                self.shared.emb.weight = self.shared.head.weight
+        if self.config.tie_heads and hasattr(self.shared, 'head') and hasattr(self.shared, 'emb'):
+            # Handle assignment of non-meta weights to meta parameters
+            if self.shared.head.weight.device == torch.device("meta") and \
+               self.shared.emb.weight.device != torch.device("meta"):
+                self.shared.head.weight = self.shared.emb.weight # type: ignore
+            elif self.shared.emb.weight.device == torch.device("meta") and \
+                 self.shared.head.weight.device != torch.device("meta"):
+                self.shared.emb.weight = self.shared.head.weight # type: ignore
 
         self._clean_up_rot_emb_cache(
             self.rot_emb.cached_freqs,
@@ -359,29 +388,30 @@ class LLaMA(nn.Module):
         )
 
         # init RoPE on the right device(s)
-        for device in set(
-            [param.device for param in self.parameters()]
-            + [buffer.device for buffer in self.buffers()]
-        ):
-            self.rot_emb.compute_freqs_cis(device, self.config.max_expected_seq_len)
+        devices = set()
+        for param in self.parameters():
+            devices.add(param.device)
+        for buffer in self.buffers(): # type: ignore
+            devices.add(buffer.device)
+        
+        for device in devices:
+            if device != torch.device("meta"): # Don't compute for meta device
+                self.rot_emb.compute_freqs_cis(device, self.config.max_expected_seq_len)
 
     def _helper(
         self,
-        x_in,
-        mask=None,
-        position_ids=None,
-        past_key_value_states=None,
-        use_cache=False,
-        attn_algorithm=None,
-        distributed_strategy: Optional[DistributedStrategy] = None,
+        x_in: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value_states: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        use_cache: bool = False,
+        attn_algorithm: Optional[str] = None,
     ):
-        # Embed the given vocabulary indices using the given attention mask, with pre-/post-norm and dropout as specified
-        # x_in: batch_size x seq_len
-        # mask: batch_size x seq_len x seq_len
-        # bias: nheads x seq_len x seq_len
+        active_strategy = self.distributed_strategy
+
         original_seq_len = x_in.size(1) # Capture original sequence length
         if past_key_value_states is None or len(past_key_value_states) == 0:
-            past_key_value_states = [None for _ in range(len(self.layers))]
+            past_key_value_states = [None for _ in range(len(self.layers))] # type: ignore
 
         qlen = x_in.size(1)
         klen = x_in.size(1)
@@ -389,56 +419,85 @@ class LLaMA(nn.Module):
         # if we are using the cache, the key length needs to be extended with the past keys length
         if use_cache and past_key_value_states[0] is not None:
             klen += past_key_value_states[0][0].size(-2)
-
         # if mask is none, we need to specify causal mask
         if mask is None:
-            # we are caching and can assume all 1s in the mask
-            if use_cache and klen != 1 and qlen == 1:
-                # b x h x qlen x kvlen
-                is_causal_mask = False
-            else:
-                is_causal_mask = True
+            is_causal_mask = not (use_cache and klen != 1 and qlen == 1)
         else:
             is_causal_mask = False
 
-        x_in = self.shared(x_in)
+        current_x = self.shared(x_in) # current_x is (B, T, E) and global
 
-        if isinstance(distributed_strategy, RingAttentionStrategy):
-            x_in = self.distributed_strategy.shard_input(x_in)
-
-
-        # this is the output cache for all the decoder layers
         present_key_value_states = []
 
-        for i, layer in enumerate(self.layers):
-            output = layer(
-                x=x_in,
+        for i, layer_module in enumerate(self.layers): # Renamed `layer` to `layer_module`
+            # Debug related setup
+            is_target_debug_layer = (self.config.debug_mode and i == self.config.debug_target_layer)
+            current_rank = active_strategy.rank if hasattr(active_strategy, 'rank') else 0
+            is_debug_orchestration_rank = (is_target_debug_layer and current_rank == 0)
+
+            debug_data_standard_this_layer = {} if is_debug_orchestration_rank else None
+            debug_data_ring_this_layer = {} if is_debug_orchestration_rank and isinstance(active_strategy, RingAttentionStrategy) else None
+
+            # --- Standard Path Debug Run (on Rank 0 if RingAttention is active and being debugged) ---
+            # This part is simplified: it's now handled within _forward_ring_attention in llama_ring.py
+            # LLaMA._helper will only pass down the debug_data_ring_this_layer for population.
+            # The shadow pass and comparison logic is encapsulated in llama_ring.py.
+
+            # --- Actual Path (Ring or Standard) Execution ---
+            input_for_this_layer = current_x
+            pos_ids_for_this_layer = position_ids
+
+            if isinstance(active_strategy, RingAttentionStrategy):
+                if hasattr(active_strategy, 'shard_input'):
+                    input_for_this_layer = active_strategy.shard_input(current_x) # type: ignore
+                else:
+                    logger.warning(f"Rank {current_rank}: RingAttentionStrategy does not have shard_input method. Passing global input to layer {i}.")
+                
+                if position_ids is not None:
+                    if hasattr(active_strategy, 'shard_input'): # Assuming shard_input can handle position_ids or a similar method exists
+                        pos_ids_for_this_layer = active_strategy.shard_input(position_ids) # type: ignore
+                    else:
+                        logger.warning(f"Rank {current_rank}: RingAttentionStrategy does not have shard_input for position_ids. Passing global position_ids to layer {i}.")
+            
+            layer_output = layer_module(
+                x=input_for_this_layer, 
                 mask=mask,
-                position_ids=position_ids,
+                position_ids=pos_ids_for_this_layer,
                 past_key_value_state=past_key_value_states[i],
                 use_cache=use_cache,
                 is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
-                distributed_strategy=distributed_strategy, # Pass strategy to the block
+                distributed_strategy=active_strategy, # Pass model's actual strategy
+                # Pass the dict for RingAttentionHelper to populate if it's a ring attention layer
+                debug_dict_ring=debug_data_ring_this_layer if isinstance(active_strategy, RingAttentionStrategy) else None,
+                debug_key_prefix_ring="ring_r0" if isinstance(active_strategy, RingAttentionStrategy) else "",
+                layer_idx_for_debug=i # Pass the current layer index
             )
 
+            current_x_sharded_or_global: torch.Tensor
             if use_cache:
-                x_in, present_key_value_state = output
+                current_x_sharded_or_global, present_key_value_state = layer_output # type: ignore
                 present_key_value_states.append(present_key_value_state)
-
             else:
-                x_in = output
+                current_x_sharded_or_global = layer_output # type: ignore
 
-        dec_out = x_in
+            if isinstance(active_strategy, RingAttentionStrategy):
+                if hasattr(active_strategy, 'gather_output'):
+                    current_x = active_strategy.gather_output(current_x_sharded_or_global) # type: ignore
+                else:
+                    logger.warning(f"Rank {current_rank}: RingAttentionStrategy does not have gather_output. Output for layer {i} might remain sharded.")
+                    current_x = current_x_sharded_or_global # Fallback
+            else:
+                current_x = current_x_sharded_or_global
+        
+        dec_out = current_x # This should be global tensor now
         dec_out = self.dec_norm(dec_out)
         if self.config.p_dropout:
             dec_out = self.dropout(dec_out)
 
-        if isinstance(distributed_strategy, RingAttentionStrategy):
-            # Gather the potentially padded tensor
-            gathered_dec_out = distributed_strategy.gather_tensor(dec_out, dim=1)
-            # Slice back to the original sequence length
-            dec_out = gathered_dec_out[:, :original_seq_len, :]
+        if isinstance(active_strategy, RingAttentionStrategy):
+            if dec_out.size(1) > original_seq_len:
+                 dec_out = dec_out[:, :original_seq_len, :]
 
         return dec_out, present_key_value_states
 
@@ -446,26 +505,30 @@ class LLaMA(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value_states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        position_ids: Optional[torch.Tensor] = None, # type: ignore
+        past_key_value_states: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         use_cache: bool = False,
         only_last_token: bool = False,
         attn_algorithm: Optional[str] = None,
     ):
         output, cache = self._helper(
-            x,
+            x, # type: ignore
             mask,
             position_ids,
             past_key_value_states,
             use_cache,
             attn_algorithm,
-            # Pass the strategy from the main model instance
-            distributed_strategy=self.distributed_strategy,
+            # distributed_strategy is taken from self.distributed_strategy in _helper
         )
 
         if only_last_token:
-            output = output[:, -1, :]
-        preds = self.shared(output, reverse=True)
+            if output.ndim == 3: # type: ignore
+                output = output[:, -1, :] # type: ignore
+            elif output.ndim == 2 and use_cache and only_last_token: 
+                pass 
+            else:
+                logger.warning(f"Unexpected output shape for only_last_token: {output.shape}") # type: ignore
+        preds = self.shared(output, reverse=True) # type: ignore
 
         if use_cache:
             return preds, cache
@@ -473,8 +536,8 @@ class LLaMA(nn.Module):
             return preds
 
 
-# Register common LLaMA variants with the model registration API
 
+# Register common LLaMA variants with the model registration API
 # a micro llama model to use with a char-level tokenizer
 _micro_char_config = LLaMAConfig(
     emb_dim=192, nheads=4, nlayers=5, max_expected_seq_len=1024, src_vocab_size=256

@@ -285,7 +285,13 @@ class GatedLinearUnit(nn.Module):
     def to_tp(self, group: ProcessGroup) -> "TPGatedLinearUnit":
         return TPGatedLinearUnit.import_module(self, group)
 
-    def forward(self, x):
+    def forward(
+        self, 
+        x: torch.Tensor,
+        # New debug parameters
+        debug_dict: Optional[dict] = None,
+        debug_key_prefix: str = "",
+    ):
         if self.fused:
             out_fused = self.wg1_fused(x)
             wg, w1 = torch.split(out_fused, [self.hidden_dim, self.hidden_dim], dim=2)
@@ -437,9 +443,15 @@ class TPGatedLinearUnit(GatedLinearUnit, TPModule):
 
         return tp_glu
 
-    def forward(self, x):
+    def forward(
+        self, 
+        x: torch.Tensor,
+        # New debug parameters (inherited)
+        debug_dict: Optional[dict] = None,
+        debug_key_prefix: str = "",
+    ):
         x_par = copy_to_tensor_model_parallel_region(x, self.group)
-        out_par = GatedLinearUnit.forward(self, x_par)
+        out_par = GatedLinearUnit.forward(self, x_par, debug_dict=debug_dict, debug_key_prefix=debug_key_prefix)
         return reduce_from_tensor_model_parallel_region(out_par, self.group)
 
     def _initialize_empty_module(self):

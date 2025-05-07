@@ -22,6 +22,11 @@ def forward_ring(
     attn_algorithm: Optional[str] = None,
     distributed_strategy: Optional[DistributedStrategy] = None, # Expected RingAttentionStrategy
     # Add debug passthrough
+    # New debug parameters from LLaMABlock.forward call
+    debug_dict_populate: Optional[dict] = None,
+    debug_key_prefix_populate: str = "",
+    debug_print_values: bool = False,
+    debug_tolerance: float = 1e-3,
     debug_label: str = "RingAttentionBlock",
     layer_idx: int = -1,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]]:

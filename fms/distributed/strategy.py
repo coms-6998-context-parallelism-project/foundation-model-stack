@@ -223,6 +223,13 @@ class RingAttentionStrategy(DistributedStrategy):
 
         return padded_shard
 
+    def shard_position_ids(self, position_ids_to_shard: Tensor, *args, **kwargs) -> Tensor:
+        """
+        Shards position_ids along dim 1, pads shard to block_size.
+        This is a new method based on the modified calls.
+        """
+        return self.shard_input(position_ids_to_shard) # Can reuse shard_input logic for now
+
     def get_local_valid_len(self) -> int:
         """Returns the valid (non-padded) sequence length on the local rank."""
         assert self._local_valid_len is not None, "get_local_valid_len called before shard_input."
@@ -252,3 +259,10 @@ class RingAttentionStrategy(DistributedStrategy):
             assert result.size(dim) == self._original_seq_len, f"Rank {self.rank}: Gather slice failed: {result.size(dim)} != {self._original_seq_len}"
 
         return result
+
+    def gather_output(self, tensor_to_gather: Tensor, *args, **kwargs) -> Tensor:
+        """
+        Gathers tensors from all ranks. This is a new method based on the modified calls.
+        For now, it can delegate to gather_tensor.
+        """
+        return self.gather_tensor(tensor_to_gather, dim=1) # Assuming dim 1 is appropriate

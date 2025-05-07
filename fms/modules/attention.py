@@ -335,6 +335,8 @@ class MultiHeadAttention(nn.Module):
         use_cache=False,
         is_self=True,
         is_causal_mask=False,
+        debug_dict: Optional[dict] = None, # New
+        debug_key_prefix: str = "",       # New
     ):
         """
         past_key_value_state: tuple
@@ -633,6 +635,8 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
         use_cache=False,
         is_self=True,
         is_causal_mask=False,
+        debug_dict: Optional[dict] = None, # New (inherited, ensure consistency)
+        debug_key_prefix: str = "",       # New (inherited, ensure consistency)
     ):
         """
         Check MultiHeadAttention for up-to-date arguments and docs
@@ -652,6 +656,8 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             use_cache,
             is_self,
             is_causal_mask,
+            debug_dict=debug_dict,
+            debug_key_prefix=debug_key_prefix,
         )
 
         # if use_cache=True, we return the hidden_state as well as the kv cache.

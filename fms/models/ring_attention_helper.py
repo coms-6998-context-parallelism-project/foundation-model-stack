@@ -243,11 +243,13 @@ class RingAttentionHelper:
                 if can_debug and i == 0:
                     total_min += (clamp == exp_min).sum().item()
                     total_max += (clamp == exp_max).sum().item()
-                    stats = {
-                        'max': e.view(B, H, -1).max(-1)[0].mean(0).cpu(),
-                        'min': e.view(B, H, -1).min(-1)[0].mean(0).cpu(),
-                        'mean': e.view(B, H, -1).mean(-1).mean(0).cpu()
-                    }
+                    if T > 0: # Guard against zero-sized dimension for reduction
+                        stats_updates = {
+                            'max': e.view(B, H, -1).max(-1)[0].mean(0).cpu(),
+                            'min': e.view(B, H, -1).min(-1)[0].mean(0).cpu(),
+                            'mean': e.view(B, H, -1).mean(-1).mean(0).cpu()
+                        }
+                        stats.update(stats_updates) # stats is initialized as {} before the loop
             if i < self.world_size - 1:
                 k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, k_len)
                 v_blk, _ = self._ring_shift_tensor(v_blk, self.block_size, k_len)
@@ -255,7 +257,8 @@ class RingAttentionHelper:
         if can_debug:
             debug_dict[f"{prefix}_clamped_min_total_count"] = torch.tensor(total_min).cpu()
             debug_dict[f"{prefix}_clamped_max_total_count"] = torch.tensor(total_max).cpu()
-            debug_dict[f"{prefix}_softmax_stats_kblock0"] = stats
+            # Align key with what _compare_debug_data expects for SDP_Probs_K0
+            debug_dict[f"{prefix}_sdp_probs_kblock0"] = stats
             debug_dict[f"{prefix}_kahan_num_comp_norm"] = torch.linalg.norm(num_comp.float()).cpu()
             debug_dict[f"{prefix}_kahan_den_comp_norm"] = torch.linalg.norm(den_comp.float()).cpu()
         return num, den

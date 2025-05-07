@@ -64,7 +64,7 @@ class LLaMAConfig(ModelConfig): # type: ignore
     fused_weights: bool = True
     # Debugging fields
     debug_mode: bool = field(default=True, metadata={"help": "Enable debug mode for tensor comparison"}) # Default to True for easier testing
-    debug_target_layer: Optional[int] = field(default=0, metadata={"help": "Specific layer to debug (e.g., 0 for the first layer)"}) # Default to 0
+    debug_target_layer: Optional[int] = field(default=30, metadata={"help": "Specific layer to debug (e.g., 0 for the first layer)"}) # Default to 0
     debug_print_values: bool = field(default=True, metadata={"help": "Print tensor values during debug comparison"})
     debug_tolerance: float = field(default=1e-9, metadata={"help": "Tolerance for tensor comparison in debug mode"})
 

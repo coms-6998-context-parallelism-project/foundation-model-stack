@@ -1,8 +1,8 @@
-from typing import List, Tuple, Dict, Optional, Union, Any
+from typing import Any, Optional, Tuple
 from fms.modules.attention import MultiHeadAttention
 import torch
 import torch.distributed as dist
-from torch.distributed import P2POp
+from torch.distributed import P2POp # Keep P2POp
 import math
 import torch.nn.functional as F
 import torch.nn as nn
@@ -24,50 +24,47 @@ def compute_local_qkv_and_rope(
     q: torch.Tensor,
     k: Optional[torch.Tensor] = None,
     v: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.Tensor] = None,
-    use_cache: bool = False,
-    past_key_value_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    is_self: bool = True
+    position_ids: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, E = q.shape
     q_out, k_out, v_out = attn_data.in_proj(q, k, v)
-    assert q_out.shape == k_out.shape == v_out.shape == (B, T, E)
+    Hq, Hkv = attn_data.nheads, attn_data.kvheads
+    Dk, Dv = attn_data.emb_kq_per_head, attn_data.emb_v_per_head
+    Q = q_out.view(B, T, Hq, Dk)
+    K = k_out.view(B, T, Hkv, Dk)
+    V = v_out.view(B, T, Hkv, Dv)
+    if attn_data.position_encoder and T > 0: # RoPE
+        # Ensure position_ids is not None if T > 0 and RoPE is used.
+        # The benchmark script should provide valid position_ids.
+        # If position_ids can be None here, a default like torch.arange might be needed,
+        # but the snippet assumes it's provided.
+        assert position_ids is not None, "position_ids must be provided for RoPE"
 
-    H_q, H_kv = attn_data.nheads, attn_data.kvheads
-    D_kq, D_v = attn_data.emb_kq_per_head, attn_data.emb_v_per_head
+        # Create a mask for valid positions (not -1)
+        valid_pos_mask = position_ids.ne(-1)
+        if valid_pos_mask.any(): # Apply RoPE only to valid positions
+            # Clamp position_ids to be within the max sequence length of RoPE
+            # max_seq_len_cached might be more accurate if NTK scaling is involved.
+            # Using a common default like 2048 or a configurable max_pos.
+            max_pos = getattr(attn_data.position_encoder, 'max_seq_len', 2048) # Fallback, ideally from config
+            clamped_position_ids = position_ids.clone()
+            clamped_position_ids[valid_pos_mask] = clamped_position_ids[valid_pos_mask].clamp(0, max_pos - 1)
 
-    queries = q_out.view(B, T, H_q, D_kq)
-    keys = k_out.view(B, T, H_kv, D_kq)
-    values = v_out.view(B, T, H_kv, D_v)
-
-    if attn_data.position_encoder and T > 0:
-        assert position_ids is not None
-        if position_ids.shape != (B, T) and not (T == 0 and position_ids.shape == (B, 0)):
-            raise AssertionError(f"Expected shape {(B, T)}, got {position_ids.shape}")
-        valid_mask = position_ids != -1
-        if valid_mask.any():
-            max_pos = getattr(attn_data.position_encoder, 'max_position_embeddings', 2048)
-            position_ids_safe = position_ids.clone()
-            position_ids_safe[valid_mask] = position_ids_safe[valid_mask].clamp(0, max_pos - 1)
-            q_rope, k_rope = attn_data.position_encoder.adjusted_qk(queries, keys, position_ids_safe)
-            if valid_mask.all():
-                queries, keys = q_rope, k_rope
-            else:
-                mask = valid_mask.unsqueeze(-1).unsqueeze(-1).expand_as(queries)
-                queries = torch.where(mask, q_rope, queries)
-                keys = torch.where(mask.expand_as(keys), k_rope, keys)
-
+            q_rope, k_rope = attn_data.position_encoder.adjusted_qk(Q, K, clamped_position_ids)
+            # Apply RoPE only where positions are valid
+            Q = torch.where(valid_pos_mask.unsqueeze(-1).unsqueeze(-1).expand_as(Q), q_rope, Q)
+            K = torch.where(valid_pos_mask.unsqueeze(-1).unsqueeze(-1).expand_as(K), k_rope, K)
     return (
-        queries.permute(0, 2, 1, 3),
-        keys.permute(0, 2, 1, 3),
-        values.permute(0, 2, 1, 3),
+        Q.permute(0, 2, 1, 3),
+        K.permute(0, 2, 1, 3),
+        V.permute(0, 2, 1, 3),
     )
 
 
 def _pad_to_block(t: torch.Tensor, target_len: int, dim: int = 2) -> torch.Tensor:
     if t.size(dim) >= target_len:
         assert t.size(dim) == target_len, f"Shape {t.shape} incompatible with target {target_len}"
-        return t
+        return t # Already at or exceeds target length
     pad = torch.zeros(
         *t.shape[:dim],
         target_len - t.size(dim),
@@ -130,18 +127,18 @@ class RingAttentionHelper:
         pos_trim = position_ids[:, :valid_len]
         res_trim = residual[:, :valid_len, :] if residual is not None else None
 
-        q, k, v = compute_local_qkv_and_rope(self.attn, x_trim, x_trim, x_trim, pos_trim)
+        q, k, v = compute_local_qkv_and_rope(self.attn, x_trim, x_trim, x_trim, pos_trim) # Use updated RoPE
 
         if self.attn.nheads != self.attn.kvheads:
             e = self.attn.nheads // self.attn.kvheads
             k = k.unsqueeze(2).expand(-1, -1, e, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_kq_per_head)
             v = v.unsqueeze(2).expand(-1, -1, e, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_v_per_head)
 
-        out_valid = self.forward_full(q, k, v, mask, valid_len, res_trim, x_trim, start)
+        out_valid = self.forward_full(q, k, v, mask, valid_len, res_trim, start, is_causal_mask)
         return (_pad_to_block(out_valid, self.block_size, dim=1), None, None) if self.world_size > 1 else (out_valid, None, None)
 
-    def forward_full(self, q, k, v, mask, valid_len, x_block, x_norm_block, q_start_global):
-        B, H, T, D_kq = q.shape # T is the local query length for this rank
+    def forward_full(self, q, k, v, mask, valid_len_local, x_block_residual_input, q_start_global, is_causal_mask: bool):
+        B, H, T, D_kq = q.shape # T is the local query length (valid_len_local)
         _, _, _, D_v = v.shape   # D_v is the value head dimension
 
         # All ranks must participate in ring communication, even if T (local query length) is 0.
@@ -149,20 +146,20 @@ class RingAttentionHelper:
 
         accum_dtype = self._accum_dtype
         exp_min, exp_max = _get_clamp_bounds(accum_dtype)
-        
+
         # q_compute will have T as its query dimension length.
         # k_compute and v_compute sequence lengths are based on the K/V blocks being processed,
         # which may be non-zero even if local T is 0.
-        q_compute = q.to(accum_dtype)
-        k_compute = k.to(accum_dtype)
-        v_compute = v.to(accum_dtype)
+        qc, kc, vc = q.to(accum_dtype), k.to(accum_dtype), v.to(accum_dtype)
 
         # max_score will have shape (B, H, T, 1)
-        max_score = self._compute_max_score_pass(q_compute, k_compute, mask, q_start_global, valid_len)
+        max_score = self._compute_max_score_pass(
+            qc, kc, mask, q_start_global, valid_len_local, is_causal_mask
+        )
         # num will have shape (B, H, T, D_v)
         # den will have shape (B, H, T, 1)
         num, denom = self._compute_sums_pass(
-            q_compute, k_compute, v_compute, mask, q_start_global, valid_len, max_score, exp_min, exp_max
+            qc, kc, vc, mask, q_start_global, valid_len_local, max_score, exp_min, exp_max, is_causal_mask
         )
 
         if T > 0:
@@ -178,11 +175,11 @@ class RingAttentionHelper:
             # self.attn.emb_dim is the output dimension of the dense layer.
             attn_out = torch.empty(B, 0, self.attn.emb_dim, device=q.device, dtype=q.dtype)
 
-        # x_block has shape (B, T, E). If T=0, it's (B, 0, E).
-        x = x_block + attn_out
-        return self.ff(self.ff_norm(x)) + x
+        # x_block_residual_input has shape (B, T, E). If T=0, it's (B, 0, E).
+        x_after_attn = x_block_residual_input + attn_out
+        return self.ff(self.ff_norm(x_after_attn)) + x_after_attn
 
-    def _compute_max_score_pass(self, q_compute, k_compute, mask_global, q_start_global, valid_len_local):
+    def _compute_max_score_pass(self, q_compute, k_compute, mask_global, q_start_global, valid_len_local, is_causal_mask: bool):
         B, H, T, _ = q_compute.shape
         dtype = q_compute.dtype
         dev = q_compute.device
@@ -190,20 +187,20 @@ class RingAttentionHelper:
         q_idx = torch.arange(q_start_global, q_start_global + T, device=dev)
         k_blk, k_len = k_compute, k_compute.shape[2]
 
+        start_idx_loop = ((self.rank) % self.world_size) * self.block_size # Initial start_idx for k-blocks
         for i in range(self.world_size):
-            k_start = ((self.rank - i + self.world_size) % self.world_size) * self.block_size
-            k_idx = torch.arange(k_start, k_start + k_len, device=dev)
-            m = mask_global[:, :, q_start_global:q_start_global + T, k_start:k_start + k_len] if mask_global is not None else None
+            # k_start_loop is the global start index of the current k_blk
+            k_idx = torch.arange(start_idx_loop, start_idx_loop + k_len, device=dev)
+            m = mask_global[:, :, q_start_global:q_start_global + T, start_idx_loop:start_idx_loop + k_len] if mask_global is not None else None
             if k_len > 0:
-                s = self._compute_attention_scores(q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m)
+                s = self._compute_attention_scores(q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m, apply_causal=is_causal_mask)
                 max_score = torch.maximum(max_score, s.amax(-1, keepdim=True))
             if i < self.world_size - 1:
                 k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, k_len)
+                start_idx_loop = ((self.rank - (i + 1) + self.world_size) % self.world_size) * self.block_size
         return max_score
 
-    def _compute_sums_pass(
-        self, q_compute, k_compute, v_compute, mask_global, q_start_global, valid_len_local, max_score, exp_min, exp_max
-    ):
+    def _compute_sums_pass(self, q_compute, k_compute, v_compute, mask_global, q_start_global, valid_len_local, max_score, exp_min, exp_max, is_causal_mask: bool):
         B, H, T, Dv = q_compute.shape
         dev = q_compute.device
         dtype = self._accum_dtype
@@ -214,14 +211,18 @@ class RingAttentionHelper:
         q_idx = torch.arange(q_start_global, q_start_global + T, device=dev)
         k_blk, v_blk, k_len = k_compute, v_compute, k_compute.shape[2]
 
+        start_idx_loop = ((self.rank) % self.world_size) * self.block_size # Initial start_idx for k-blocks
         for i in range(self.world_size):
-            k_start = ((self.rank - i + self.world_size) % self.world_size) * self.block_size
-            k_idx = torch.arange(k_start, k_start + k_len, device=dev)
-            m = mask_global[:, :, q_start_global:q_start_global + T, k_start:k_start + k_len] if mask_global is not None else None
+            # k_start_loop is the global start index of the current k_blk
+            k_idx = torch.arange(start_idx_loop, start_idx_loop + k_len, device=dev)
+            m = mask_global[:, :, q_start_global:q_start_global + T, start_idx_loop:start_idx_loop + k_len] if mask_global is not None else None
             if k_len > 0:
-                s = self._compute_attention_scores(q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m)
-                e = torch.exp((s - max_score).clamp(min=exp_min, max=exp_max))
-                contrib_num = torch.einsum("bhqk,bhkd->bhqd", e, v_blk[:, :, :k_len])
+                s = self._compute_attention_scores(q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m, apply_causal=is_causal_mask)
+                delta = s - max_score
+                clamp = delta.clamp(min=exp_min, max=exp_max)
+                e = torch.exp(clamp.masked_fill(torch.isneginf(clamp), exp_min)) # exp(S - max(S))
+                e = e.masked_fill(torch.isneginf(max_score.expand_as(s)), 0) # if max_score was -inf, scores were -inf, exp should be 0
+                contrib_num = torch.matmul(e, v_blk[:, :, :k_len]) # Matmul for (B,H,Tq,Tk) x (B,H,Tk,Dv) -> (B,H,Tq,Dv)
                 contrib_den = e.sum(-1, keepdim=True)
 
                 # Kahan summation
@@ -236,23 +237,26 @@ class RingAttentionHelper:
                 den = t_den
 
             if i < self.world_size - 1:
-                valid = k_len
-                k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, valid)
-                v_blk, _ = self._ring_shift_tensor(v_blk, self.block_size, valid)
+                k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, k_len)
+                v_blk, _ = self._ring_shift_tensor(v_blk, self.block_size, k_len) # v_len is same as k_len
+                start_idx_loop = ((self.rank - (i + 1) + self.world_size) % self.world_size) * self.block_size
 
         return num, den
 
-    def _compute_attention_scores(self, q, k, q_idx, k_idx, mask=None, apply_mask=True, keep_causal=True):
+    def _compute_attention_scores(self, q, k, q_idx, k_idx, mask=None, apply_mask=True, apply_causal=True):
         B, H, Tq, D = q.shape
         Tk = k.shape[2]
+        if Tq == 0: # No local queries, no scores to compute.
+            return torch.empty(B, H, 0, Tk, device=q.device, dtype=q.dtype)
         scores = torch.matmul(q / self.scale, k.transpose(-2, -1))
 
         if apply_mask:
             if mask is not None:
+                assert mask.shape == scores.shape, f"Mask shape {mask.shape} mismatch with scores shape {scores.shape}"
                 scores += mask.to(scores.dtype)
-            if keep_causal:
+            if apply_causal:
                 causal = k_idx[None, None, None, :] > q_idx[None, None, :, None]
-                scores = scores.masked_fill(causal, torch.finfo(scores.dtype).min)
+                scores = scores.masked_fill(causal, float('-inf'))
         return scores
 
     def _ring_shift_tensor(self, tensor, pad_len, valid_len):
@@ -261,16 +265,16 @@ class RingAttentionHelper:
         device = tensor.device
         send_tensor = _pad_to_block(tensor[:, :, :valid_len], pad_len, -2).contiguous()
         recv_tensor = torch.empty_like(send_tensor)
-        recv_len = torch.empty(1, dtype=torch.int32, device=device)
+        recv_len_tensor = torch.empty(1, dtype=torch.int32, device=device) # Renamed to avoid conflict
 
         ops = [
             P2POp(dist.isend, torch.tensor([valid_len], dtype=torch.int32, device=device), peer=send),
-            P2POp(dist.irecv, recv_len, peer=recv),
+            P2POp(dist.irecv, recv_len_tensor, peer=recv),
             P2POp(dist.isend, send_tensor, peer=send),
             P2POp(dist.irecv, recv_tensor, peer=recv),
         ]
         for r in dist.batch_isend_irecv(ops):
             r.wait()
-        r_len = recv_len.item()
+        r_len = recv_len_tensor.item()
         assert 0 <= r_len <= pad_len, f"Rank {rank}: invalid recv_len {r_len}"
         return recv_tensor[:, :, :r_len].contiguous(), r_len

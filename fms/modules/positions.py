@@ -148,7 +148,7 @@ class RotaryEmbedding(PositionEncoder):
             alpha = int(alpha)
             return alpha
 
-    def compute_freqs_cis(self, device, max_seq_len=2048):
+    def compute_freqs_cis(self, device, max_seq_len=4096):
         # NTK scaling.
         # https://arxiv.org/abs/2306.15595
         # https://www.reddit.com/r/LocalLLaMA/comments/14lz7j5/ntkaware_scaled_rope_allows_llama_models_to_have/

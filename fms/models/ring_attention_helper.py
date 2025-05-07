@@ -141,28 +141,44 @@ class RingAttentionHelper:
         return (_pad_to_block(out_valid, self.block_size, dim=1), None, None) if self.world_size > 1 else (out_valid, None, None)
 
     def forward_full(self, q, k, v, mask, valid_len, x_block, x_norm_block, q_start_global):
-        B, H, T, D = q.shape
-        if T == 0:
-            return torch.empty(B, 0, self.attn.emb_dim, device=q.device, dtype=q.dtype)
+        B, H, T, D_kq = q.shape # T is the local query length for this rank
+        _, _, _, D_v = v.shape   # D_v is the value head dimension
+
+        # All ranks must participate in ring communication, even if T (local query length) is 0.
+        # The max_score, num, and den computations will naturally result in tensors with a 0 query dimension if T=0.
 
         accum_dtype = self._accum_dtype
         exp_min, exp_max = _get_clamp_bounds(accum_dtype)
+        
+        # q_compute will have T as its query dimension length.
+        # k_compute and v_compute sequence lengths are based on the K/V blocks being processed,
+        # which may be non-zero even if local T is 0.
         q_compute = q.to(accum_dtype)
         k_compute = k.to(accum_dtype)
         v_compute = v.to(accum_dtype)
 
+        # max_score will have shape (B, H, T, 1)
         max_score = self._compute_max_score_pass(q_compute, k_compute, mask, q_start_global, valid_len)
+        # num will have shape (B, H, T, D_v)
+        # den will have shape (B, H, T, 1)
         num, denom = self._compute_sums_pass(
             q_compute, k_compute, v_compute, mask, q_start_global, valid_len, max_score, exp_min, exp_max
         )
 
-        eps = torch.finfo(denom.dtype).eps
-        attn = (num / (denom + eps)).to(q.dtype)
+        if T > 0:
+            eps = torch.finfo(denom.dtype).eps
+            attn = (num / (denom + eps)).to(q.dtype) # attn shape (B, H, T, D_v)
 
-        if self.attn.p_dropout and self.llama_block.training:
-            attn = F.dropout(attn, p=self.attn.p_dropout, training=True)
+            if self.attn.p_dropout and self.llama_block.training:
+                attn = F.dropout(attn, p=self.attn.p_dropout, training=True)
+            attn_reshaped = attn.transpose(1, 2).contiguous().view(B, T, H * D_v)
+            attn_out = self.attn.dense(attn_reshaped) # attn_out shape (B, T, E)
+        else: # T == 0
+            # If there are no local queries, the attention output is an empty tensor.
+            # self.attn.emb_dim is the output dimension of the dense layer.
+            attn_out = torch.empty(B, 0, self.attn.emb_dim, device=q.device, dtype=q.dtype)
 
-        attn_out = self.attn.dense(attn.transpose(1, 2).contiguous().view(B, T, -1))
+        # x_block has shape (B, T, E). If T=0, it's (B, 0, E).
         x = x_block + attn_out
         return self.ff(self.ff_norm(x)) + x
 

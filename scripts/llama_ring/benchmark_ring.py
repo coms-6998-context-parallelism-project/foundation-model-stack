@@ -99,12 +99,16 @@ def run_generation_benchmark(model, tokenizer, initial_ids, num_tokens_to_gen, l
             torch.cuda.synchronize() # Sync before timing
         start_time = time.perf_counter()
 
-        logits = model.forward(
+        # When use_cache=False, model.forward returns only the logits tensor.
+        # The previous [0] indexing was incorrect as it would reduce a batch_size=1
+        # logits tensor to 2D, causing an IndexError in the argmax line.
+        # This tensor will have shape (batch_size, sequence_length, vocab_size).
+        returned_logits = model.forward(
             input_ids_step,
             past_key_value_states=past_key_value_states,
-            use_cache=False
-        )[0]  # Unpack the logits
-
+            use_cache=False # This is hardcoded to False in this script
+        )
+        logits = returned_logits # logits is now (batch_size, seq_len, vocab_size)
 
         next_token_id = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
 

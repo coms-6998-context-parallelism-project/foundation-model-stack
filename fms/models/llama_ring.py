@@ -49,10 +49,12 @@ def forward_ring(
         # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank_for_ring}, Tensor: LLaMABlock_final_output_RING_Rank0_portion): norm = {torch.linalg.norm(x_out.float()).item()}")
         first_block_debug_out_ring = x_out.clone() # Collect sharded output
 
-    # Return based on the use_cache flag
-    # Ensure three values are returned if not use_cache to match regular path's potential debug output
-    # The third value (debug output) might be None if not layer 0 / rank 0
-    return (x_out, cache_out, first_block_debug_out_ring) if use_cache else (x_out, first_block_debug_out_ring)
+    if use_cache:
+        # When use_cache is True, return the main output, the cache, and optionally debug info
+        return x_out, cache_out #, first_block_debug_out_ring # Decide if debug info is part of cache tuple
+    else:
+        # When use_cache is False, only return the main tensor output
+        return x_out # first_block_debug_out_ring can be handled differently if needed
 
 
 # Assigned to LLaMABlock._forward_ring_attention

@@ -138,9 +138,9 @@ class LLaMABlock(nn.Module):
         attn_algorithm=None,
         distributed_strategy: Optional[DistributedStrategy] = None,
     ):
-        
-        if isinstance(distributed_strategy, RingAttentionStrategy):
 
+        if isinstance(distributed_strategy, RingAttentionStrategy):
+            # print(torch.distributed.get_rank(), x.shape)
             return forward_ring(
                 self,
                 x,
@@ -152,6 +152,8 @@ class LLaMABlock(nn.Module):
                 attn_algorithm=attn_algorithm,
                 distributed_strategy=distributed_strategy,
             )
+        
+
 
         # if the cache is not empty, we need to get the kv cache for self and cross attention
         self_attn_past_key_value = past_key_value_state

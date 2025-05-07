@@ -448,6 +448,21 @@ class MultiHeadAttention(nn.Module):
             keys_e = keys
             values_e = values
 
+        if debug_dict is not None:
+            # Manual calculation for sdp_scores and sdp_probs for debugging
+            # These are calculated *before* the fused F.scaled_dot_product_attention
+            # scores_raw shape: (B, H, Tq, Tk)
+            scores_raw = torch.matmul(queries, keys_e.transpose(-2, -1))
+            if self.scale_factor is not None:
+                scores_raw = scores_raw / self.scale_factor
+            
+            scores_for_probs = scores_raw
+            if attn_mask is not None:
+                # Assuming attn_mask is additive. If boolean, it would be applied differently.
+                scores_for_probs = scores_for_probs + attn_mask.to(scores_raw.dtype)
+            debug_dict[f"{debug_key_prefix}_sdp_scores_kblock0"] = scores_for_probs.detach().clone().cpu()
+            debug_dict[f"{debug_key_prefix}_sdp_probs_kblock0"] = F.softmax(scores_for_probs, dim=-1).detach().clone().cpu()
+
         if attn_algorithm:
             # Pick which fused attn kernels will run.
             use_flash = attn_algorithm == "flash"
@@ -471,8 +486,8 @@ class MultiHeadAttention(nn.Module):
             scale=self.scale_factor,
         )
         if debug_dict is not None:
-            # attn is (B, H, Tq, Dv) - output of SDP before reshape and dense
-            debug_dict[f"{debug_key_prefix}_sdp_out"] = attn.detach().clone().cpu()
+            # Capture raw context (probs @ V) right after SDP, before reshape/transpose
+            debug_dict[f"{debug_key_prefix}_context_raw"] = attn.detach().clone().cpu()
 
 
         if attn_algorithm:
@@ -490,9 +505,9 @@ class MultiHeadAttention(nn.Module):
             .view(batch_size, q_len, self.nheads * self.emb_v_per_head)
         )
         out = self.dense(attn)
-        # The `LLaMABlock` captures `attn_dense_out_global` which is this `out` tensor.
-        # If a pre-dropout version is specifically needed from MHA, it could be stored here.
-        # For now, assuming LLaMABlock's capture is sufficient.
+        if debug_dict is not None:
+            # Capture the output of the dense projection
+            debug_dict[f"{debug_key_prefix}_attn_out_dense"] = out.detach().clone().cpu()
 
         # if use_cache=True, we return the hidden_state as well as the kv cache
         if use_cache:

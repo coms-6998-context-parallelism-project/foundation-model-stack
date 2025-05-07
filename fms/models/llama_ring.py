@@ -82,27 +82,33 @@ def _compare_debug_data(
 
     # Define mappings from no_ring keys (global) to ring keys (rank0 local)
     # Ensure these keys match what's populated in the dicts
+    # Format: (Display Name, NoRing Key Suffix, Ring Key Suffix, Global Seq Dim for Slicing NoRing, is_weight_or_bias)
     comparison_map = [
-        # Format: (Display Name, NoRing Key Suffix, Ring Key Suffix, Global Seq Dim for Slicing NoRing)
-        ("X_norm", "_x_norm_global", "_x_norm", 1),
-        ("Q_local", "_q_global", "_attn_q_local", 2),
-        ("K_local", "_k_global", "_attn_k_local", 2),
-        ("V_local", "_v_global", "_attn_v_local", 2),
-        ("Attn_Dense_Out", "_attn_dense_out_global", "_attn_out_raw", 1),
-        ("Residual1", "_residual1_global", "_attn_out_residual", 1),
-        ("FF_LN_Out", "_ff_ln_out_global", "_ff_ln_out", 1),
-        ("FF_Out", "_ff_out_global", "_ff_out_raw", 1),
-        ("Block_Output", "_block_output_global", "_block_output", 1),
+        ("X_norm", "_x_norm_global", "_x_norm", 1, False),
+        ("Q_local", "_q_global", "_attn_q_local", 2, False), # Q is (B, H, T, Dk)
+        ("K_local", "_k_global", "_attn_k_local", 2, False), # K is (B, H, T, Dk)
+        ("V_local", "_v_global", "_attn_v_local", 2, False), # V is (B, H, T, Dv)
+        ("SDP_Scores_K0", "_sdp_scores_kblock0_global", "_sdp_scores_kblock0", [2,3], False), 
+        ("SDP_Probs_K0", "_sdp_probs_kblock0_global", "_sdp_probs_kblock0", [2,3], False),   
+        ("Context_Raw", "_context_raw_global", "_context_raw", 2, False), # Context Raw is (B, H, Tq, Dv)
+        ("Attn_Dense_Out", "_attn_out_dense_global", "_attn_out_dense", 1, False), 
+        # ("Dense_W_Slice", "_dense_w_slice", "_dense_w_slice", -1, True), # Example for weights, keep if needed
+        # ("Dense_B_Slice", "_dense_b_slice", "_dense_b_slice", -1, True), # Example for bias, keep if needed
+        ("Residual1", "_residual1_global", "_attn_out_residual", 1, False),
+        ("FF_LN_Out", "_ff_ln_out_global", "_ff_ln_out", 1, False),
+        ("FF_Out", "_ff_out_global", "_ff_out_raw", 1, False),
+        ("Block_Output", "_block_output_global", "_block_output", 1, False),
+        ("Mask_Slice_SumPass_K0_Sum", "_mask_slice_sumpass_kblock0_global_sum", "_sumpass_kblock0_mask_slice_sum", -1, False), # Compare sums, -1 for scalar-like
     ]
 
     all_match = True
-    for name, global_key_suffix, ring_key_suffix, global_seq_dim in comparison_map:
+    for name, global_key_suffix, ring_key_suffix, global_seq_dim, is_weight_or_bias in comparison_map:
         # --- CHANGE IS HERE ---
         # Construct the full key expected in debug_no_ring
         full_global_key = f"noring{global_key_suffix}"
 
         # Check for the full key in debug_no_ring
-        if full_global_key not in debug_no_ring:
+        if not is_weight_or_bias and full_global_key not in debug_no_ring: # Weights/biases might be handled differently if optional
             print(f"[DEBUG L{layer_idx}] Key {full_global_key} not found in debug_no_ring.")
             sys.stdout.flush()
             all_match = False
@@ -111,7 +117,7 @@ def _compare_debug_data(
 
         # Construct the full key for the current rank's ring debug dictionary
         full_ring_key_current_rank = f"{current_rank_ring_key_prefix}{ring_key_suffix}"
-        if full_ring_key_current_rank not in debug_ring_current_rank:
+        if not is_weight_or_bias and full_ring_key_current_rank not in debug_ring_current_rank:
             print(f"[DEBUG L{layer_idx}] Key {full_ring_key_current_rank} not found in current rank's ({current_rank_for_comparison}) ring_debug_dict.")
             sys.stdout.flush()
             all_match = False
@@ -138,40 +144,73 @@ def _compare_debug_data(
                 continue
 
         slicers = [slice(None)] * no_ring_tensor_global.ndim
-        if global_seq_dim >= no_ring_tensor_global.ndim:
-             print(f"[DEBUG L{layer_idx}] Invalid global_seq_dim {global_seq_dim} for tensor {name} with shape {no_ring_tensor_global.shape}")
-             sys.stdout.flush() # type: ignore
-             all_match = False
-             continue
-        # Slice the sequence dimension
-        # Calculate start offset for the current rank
-        current_rank_start_offset = strategy.rank * strategy.block_size # Assuming block_size is uniform for sharding
-        slicers[global_seq_dim] = slice(current_rank_start_offset, current_rank_start_offset + current_rank_valid_len)
-        try:
-            no_ring_tensor_r0_slice = no_ring_tensor_global[tuple(slicers)]
-        except IndexError as e:
-            print(f"[DEBUG L{layer_idx}] IndexError when slicing {name} ({full_global_key}) with shape {no_ring_tensor_global.shape} using slicers {slicers} (current_rank_valid_len: {current_rank_valid_len}). Error: {e}")
-            sys.stdout.flush()
-            all_match = False
-            continue
+        
+        if is_weight_or_bias:
+            no_ring_tensor_to_compare = no_ring_tensor_global
+        else:
+            current_rank_start_offset = strategy.rank * strategy.block_size
+            # Handle single dim or list of dims for slicing
+            if isinstance(global_seq_dim, int):
+                if global_seq_dim >= no_ring_tensor_global.ndim:
+                    print(f"[DEBUG L{layer_idx}] Invalid global_seq_dim {global_seq_dim} for tensor {name} with shape {no_ring_tensor_global.shape}")
+                    sys.stdout.flush()
+                    all_match = False
+                    continue
+                slicers[global_seq_dim] = slice(current_rank_start_offset, current_rank_start_offset + current_rank_valid_len)
+            elif isinstance(global_seq_dim, list): # For scores/probs with Tq, Tk dims
+                # Assuming global_seq_dim = [dim_Tq, dim_Tk]
+                # Slice Tq by current rank's valid query length
+                # Slice Tk by the first k-block's length (which is also current_rank_valid_len for the first block in ring)
+                dim_Tq, dim_Tk = global_seq_dim
+                if dim_Tq >= no_ring_tensor_global.ndim or dim_Tk >= no_ring_tensor_global.ndim:
+                    print(f"[DEBUG L{layer_idx}] Invalid global_seq_dims {global_seq_dim} for tensor {name} with shape {no_ring_tensor_global.shape}")
+                    sys.stdout.flush()
+                    all_match = False
+                    continue
+                slicers[dim_Tq] = slice(current_rank_start_offset, current_rank_start_offset + current_rank_valid_len)
+                # For K0 comparison, Tk slice length is also current_rank_valid_len (block_size essentially for rank 0)
+                # K-block starts at 0 for the first block comparison.
+                slicers[dim_Tk] = slice(0, current_rank_valid_len) 
+            else:
+                print(f"[DEBUG L{layer_idx}] Invalid type for global_seq_dim: {type(global_seq_dim)} for {name}")
+                sys.stdout.flush()
+                all_match = False
+                continue
+            try:
+                no_ring_tensor_to_compare = no_ring_tensor_global[tuple(slicers)]
+            except IndexError as e:
+                print(f"[DEBUG L{layer_idx}] IndexError when slicing {name} ({full_global_key}) with shape {no_ring_tensor_global.shape} using slicers {slicers} (current_rank_valid_len: {current_rank_valid_len}). Error: {e}")
+                sys.stdout.flush()
+                all_match = False
+                continue
         
         # Ensure the sliced standard tensor shape matches the local ring tensor shape
         # Ring tensor might have padding in non-sequence dims, standard slice won't. This comparison might need adjustment.
         # For now, assume shapes should match after slicing seq dim.
-        if ring_tensor_local_current_rank.shape != no_ring_tensor_r0_slice.shape:
-             print(f"[DEBUG L{layer_idx}] SHAPE MISMATCH after slicing for {name}: Ring {ring_tensor_local_current_rank.shape} vs Sliced NoRing {no_ring_tensor_r0_slice.shape}")
+        if ring_tensor_local_current_rank.shape != no_ring_tensor_to_compare.shape:
+             print(f"[DEBUG L{layer_idx}] SHAPE MISMATCH for {name}: Ring {ring_tensor_local_current_rank.shape} vs NoRing (sliced if applicable) {no_ring_tensor_to_compare.shape}")
              sys.stdout.flush()
              # Optionally try slicing ring tensor if it has padding:
              # ring_slicers = [slice(None)] * ring_tensor_local_current_rank.ndim
              # ring_slicers[1] = slice(0, rank0_valid_len) # Assuming seq dim is 1 for ring tensors B,T,E ? Adjust if needed.
              # ring_tensor_local_r0_sliced = ring_tensor_local_current_rank[tuple(ring_slicers)]
-             # if ring_tensor_local_r0_sliced.shape == no_ring_tensor_r0_slice.shape: ... proceed with comparison ...
+             # if ring_tensor_local_r0_sliced.shape == no_ring_tensor_to_compare.shape: ... proceed with comparison ...
              all_match = False
              continue # Skip comparison if shapes don't match after slicing standard tensor
 
-        if not _compare_tensors(name, ring_tensor_local_current_rank, no_ring_tensor_r0_slice, layer_idx, tolerance, print_values):
+        if not _compare_tensors(name, ring_tensor_local_current_rank, no_ring_tensor_to_compare, layer_idx, tolerance, print_values):
             all_match = False
             # Potentially break early if one mismatch is found? Or collect all mismatches.
+    
+    # Print Kahan norms if available (not for direct comparison, but for inspection)
+    if f"{current_rank_ring_key_prefix}_kahan_num_comp_norm" in debug_ring_current_rank:
+        norm_val = debug_ring_current_rank[f"{current_rank_ring_key_prefix}_kahan_num_comp_norm"].item()
+        print(f"[DEBUG L{layer_idx}, Rank {current_rank_for_comparison}] Kahan Numerator Compensation Norm: {norm_val:.3e}")
+        sys.stdout.flush()
+    if f"{current_rank_ring_key_prefix}_kahan_den_comp_norm" in debug_ring_current_rank:
+        norm_val = debug_ring_current_rank[f"{current_rank_ring_key_prefix}_kahan_den_comp_norm"].item()
+        print(f"[DEBUG L{layer_idx}, Rank {current_rank_for_comparison}] Kahan Denominator Compensation Norm: {norm_val:.3e}")
+        sys.stdout.flush()
 
     print(f"--- Comparison Result for Layer {layer_idx}, Rank {current_rank_for_comparison}: {'ALL MATCH' if all_match else 'MISMATCHES FOUND'} ---")
     sys.stdout.flush()
@@ -230,7 +269,36 @@ def _perform_shadow_standard_attention_pass(
     if f"{attn_key_prefix_shadow}_v_final" in attn_debug_dict_shadow:
         debug_data["noring_v_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_v_final"]
     
-    debug_data["noring_attn_dense_out_global"] = attn_out_dense.detach().clone().cpu()
+    # Capture SDP scores and probs from MHA's debug dict
+    if f"{attn_key_prefix_shadow}_sdp_scores" in attn_debug_dict_shadow:
+        debug_data["noring_sdp_scores_kblock0_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_sdp_scores"]
+    if f"{attn_key_prefix_shadow}_sdp_probs" in attn_debug_dict_shadow:
+        # These are global probs, for comparison with ring's k_block0, we'll slice later
+        debug_data["noring_sdp_probs_kblock0_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_sdp_probs"]
+
+    # Capture raw context (probs @ V) from MHA's debug dict
+    if f"{attn_key_prefix_shadow}_context_raw" in attn_debug_dict_shadow:
+        debug_data["noring_context_raw_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_context_raw"]
+    
+    # Capture post-dense output from MHA's debug dict
+    if f"{attn_key_prefix_shadow}_attn_out_dense" in attn_debug_dict_shadow:
+        debug_data["noring_attn_dense_out_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_attn_out_dense"]
+    else: # Fallback, though it should be populated by MHA
+        debug_data["noring_attn_dense_out_global"] = attn_out_dense.detach().clone().cpu()
+
+    # Capture mask slice for comparison with ring's first k-block sum_pass mask
+    # Assuming rank 0's valid length (block_size) for Tq_local and Tk_local for the first block.
+    # This requires strategy to be available or block_size to be known.
+    # For now, let's assume self_block.config.emb_dim can give an idea of block_size if needed,
+    # or better, pass block_size if available.
+    # A simpler approach for now: if mask_global exists, log its sum. Detailed slice later.
+    if mask_global is not None:
+        # For comparison with ring's k_block0, we'd slice this: mask_global[:, :, 0:T_r0, 0:K_block_len_r0]
+        # T_r0 and K_block_len_r0 are typically strategy.block_size for rank 0.
+        # Let's just log the sum of the relevant part for now.
+        # This part is tricky as strategy isn't directly here. We'll refine if needed.
+        # For now, just log the sum of the whole mask for general info.
+        debug_data["noring_mask_global_sum_for_shadow"] = mask_global.sum().detach().clone().cpu()
 
     # 2. First Residual Connection
     # residual_global is the original input `x` to the block

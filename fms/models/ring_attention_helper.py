@@ -7,6 +7,7 @@ import math
 import torch.nn.functional as F
 import torch.nn as nn
 from fms.distributed.strategy import RingAttentionStrategy
+import sys
 
 
 def _get_accum_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -173,7 +174,10 @@ class RingAttentionHelper:
             # Pass debug parameters
             can_populate_debug=can_populate_debug,
             debug_dict_populate=debug_dict_populate,
-            debug_key_prefix_populate=debug_key_prefix_populate
+            debug_key_prefix_populate=debug_key_prefix_populate,
+            # layer_idx is implicitly available in self.llama_block.layer_idx if needed by forward_full
+            # but RingAttentionHelper.forward gets it explicitly, so let's pass it if sub-methods need it.
+            layer_idx=layer_idx # Pass layer_idx from the main forward call
         )
         # out_valid is the final output of the block for this shard, after all residuals and FFN
         if can_populate_debug:
@@ -185,7 +189,8 @@ class RingAttentionHelper:
                      # Debug parameters
                      can_populate_debug: bool = False,
                      debug_dict_populate: Optional[dict] = None,
-                     debug_key_prefix_populate: str = ""):
+                     debug_key_prefix_populate: str = "",
+                     layer_idx: int = -1): # Added layer_idx
         B, H, T, D_kq = q.shape # T is the local query length for this rank
         _, _, _, D_v = v.shape   # D_v is the value head dimension
 
@@ -202,31 +207,56 @@ class RingAttentionHelper:
         k_compute = k.to(accum_dtype)
         v_compute = v.to(accum_dtype)
 
+        if self.rank == 0 and can_populate_debug: # Check for Rank 0 if debugging
+            print(f"DEBUG HELPER forward_full (L{layer_idx} R{self.rank}): q_compute.shape={q_compute.shape}, "
+                  f"k_compute.shape={k_compute.shape}, v_compute.shape={v_compute.shape}, T (valid_len_local_T)={valid_len_local_T}")
+            sys.stdout.flush()
+
         # max_score will have shape (B, H, T, 1)
-        max_score = self._compute_max_score_pass(q_compute, k_compute, mask, q_start_global, valid_len_local_T)
+        max_score = self._compute_max_score_pass(
+            q_compute, k_compute, mask, q_start_global, valid_len_local_T,
+            can_populate_debug=can_populate_debug, # Pass down
+            debug_dict_populate=debug_dict_populate, # Pass down
+            debug_key_prefix_for_pass=debug_key_prefix_populate, # Pass down (renamed for clarity in sub-method)
+            layer_idx=layer_idx # Pass down
+        )
         # num will have shape (B, H, T, D_v) 
         # den will have shape (B, H, T, 1)
         num, denom = self._compute_sums_pass(
-            q_compute, k_compute, v_compute, mask, q_start_global, valid_len_local_T, max_score, exp_min, exp_max
+            q_compute, k_compute, v_compute, mask, q_start_global, valid_len_local_T, max_score, exp_min, exp_max,
+            can_populate_debug=can_populate_debug, # Pass down
+            debug_dict_populate=debug_dict_populate, # Pass down
+            debug_key_prefix_populate=debug_key_prefix_populate, # Pass down
+            layer_idx=layer_idx # Pass down
         )
         
         if T > 0:
             eps = torch.finfo(denom.dtype).eps
             attn = (num / (denom + eps)).to(q.dtype) # attn shape (B, H, T, D_v)
+            if can_populate_debug: # Capture pre-dense context (probs @ V)
+                debug_dict_populate[f"{debug_key_prefix_populate}_context_raw"] = attn.detach().clone().cpu()
 
             # if self.attn.p_dropout and self.llama_block.training:
             #     attn = F.dropout(attn, p=self.attn.p_dropout, training=True)
             attn_reshaped = attn.transpose(1, 2).contiguous().view(B, T, H * D_v)
             attn_out = self.attn.dense(attn_reshaped) # attn_out shape (B, T, E)
+            if can_populate_debug: # Capture post-dense output
+                debug_dict_populate[f"{debug_key_prefix_populate}_attn_out_dense"] = attn_out.detach().clone().cpu()
         else: # T == 0
+            # For T=0, attn (pre-dense context) would be (B, H, 0, D_v)
+            # self.attn.emb_v_per_head is D_v
+            attn_empty_context = torch.empty(B, H, 0, self.attn.emb_v_per_head, device=q.device, dtype=q.dtype)
+            if can_populate_debug:
+                debug_dict_populate[f"{debug_key_prefix_populate}_context_raw"] = attn_empty_context.cpu()
+            
+            # attn_out is already correctly shaped as (B, 0, E)
             attn_out = torch.empty(B, 0, self.attn.emb_dim, device=q.device, dtype=q.dtype)
-
-        if can_populate_debug:
-            debug_dict_populate[f"{debug_key_prefix_populate}_attn_out_raw"] = attn_out.detach().clone().cpu()
+            if can_populate_debug: # Capture post-dense output (empty)
+                debug_dict_populate[f"{debug_key_prefix_populate}_attn_out_dense"] = attn_out.detach().clone().cpu()
 
         # x_block_residual_input has shape (B, T, E). If T=0, it's (B, 0, E). This is the sharded input residual.
         x_after_attn_residual = x_block_residual_input + attn_out
-        if can_populate_debug:
+        if can_populate_debug: # This capture is for the residual after attention
             debug_dict_populate[f"{debug_key_prefix_populate}_attn_out_residual"] = x_after_attn_residual.detach().clone().cpu()
 
         # FeedForward part
@@ -246,29 +276,51 @@ class RingAttentionHelper:
         block_output_valid = ff_out_raw + x_after_attn_residual 
         # This final block_output_valid will be captured in the main forward method after padding.
         return block_output_valid
-    def _compute_max_score_pass(self, q_compute, k_compute, mask_global, q_start_global, valid_len_local):
+
+    def _compute_max_score_pass(self, q_compute, k_compute, mask_global, q_start_global, valid_len_local,
+                                # Debug parameters
+                                can_populate_debug: bool = False,
+                                debug_dict_populate: Optional[dict] = None,
+                                debug_key_prefix_for_pass: str = "", 
+                                layer_idx: int = -1):
         B, H, T, _ = q_compute.shape
         dtype = q_compute.dtype
         dev = q_compute.device
         max_score = torch.full((B, H, T, 1), torch.finfo(dtype).min, device=dev, dtype=dtype)
         q_idx = torch.arange(q_start_global, q_start_global + T, device=dev)
         k_blk, k_len = k_compute, k_compute.shape[2]
+        
+        # For mask logging in this pass
+        # debug_key_prefix_for_pass is already specific (e.g., "ring_r0")
 
         for i in range(self.world_size):
             k_start = ((self.rank - i + self.world_size) % self.world_size) * self.block_size
             k_idx = torch.arange(k_start, k_start + k_len, device=dev)
             m = mask_global[:, :, q_start_global:q_start_global + T, k_start:k_start + k_len] if mask_global is not None else None
             if k_len > 0:
-                s = self._compute_attention_scores(q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m)
+                s = self._compute_attention_scores(
+                    q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m,
+                    # Pass debug params for mask logging
+                    can_populate_debug_mask=can_populate_debug and i==0, # Only for first k-block
+                    debug_dict_populate_mask=debug_dict_populate,
+                    debug_key_prefix_populate_mask=f"{debug_key_prefix_for_pass}_maxpass_kblock0" if i==0 else "",
+                    layer_idx_mask=layer_idx
+                )
                 max_score = torch.maximum(max_score, s.amax(-1, keepdim=True))
             if i < self.world_size - 1:
                 k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, k_len)
         return max_score
 
     def _compute_sums_pass(
-        self, q_compute, k_compute, v_compute, mask_global, q_start_global, valid_len_local, max_score, exp_min, exp_max
+        self, q_compute, k_compute, v_compute, mask_global, q_start_global, valid_len_local, max_score, exp_min, exp_max,
+        # Debug parameters
+        can_populate_debug: bool = False, 
+        debug_dict_populate: Optional[dict] = None,
+        debug_key_prefix_populate: str = "", # This is the rank-specific prefix like "ring_r0"
+        layer_idx: int = -1
     ):
-        B, H, T, Dv = q_compute.shape
+        B, H, T, Dk = q_compute.shape # q_compute has Dk
+        _, _, _, Dv = v_compute.shape # v_compute has Dv
         dev = q_compute.device
         dtype = self._accum_dtype
         num = torch.zeros(B, H, T, Dv, device=dev, dtype=dtype)
@@ -278,13 +330,33 @@ class RingAttentionHelper:
         q_idx = torch.arange(q_start_global, q_start_global + T, device=dev)
         k_blk, v_blk, k_len = k_compute, v_compute, k_compute.shape[2]
 
+        # Print k_len immediately after initialization, only for rank 0 if debugging this layer
+        if self.rank == 0 and can_populate_debug: # Check layer_idx if it's available and relevant
+            print(f"DEBUG HELPER _compute_sums_pass INIT (L{layer_idx} R{self.rank}):\n"
+                  f"  k_compute.shape: {k_compute.shape}\n"
+                  f"  k_len initialized to: {k_len}")
+            sys.stdout.flush()
+
+        # For clamping diagnostics and softmax stats (already present, ensure they use passed debug params)
+        total_clamped_min_count_this_rank = 0
+        total_clamped_max_count_this_rank = 0
+        softmax_stats_kblock0_this_rank = {}
+
         for i in range(self.world_size):
             k_start = ((self.rank - i + self.world_size) % self.world_size) * self.block_size
             k_idx = torch.arange(k_start, k_start + k_len, device=dev)
             m = mask_global[:, :, q_start_global:q_start_global + T, k_start:k_start + k_len] if mask_global is not None else None
             if k_len > 0:
-                s = self._compute_attention_scores(q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m)
-                e = torch.exp((s - max_score).clamp(min=exp_min, max=exp_max))
+                s = self._compute_attention_scores(
+                    q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m,
+                    # Pass debug params for mask logging
+                    can_populate_debug_mask=can_populate_debug and i==0, # Only for first k-block
+                    debug_dict_populate_mask=debug_dict_populate,
+                    debug_key_prefix_populate_mask=f"{debug_key_prefix_populate}_sumpass_kblock0" if i==0 else "",
+                    layer_idx_mask=layer_idx
+                )
+                s_minus_max_clamped = (s - max_score).clamp(min=exp_min, max=exp_max) # Renamed for clarity
+                e = torch.exp(s_minus_max_clamped)
                 contrib_num = torch.einsum("bhqk,bhkd->bhqd", e, v_blk[:, :, :k_len])
                 contrib_den = e.sum(-1, keepdim=True)
 
@@ -303,16 +375,96 @@ class RingAttentionHelper:
                 valid = k_len
                 k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, valid)
                 v_blk, _ = self._ring_shift_tensor(v_blk, self.block_size, valid)
+            
+            # Diagnostic print BEFORE the main logging block for i=0
+            if self.rank == 0 and i == 0: # Focus on Rank 0, first k-block
+                # This k_len is the one for the current iteration i, 
+                # which for i=0, is the one initialized from k_compute.shape[2]
+                # at the start of _compute_sums_pass.
+                print(f"DEBUG HELPER _compute_sums_pass (L{layer_idx} R{self.rank} i={i}) "
+                      f"k_compute.shape_at_start_of_func={k_compute.shape}, "
+                      f"k_len_at_start_of_iter_i={k_len}, T={T}")
+                sys.stdout.flush()
+
+                print(f"DEBUG HELPER PRE-CHECK (L{layer_idx} R{self.rank} i={i}):\n"
+                      f"  can_populate_debug: {can_populate_debug}\n"
+                      f"  debug_dict_populate is not None: {debug_dict_populate is not None}\n"
+                      f"  T (local_query_len): {T}\n"
+                      f"  k_len_in_pre_check_for_iter_i: {k_len}\n" 
+                      f"  Overall condition for logging: {can_populate_debug and i == 0 and debug_dict_populate is not None and T > 0 and k_len > 0}")
+                sys.stdout.flush()
+            
+            # Log intermediate scores and probs for the first k-block if debugging
+            if can_populate_debug and i == 0 and debug_dict_populate is not None and T > 0 and k_len > 0:
+                # Diagnostic print
+                if self.rank == 0: # Only print for rank 0 to reduce noise
+                    print(f"DEBUG HELPER (L{layer_idx} R{self.rank} i={i}) INSIDE LOGGING BLOCK. T={T}, k_len={k_len}. "
+                          f"s.shape={s.shape if hasattr(s, 'shape') else 's_not_defined'}, "
+                          f"e.shape={e.shape if hasattr(e, 'shape') else 'e_not_defined'}, "
+                          f"contrib_den.shape={contrib_den.shape if hasattr(contrib_den, 'shape') else 'contrib_den_not_defined'}")
+                    sys.stdout.flush()
+
+                # 1. Raw scores per block (s)
+                debug_dict_populate[f"{debug_key_prefix_populate}_sdp_scores_kblock0"] = s.detach().clone().cpu()
+                
+                # 2. "Probs" per block BEFORE summing into num/den
+                # e is exp((s-max).clamp(...)), contrib_den is e.sum(-1, keepdim=True)
+                probs_kblock0 = e / (contrib_den + torch.finfo(e.dtype).eps) # Add epsilon for stability if contrib_den is zero
+                if self.rank == 0 and i == 0: # More focused print
+                    print(f"DEBUG HELPER (L{layer_idx} R{self.rank} i={i}) Populated _sdp_scores_kblock0 and _sdp_probs_kblock0.")
+                    sys.stdout.flush()
+
+                debug_dict_populate[f"{debug_key_prefix_populate}_sdp_probs_kblock0"]  = probs_kblock0.detach().clone().cpu()
+                debug_dict_populate[f"{debug_key_prefix_populate}_contrib_den_kblock0"] = contrib_den.detach().clone().cpu()
+
+                # 3. Mask-slice diagnostics (already handled by _compute_attention_scores for _sumpass_kblock0_mask_slice_sum)
+
+                # Clamping diagnostics for this block
+                clamped_min_count_block = (s_minus_max_clamped == exp_min).sum().item()
+                clamped_max_count_block = (s_minus_max_clamped == exp_max).sum().item()
+                total_clamped_min_count_this_rank += clamped_min_count_block
+                total_clamped_max_count_this_rank += clamped_max_count_block
+
+                # Softmax probabilities (e) stats for this block
+                if e.numel() > 0:
+                    e_flat_per_head = e.view(B, H, -1)
+                    softmax_max_per_head = e_flat_per_head.max(dim=2)[0].mean(dim=0)
+                    softmax_min_per_head = e_flat_per_head.min(dim=2)[0].mean(dim=0)
+                    softmax_mean_per_head = e_flat_per_head.mean(dim=2).mean(dim=0)
+                    softmax_stats_kblock0_this_rank = {
+                        "max_per_head": softmax_max_per_head.detach().clone().cpu(),
+                        "min_per_head": softmax_min_per_head.detach().clone().cpu(),
+                        "mean_per_head": softmax_mean_per_head.detach().clone().cpu(),
+                    }
+
+        # Populate overall debug info after the loop
+        if can_populate_debug and debug_dict_populate is not None:
+            debug_dict_populate[f"{debug_key_prefix_populate}_clamped_min_total_count"] = torch.tensor(total_clamped_min_count_this_rank, dtype=torch.long).cpu()
+            debug_dict_populate[f"{debug_key_prefix_populate}_clamped_max_total_count"] = torch.tensor(total_clamped_max_count_this_rank, dtype=torch.long).cpu()
+            if softmax_stats_kblock0_this_rank:
+                 debug_dict_populate[f"{debug_key_prefix_populate}_softmax_stats_kblock0"] = softmax_stats_kblock0_this_rank
+            debug_dict_populate[f"{debug_key_prefix_populate}_kahan_num_comp_norm"] = torch.linalg.norm(num_comp.float()).detach().clone().cpu()
+            debug_dict_populate[f"{debug_key_prefix_populate}_kahan_den_comp_norm"] = torch.linalg.norm(den_comp.float()).detach().clone().cpu()
 
         return num, den
 
-    def _compute_attention_scores(self, q, k, q_idx, k_idx, mask=None, apply_mask=True, keep_causal=True):
+    def _compute_attention_scores(self, q, k, q_idx, k_idx, mask=None, apply_mask=True, keep_causal=True,
+                                  # Debug parameters for mask
+                                  can_populate_debug_mask: bool = False,
+                                  debug_dict_populate_mask: Optional[dict] = None,
+                                  debug_key_prefix_populate_mask: str = "",
+                                  layer_idx_mask: int = -1):
         B, H, Tq, D = q.shape
         Tk = k.shape[2]
         scores = torch.matmul(q / self.scale, k.transpose(-2, -1))
 
         if apply_mask:
             if mask is not None:
+                if can_populate_debug_mask and debug_dict_populate_mask is not None and mask.numel() > 0:
+                    debug_dict_populate_mask[f"{debug_key_prefix_populate_mask}_mask_slice_sum"] = mask.sum().detach().clone().cpu()
+                    if mask.numel() < 1000:
+                         debug_dict_populate_mask[f"{debug_key_prefix_populate_mask}_mask_slice_sample"] = mask.flatten()[:10].detach().clone().cpu()
+
                 scores += mask.to(scores.dtype)
             if keep_causal:
                 causal = k_idx[None, None, None, :] > q_idx[None, None, :, None]

@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default=str(model_dir))
     parser.add_argument("--tokenizer", type=str, default=str(tokenizer_path))
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_tokens_to_benchmark", type=int, default=5)
+    parser.add_argument("--num_tokens_to_benchmark", type=int, default=1)
     parser.add_argument("--run_ring_first", action="store_true")
     parser.add_argument("--no-run_ring_first", dest="run_ring_first", action="store_false")
     parser.add_argument("--csv_output_file", type=str, default="benchmark_log.csv", help="Path to the CSV file for logging benchmark results.")
@@ -61,6 +61,14 @@ def init_csv_logging(csv_filepath, rank):
             print0(f"[WARNING] Could not open CSV file {csv_filepath} for writing: {e}")
             csv_writer = None
             csv_file_handle = None
+
+def close_csv_logging():
+    global csv_file_handle, csv_writer
+    if csv_file_handle:
+        csv_file_handle.close()
+        csv_file_handle = None
+        csv_writer = None
+        print0("[INFO] CSV logging file closed.")
 
 def log_to_csv(event_type, key, value, strategy_label="N/A", prompt_n="N/A"):
     if csv_writer:
@@ -285,7 +293,7 @@ def main():
     if not args.run_ring_first:
         strategies.reverse()
 
-    prompt_n_values = [10, 20, 50, 100, 200, 300, 400]
+    prompt_n_values = [10]#, 20, 50, 100, 200, 300, 400]
 
     for strategy_label, strategy in strategies:
 

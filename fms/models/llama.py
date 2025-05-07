@@ -66,7 +66,7 @@ class LLaMAConfig(ModelConfig): # type: ignore
     debug_mode: bool = field(default=True, metadata={"help": "Enable debug mode for tensor comparison"}) # Default to True for easier testing
     debug_target_layer: Optional[int] = field(default=0, metadata={"help": "Specific layer to debug (e.g., 0 for the first layer)"}) # Default to 0
     debug_print_values: bool = field(default=True, metadata={"help": "Print tensor values during debug comparison"})
-    debug_tolerance: float = field(default=1e-3, metadata={"help": "Tolerance for tensor comparison in debug mode"})
+    debug_tolerance: float = field(default=1e-9, metadata={"help": "Tolerance for tensor comparison in debug mode"})
 
 
 class LLaMABlock(nn.Module):
@@ -150,7 +150,7 @@ class LLaMABlock(nn.Module):
         layer_idx_for_debug: int = -1
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
 
-        effective_strategy = distributed_strategy if distributed_strategy is not None else NoOpStrategy()
+        effective_strategy = distributed_strategy if distributed_strategy is not None else NoOpStrategy
 
         if isinstance(effective_strategy, RingAttentionStrategy):
             # print(torch.distributed.get_rank(), x.shape)
@@ -222,7 +222,7 @@ class LLaMA(nn.Module):
         super(LLaMA, self).__init__()
         # Ensure NoOpStrategy is instanced if passed as class
         if distributed_strategy == NoOpStrategy:
-            distributed_strategy = NoOpStrategy()
+            distributed_strategy = NoOpStrategy
 
         if config is not None:
             self.config = config
@@ -431,14 +431,21 @@ class LLaMA(nn.Module):
 
         for i, layer_module in enumerate(self.layers): # Renamed `layer` to `layer_module`
             # Debug related setup
-            is_target_debug_layer = (self.config.debug_mode and i == self.config.debug_target_layer)
             current_rank = active_strategy.rank if hasattr(active_strategy, 'rank') else 0
-            is_debug_orchestration_rank = (is_target_debug_layer and current_rank == 0)
+            
+            # Determine if the current layer on the current rank is a target for ring debug data population
+            target_debug_ranks_for_ring_population = [0, 1] # Ranks that should populate their ring debug dict
+            is_this_rank_a_ring_debug_target_for_population = (
+                self.config.debug_mode and
+                i == self.config.debug_target_layer and
+                isinstance(active_strategy, RingAttentionStrategy) and
+                current_rank in target_debug_ranks_for_ring_population
+            )
 
-            debug_data_standard_this_layer = {} if is_debug_orchestration_rank else None
-            debug_data_ring_this_layer = {} if is_debug_orchestration_rank and isinstance(active_strategy, RingAttentionStrategy) else None
+            debug_data_ring_this_layer = {} if is_this_rank_a_ring_debug_target_for_population else None
+            # The prefix will be used by RingAttentionHelper to create rank-specific keys
+            debug_key_prefix_for_current_rank_ring = f"ring_r{current_rank}" if isinstance(active_strategy, RingAttentionStrategy) else ""
 
-            # --- Standard Path Debug Run (on Rank 0 if RingAttention is active and being debugged) ---
             # This part is simplified: it's now handled within _forward_ring_attention in llama_ring.py
             # LLaMA._helper will only pass down the debug_data_ring_this_layer for population.
             # The shadow pass and comparison logic is encapsulated in llama_ring.py.
@@ -470,7 +477,7 @@ class LLaMA(nn.Module):
                 distributed_strategy=active_strategy, # Pass model's actual strategy
                 # Pass the dict for RingAttentionHelper to populate if it's a ring attention layer
                 debug_dict_ring=debug_data_ring_this_layer if isinstance(active_strategy, RingAttentionStrategy) else None,
-                debug_key_prefix_ring="ring_r0" if isinstance(active_strategy, RingAttentionStrategy) else "",
+                debug_key_prefix_ring=debug_key_prefix_for_current_rank_ring,
                 layer_idx_for_debug=i # Pass the current layer index
             )
 

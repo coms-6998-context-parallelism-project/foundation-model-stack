@@ -122,12 +122,12 @@ echo "[INFO] Monitor with: $wait_cmd"
 echo "[INFO] Will tail: $output_file"
 
 # Wait until output file appears
-for i in {1..36}; do
+for i in {1..300}; do
   if [[ -s "$output_file" ]]; then
     echo; echo "[INFO] Tailing…"; tail -n +1 -f "$output_file"; exit 0
   fi
   printf '.'
-  sleep 5
+  sleep 1
 done
 
 echo; echo "[ERROR] No output in $output_file"

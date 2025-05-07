@@ -136,6 +136,30 @@ def main():
     args = parse_args()
     set_determinism()
 
+    # --- Enhanced Diagnostic Information ---
+    print0("--- Benchmark Arguments ---")
+    for arg, value in sorted(vars(args).items()):
+        print0(f"  {arg}: {value}")
+    print0("---------------------------")
+
+    print0("--- System Configuration ---")
+    print0(f"  PyTorch Version: {torch.__version__}")
+    if args.device_type == "cuda" and torch.cuda.is_available():
+        print0(f"  CUDA Version: {torch.version.cuda}")
+        try:
+            print0(f"  NCCL Version: {torch.cuda.nccl.version()}")
+        except AttributeError:
+            print0("  NCCL Version: Not available via torch.cuda.nccl.version()")
+    print0("---------------------------")
+
+    print0("--- Relevant Environment Variables ---")
+    env_vars_to_log = ["OMP_NUM_THREADS", "NCCL_DEBUG", "NCCL_P2P_DISABLE", "TORCH_DISTRIBUTED_DEBUG", "CUDA_VISIBLE_DEVICES",
+                       "SLURM_JOB_ID", "SLURM_JOB_NODELIST", "SLURM_NNODES", "SLURM_NTASKS_PER_NODE", "SLURM_PROCID", "SLURM_LOCALID"]
+    for var in env_vars_to_log:
+        value = os.getenv(var)
+        if value is not None:
+            print0(f"  {var}: {value}")
+    print0("----------------------------------")
     local_rank = int(os.getenv("LOCAL_RANK", -1))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     rank = int(os.getenv("RANK", 0))
@@ -149,14 +173,20 @@ def main():
     elif world_size > 1:
         if args.device_type == "cuda" and not torch.cuda.is_available():
             raise EnvironmentError("CUDA requested but not available.")
+        
+        print(f"[Rank {rank}/{world_size}] Initializing distributed process group...")
         if args.device_type == "cuda":
             torch.cuda.set_device(local_rank)
+            print(f"[Rank {rank}/{world_size}] Set CUDA device to: {torch.cuda.current_device()} ({torch.cuda.get_device_name(torch.cuda.current_device()) if torch.cuda.is_available() else 'N/A'})")
             backend = "nccl"
         else:
             backend = "gloo"
         if not dist.is_initialized():
             dist.init_process_group(backend=backend)
+            print(f"[Rank {rank}/{world_size}] Distributed process group initialized with backend '{backend}'.")
         device = torch.device(args.device_type, local_rank)
+        print(f"[Rank {rank}/{world_size}] Using device: {device}")
+
     else:
         device = torch.device(args.device_type)
 
@@ -196,6 +226,13 @@ def main():
             torch.set_grad_enabled(False)
             mem_after_model_load = get_memory_snapshot(args.device_type, rank)
             print_memory_snapshot(f"After Model Load ({strategy_label})", mem_after_model_load, rank)
+            if hasattr(model, 'config'):
+                print0(f"--- Model Config ({strategy_label}) ---")
+                print0(f"  Architecture: {args.architecture}, Variant: {args.variant}")
+                print0(f"  Layers: {getattr(model.config, 'nlayers', 'N/A')}, Heads: {getattr(model.config, 'nheads', 'N/A')}, Hidden Dim: {getattr(model.config, 'emb_dim', getattr(model.config, 'dim', 'N/A'))}")
+                print0(f"  Vocab Size: {getattr(model.config, 'src_vocab_size', 'N/A')}")
+                print0("--------------------------")
+
             warnings.resetwarnings()
 
         if world_size > 1:

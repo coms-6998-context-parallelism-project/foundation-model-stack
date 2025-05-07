@@ -138,10 +138,15 @@ def _forward_ring_attention(self: nn.Module, x: torch.Tensor, *, mask: Optional[
         shards = [torch.empty_like(x) for _ in range(strategy.world_size)]
         dist.all_gather(shards, x, group=strategy.group)
         # Gather position_ids shards
-        template = position_ids if position_ids is not None else shards[0]
-        psh = [torch.empty_like(template) for _ in range(strategy.world_size)]
-        gather_src = position_ids if position_ids is not None else torch.full((B, T), -1, device=x.device)
+        # Gather position_ids shards — make recv‑buffers match the dtype of what we send
+        if position_ids is not None:
+            gather_src = position_ids
+        else:
+            # explicit dtype=int64 so empty_like below has the right dtype
+            gather_src = torch.full((B, T), -1, dtype=torch.int64, device=x.device)
+        psh = [torch.empty_like(gather_src) for _ in range(strategy.world_size)]
         dist.all_gather(psh, gather_src, group=strategy.group)
+
         # On rank 0, reconstruct and compute shadow pass
         if rank == 0:
             orig_len = getattr(strategy, '_original_seq_len', None)

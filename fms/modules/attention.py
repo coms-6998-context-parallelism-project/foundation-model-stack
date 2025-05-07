@@ -335,8 +335,8 @@ class MultiHeadAttention(nn.Module):
         use_cache=False,
         is_self=True,
         is_causal_mask=False,
-        debug_dict: Optional[dict] = None, # New
-        debug_key_prefix: str = "",       # New
+        debug_dict: Optional[dict] = None, # For debug data population
+        debug_key_prefix: str = "",       # Prefix for keys in debug_dict
     ):
         """
         past_key_value_state: tuple
@@ -370,19 +370,35 @@ class MultiHeadAttention(nn.Module):
         # todo: Cross attention (This always is true for now)
         if is_self or past_key_value_state is None:
             q_out, k_out, v_out = self.in_proj(q, k, v)
+            if debug_dict is not None:
+                # These are (B, T, E_total_for_qkv)
+                debug_dict[f"{debug_key_prefix}_q_proj_out"] = q_out.detach().clone().cpu()
+                debug_dict[f"{debug_key_prefix}_k_proj_out"] = k_out.detach().clone().cpu()
+                debug_dict[f"{debug_key_prefix}_v_proj_out"] = v_out.detach().clone().cpu()
 
             # note: transposes will be moved in a later PR to fix dis-contiguous tensor issues
+            # q_out/k_out/v_out are (B, T, TotalHeads*HeadDim)
+            # queries/keys/values are (B, T, NumHeadsForThisType, HeadDim)
             queries = q_out.view(batch_size, q_len, self.nheads, self.emb_kq_per_head)
             keys = k_out.view(batch_size, q_len, self.kvheads, self.emb_kq_per_head)
             values = v_out.view(batch_size, q_len, self.kvheads, self.emb_v_per_head)
 
             # You want to apply rotary embeddings pre-cache
             if self.position_encoder is not None:
-                queries, keys = self.position_encoder.adjusted_qk(
+                # RoPE is applied to (B, T, H, Dk)
+                queries_rope, keys_rope = self.position_encoder.adjusted_qk(
                     queries, keys, position_ids, past_key_value_state, use_cache
                 )
+                if debug_dict is not None:
+                    # Store RoPE'd versions before potential overwrite
+                    # These are (B, T, H, Dk)
+                    debug_dict[f"{debug_key_prefix}_q_rope"] = queries_rope.detach().clone().cpu()
+                    debug_dict[f"{debug_key_prefix}_k_rope"] = keys_rope.detach().clone().cpu()
+                queries = queries_rope
+                keys = keys_rope
 
         queries = queries.transpose(2, 1)  # / (self.emb_kq_per_head**(1/4))
+        # queries is now (B, H, T, Dk)
         keys = keys.transpose(2, 1)  # / (self.emb_kq_per_head**(1/4))
         values = values.transpose(2, 1)  # compatible with QK.T
 
@@ -398,6 +414,13 @@ class MultiHeadAttention(nn.Module):
             else:
                 keys = past_key_value_state[0]
                 values = past_key_value_state[1]
+        
+        if debug_dict is not None:
+            # Store final Q, K, V that go into scaled_dot_product_attention
+            # These are (B, H, T_effective, Dk) or (B, H, T_effective, Dv)
+            debug_dict[f"{debug_key_prefix}_q_final"] = queries.detach().clone().cpu()
+            debug_dict[f"{debug_key_prefix}_k_final"] = keys.detach().clone().cpu()
+            debug_dict[f"{debug_key_prefix}_v_final"] = values.detach().clone().cpu()
 
         # Merge rel pos bias and mask into single float mask
         if mask is not None:
@@ -447,6 +470,10 @@ class MultiHeadAttention(nn.Module):
             is_causal=is_causal_mask,
             scale=self.scale_factor,
         )
+        if debug_dict is not None:
+            # attn is (B, H, Tq, Dv) - output of SDP before reshape and dense
+            debug_dict[f"{debug_key_prefix}_sdp_out"] = attn.detach().clone().cpu()
+
 
         if attn_algorithm:
             torch.backends.cuda.enable_flash_sdp(self.previous_flash)
@@ -463,6 +490,9 @@ class MultiHeadAttention(nn.Module):
             .view(batch_size, q_len, self.nheads * self.emb_v_per_head)
         )
         out = self.dense(attn)
+        # The `LLaMABlock` captures `attn_dense_out_global` which is this `out` tensor.
+        # If a pre-dropout version is specifically needed from MHA, it could be stored here.
+        # For now, assuming LLaMABlock's capture is sufficient.
 
         # if use_cache=True, we return the hidden_state as well as the kv cache
         if use_cache:
@@ -635,8 +665,8 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
         use_cache=False,
         is_self=True,
         is_causal_mask=False,
-        debug_dict: Optional[dict] = None, # New (inherited, ensure consistency)
-        debug_key_prefix: str = "",       # New (inherited, ensure consistency)
+        debug_dict: Optional[dict] = None, # Pass down to parent's forward
+        debug_key_prefix: str = "",       # Pass down to parent's forward
     ):
         """
         Check MultiHeadAttention for up-to-date arguments and docs

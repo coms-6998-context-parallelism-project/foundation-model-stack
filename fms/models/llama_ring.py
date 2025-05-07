@@ -27,8 +27,7 @@ def forward_ring(
     debug_key_prefix_populate: str = "",
     debug_print_values: bool = False,
     debug_tolerance: float = 1e-3,
-    debug_label: str = "RingAttentionBlock",
-    layer_idx: int = -1,
+    layer_idx: int = -1, # Passed from LLaMABlock
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
 
     # Dispatch to helper function assigned to the block
@@ -41,7 +40,11 @@ def forward_ring(
         use_cache=use_cache,
         is_causal_mask=is_causal_mask,
         strategy=distributed_strategy,
-        debug_label=debug_label,
+        # Pass through the debug parameters
+        debug_dict_populate=debug_dict_populate,
+        debug_key_prefix_populate=debug_key_prefix_populate,
+        debug_print_values=debug_print_values,
+        debug_tolerance=debug_tolerance,
         layer_idx=layer_idx,
     )
 
@@ -74,8 +77,12 @@ def _forward_ring_attention(
     is_causal_mask: bool,
     strategy: DistributedStrategy, # Expected RingAttentionStrategy
     # Add debug passthrough
-    debug_label: str = "RingAttentionBlock", # Default, will be overridden
     layer_idx: int = -1, # Default, will be overridden
+    # New debug parameters from forward_ring
+    debug_dict_populate: Optional[dict] = None,
+    debug_key_prefix_populate: str = "",
+    debug_print_values: bool = False,
+    debug_tolerance: float = 1e-3,
 ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Any]: # Returns (output, cache, extra)
 
     assert isinstance(strategy, RingAttentionStrategy), f"Expected RingAttentionStrategy, got {type(strategy)}"
@@ -85,6 +92,11 @@ def _forward_ring_attention(
 
     rank = strategy.rank # Get rank from strategy
     correct_valid_len = strategy.get_local_valid_len() # Valid tokens on this rank
+
+    # Construct a debug label if needed for print statements, using layer_idx
+    # This replaces the passed 'debug_label'
+    # Example:
+    # local_debug_label = f"L{layer_idx}_R{rank}"
 
     # Lazy init RingAttentionHelper on first call with this strategy
     if self.ring_helper is None or self.ring_helper.strategy is not strategy:
@@ -98,8 +110,10 @@ def _forward_ring_attention(
         )
 
     # Debug print for input to RingAttentionHelper.forward (Rank 0's portion)
-    if rank == 0 and layer_idx == 0:
-        # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: input_to_RingHelper_x_norm_local_Rank0): norm = {torch.linalg.norm(x_norm_local.float()).item()}")
+    # Use self.config from LLaMABlock to check debug_mode and debug_target_layer
+    if self.config.debug_mode and layer_idx == self.config.debug_target_layer and rank == 0:
+        # Example print:
+        # print(f"DEBUG (L{layer_idx}, Rank {rank}, Tensor: input_to_RingHelper_x_norm_local_Rank0): norm = {torch.linalg.norm(x_norm_local.float()).item()}")
         pass
 
     # Call helper's core logic
@@ -107,17 +121,23 @@ def _forward_ring_attention(
         x_norm_local,
         mask=mask,
         strategy=strategy,
-        position_ids=position_ids, # Pass global position_ids
+        position_ids=position_ids, # Pass sharded position_ids (as received by _forward_ring_attention)
         past_key_value_state=past_key_value_state,
         is_causal_mask=is_causal_mask,
         valid_len=correct_valid_len,
         residual=residual,
+        debug_dict_populate=debug_dict_populate,
+        debug_key_prefix_populate=debug_key_prefix_populate,
+        layer_idx=layer_idx, # Pass layer_idx for helper's internal checks
+        debug_print_values=debug_print_values,
+        debug_tolerance=debug_tolerance,
     )
     
     # Debug print for output of RingAttentionHelper.forward (Rank 0's portion)
     # This 'output' is the block's final output for this rank, padded.
-    if rank == 0 and layer_idx == 0:
-        # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: output_from_RingHelper_BlockOutput_Rank0_portion): norm = {torch.linalg.norm(output.float()).item()}")
+    if self.config.debug_mode and layer_idx == self.config.debug_target_layer and rank == 0:
+        # Example print:
+        # print(f"DEBUG (L{layer_idx}, Rank {rank}, Tensor: output_from_RingHelper_BlockOutput_Rank0_portion): norm = {torch.linalg.norm(output.float()).item()}")
         pass
 
     return output, cache_from_helper, extra_output

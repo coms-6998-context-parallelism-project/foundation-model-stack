@@ -114,11 +114,27 @@ class RingAttentionHelper:
         is_causal_mask=False,
         valid_len=0,
         residual=None,
+        # New debug parameters
+        debug_dict_populate: Optional[dict] = None,
+        debug_key_prefix_populate: str = "",
+        layer_idx: int = -1, 
+        debug_print_values: bool = False, 
+        debug_tolerance: float = 1e-3,
     ):
         assert isinstance(strategy, RingAttentionStrategy) and self.strategy is strategy
         B, T_padded, _ = x_norm.shape
         if self.world_size > 1:
             assert T_padded == self.block_size
+        
+        # Determine if we should populate the debug dictionary for this call
+        # self.llama_block is available from __init__
+        is_debug_target_layer_and_rank = (
+            self.llama_block.config.debug_mode and
+            layer_idx == self.llama_block.config.debug_target_layer and
+            self.rank == 0 # Typically populate on rank 0
+        )
+        can_populate_debug = is_debug_target_layer_and_rank and debug_dict_populate is not None
+
         start = self.rank * self.block_size
 
         if position_ids is None:
@@ -130,17 +146,45 @@ class RingAttentionHelper:
         pos_trim = position_ids[:, :valid_len]
         res_trim = residual[:, :valid_len, :] if residual is not None else None
 
+        if can_populate_debug:
+            debug_dict_populate[f"{debug_key_prefix_populate}_x_norm_r0"] = x_trim.detach().clone().cpu()
+            if res_trim is not None: # Corresponds to the input residual to the block for this shard
+                debug_dict_populate[f"{debug_key_prefix_populate}_residual_input_r0"] = res_trim.detach().clone().cpu()
+
         q, k, v = compute_local_qkv_and_rope(self.attn, x_trim, x_trim, x_trim, pos_trim)
+
+        if can_populate_debug:
+            # q, k, v are (B, H, T_local, D_head)
+            debug_dict_populate[f"{debug_key_prefix_populate}_attn_q_local_r0"] = q.detach().clone().cpu()
+            debug_dict_populate[f"{debug_key_prefix_populate}_attn_k_local_r0"] = k.detach().clone().cpu()
+            debug_dict_populate[f"{debug_key_prefix_populate}_attn_v_local_r0"] = v.detach().clone().cpu()
 
         if self.attn.nheads != self.attn.kvheads:
             e = self.attn.nheads // self.attn.kvheads
             k = k.unsqueeze(2).expand(-1, -1, e, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_kq_per_head)
             v = v.unsqueeze(2).expand(-1, -1, e, -1, -1).reshape(B, self.attn.nheads, valid_len, self.attn.emb_v_per_head)
 
-        out_valid = self.forward_full(q, k, v, mask, valid_len, res_trim, x_trim, start)
+        out_valid = self.forward_full(
+            q, k, v, mask, 
+            valid_len, # local valid length (T)
+            res_trim, # residual input for this shard (x_block in forward_full)
+            start,    # q_start_global
+            # Pass debug parameters
+            can_populate_debug=can_populate_debug,
+            debug_dict_populate=debug_dict_populate,
+            debug_key_prefix_populate=debug_key_prefix_populate
+        )
+        # out_valid is the final output of the block for this shard, after all residuals and FFN
+        if can_populate_debug:
+            debug_dict_populate[f"{debug_key_prefix_populate}_block_output_r0"] = out_valid.detach().clone().cpu()
+
         return (_pad_to_block(out_valid, self.block_size, dim=1), None, None) if self.world_size > 1 else (out_valid, None, None)
 
-    def forward_full(self, q, k, v, mask, valid_len, x_block, x_norm_block, q_start_global):
+    def forward_full(self, q, k, v, mask, valid_len_local_T, x_block_residual_input, q_start_global,
+                     # Debug parameters
+                     can_populate_debug: bool = False,
+                     debug_dict_populate: Optional[dict] = None,
+                     debug_key_prefix_populate: str = ""):
         B, H, T, D_kq = q.shape # T is the local query length for this rank
         _, _, _, D_v = v.shape   # D_v is the value head dimension
 
@@ -158,13 +202,13 @@ class RingAttentionHelper:
         v_compute = v.to(accum_dtype)
 
         # max_score will have shape (B, H, T, 1)
-        max_score = self._compute_max_score_pass(q_compute, k_compute, mask, q_start_global, valid_len)
-        # num will have shape (B, H, T, D_v)
+        max_score = self._compute_max_score_pass(q_compute, k_compute, mask, q_start_global, valid_len_local_T)
+        # num will have shape (B, H, T, D_v) 
         # den will have shape (B, H, T, 1)
         num, denom = self._compute_sums_pass(
-            q_compute, k_compute, v_compute, mask, q_start_global, valid_len, max_score, exp_min, exp_max
+            q_compute, k_compute, v_compute, mask, q_start_global, valid_len_local_T, max_score, exp_min, exp_max
         )
-
+        
         if T > 0:
             eps = torch.finfo(denom.dtype).eps
             attn = (num / (denom + eps)).to(q.dtype) # attn shape (B, H, T, D_v)
@@ -174,14 +218,33 @@ class RingAttentionHelper:
             attn_reshaped = attn.transpose(1, 2).contiguous().view(B, T, H * D_v)
             attn_out = self.attn.dense(attn_reshaped) # attn_out shape (B, T, E)
         else: # T == 0
-            # If there are no local queries, the attention output is an empty tensor.
-            # self.attn.emb_dim is the output dimension of the dense layer.
             attn_out = torch.empty(B, 0, self.attn.emb_dim, device=q.device, dtype=q.dtype)
 
-        # x_block has shape (B, T, E). If T=0, it's (B, 0, E).
-        x = x_block + attn_out
-        return self.ff(self.ff_norm(x)) + x
+        if can_populate_debug:
+            debug_dict_populate[f"{debug_key_prefix_populate}_attn_out_raw_r0"] = attn_out.detach().clone().cpu()
 
+        # x_block_residual_input has shape (B, T, E). If T=0, it's (B, 0, E). This is the sharded input residual.
+        x_after_attn_residual = x_block_residual_input + attn_out
+        if can_populate_debug:
+            debug_dict_populate[f"{debug_key_prefix_populate}_attn_out_residual_r0"] = x_after_attn_residual.detach().clone().cpu()
+
+        # FeedForward part
+        # self.ff_norm and self.ff are from the LLaMABlock instance
+        if self.ff_norm is None or self.ff is None:
+            raise ValueError("FeedForward (ff) and its LayerNorm (ff_norm) must be provided to RingAttentionHelper for a full block pass.")
+
+        ff_ln_out = self.ff_norm(x_after_attn_residual)
+        if can_populate_debug:
+            debug_dict_populate[f"{debug_key_prefix_populate}_ff_ln_out_r0"] = ff_ln_out.detach().clone().cpu()
+
+        ff_out_raw = self.ff(ff_ln_out)
+        if can_populate_debug:
+            debug_dict_populate[f"{debug_key_prefix_populate}_ff_out_raw_r0"] = ff_out_raw.detach().clone().cpu()
+
+        # Second residual connection (output of the block for this shard)
+        block_output_valid = ff_out_raw + x_after_attn_residual 
+        # This final block_output_valid will be captured in the main forward method after padding.
+        return block_output_valid
     def _compute_max_score_pass(self, q_compute, k_compute, mask_global, q_start_global, valid_len_local):
         B, H, T, _ = q_compute.shape
         dtype = q_compute.dtype

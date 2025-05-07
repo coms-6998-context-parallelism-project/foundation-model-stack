@@ -4,7 +4,7 @@ import statistics
 import random
 import warnings
 import time
-import gc
+import gc # Make sure gc is imported
 import torch
 import numpy as np
 import torch.distributed as dist
@@ -193,6 +193,10 @@ def main():
 
     try:
         parsed_dtype = getattr(torch, args.dtype)
+        # Initial memory snapshot after basic setup and before heavy lifting
+        # Placed here to capture state before any major torch operations beyond dtype parsing
+        initial_mem_snapshot = get_memory_snapshot(args.device_type, rank)
+        print_memory_snapshot("Initial Script Load", initial_mem_snapshot, rank)
     except AttributeError:
         print0(f"[WARNING] Invalid dtype '{args.dtype}', defaulting to float32.")
         parsed_dtype = torch.float32
@@ -220,6 +224,8 @@ def main():
         print0(f"\n=== Benchmarking: {strategy_label} ===")
         should_run = strategy is not NoOpStrategy or rank == 0
         model = None
+        mem_before_current_model_load = get_memory_snapshot(args.device_type, rank)
+        print_memory_snapshot(f"Before Model Load ({strategy_label})", mem_before_current_model_load, rank)
 
         if should_run:
             warnings.filterwarnings("ignore", message=r"Keys from checkpoint.*rotary_emb\.inv_freq")
@@ -275,11 +281,12 @@ def main():
             mem_before_model_del = get_memory_snapshot(args.device_type, rank)
             print_memory_snapshot(f"Before Model Deletion ({strategy_label})", mem_before_model_del, rank)
             del model
-            gc.collect()
+            gc.collect() # Explicitly run garbage collection
             if args.device_type == "cuda":
                 torch.cuda.empty_cache()
-            # print_memory_snapshot(f"After Model Deletion ({strategy_label})", get_memory_snapshot(args.device_type, rank), rank) # Optional
-
+            # Snapshot after deletion and cache clearing
+            mem_after_model_del = get_memory_snapshot(args.device_type, rank)
+            print_memory_snapshot(f"After Model Deletion ({strategy_label})", mem_after_model_del, rank)
         if world_size > 1:
             dist.barrier()
 

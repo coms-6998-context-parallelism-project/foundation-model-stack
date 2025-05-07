@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Tuple
 
+from fms.models.ring_attention_helper import RingAttentionHelper
 import torch
 import torch.nn as nn
 
@@ -15,13 +16,8 @@ from fms.distributed.strategy import (
 )
 
 from fms.models.llama_ring import (
-    compute_local_qkv_and_rope,
-    compute_qkv_and_rope_thread,
     forward_ring,
-    _diff_debug_dicts,
-    _gather_debug_tensors,
     _forward_ring_attention,
-    _forward_engine_attention,
 )
 
 
@@ -70,18 +66,14 @@ class LLaMAConfig(ModelConfig):
 
 class LLaMABlock(nn.Module):
 
-    compute_local_qkv_and_rope  = compute_local_qkv_and_rope
-    compute_qkv_and_rope_thread = compute_qkv_and_rope_thread
-    forward                     = forward_ring
-    _diff_debug_dicts           = _diff_debug_dicts
-    _gather_debug_tensors       = _gather_debug_tensors
-    _forward_ring_attention     = _forward_ring_attention
-    _forward_engine_attention   = _forward_engine_attention
     def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
         super(LLaMABlock, self).__init__()
         self.config = config
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
+
+        # Make _forward_ring_attention available as an instance method
+        self._forward_ring_attention = _forward_ring_attention.__get__(self, LLaMABlock)
 
         self.ln = LayerNormParameterized(
             self.config.emb_dim,
@@ -131,6 +123,8 @@ class LLaMABlock(nn.Module):
 
         if self.config.p_dropout != 0:
             self.dropout = nn.Dropout(self.config.p_dropout)
+
+        self.ring_helper = None # Initialize to None, will be created on first use with the correct strategy
 
     def forward(
         self,

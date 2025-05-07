@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Ring Attention Inference submit script.
-# Submits a single Slurm job (Insomnia/GPU) or runs a local process (CPU) in the background
-# then tails the output.
+# Submits a Slurm job (Insomnia/GPU) or runs locally (CPU), then tails the output.
 
 set -eo pipefail
 IFS=$'\n\t'
 
-# --- Environment Detection ---
+# --- Detect Environment ---
 INSOMNIA_REPO_DIR="/insomnia001/depts/edu/COMSE6998/sg3790/foundation-model-stack"
 if [[ -d "$INSOMNIA_REPO_DIR" ]]; then
   RUN_LOCATION="insomnia"
@@ -18,34 +17,28 @@ fi
 
 # --- Base Paths ---
 LOCAL_REPO_DIR="/Users/sadigulcelik/Documents/CompSci/HPML-2025-Spring/FMSwrapper/foundation-model-stack"
-
-# --- Defaults ---
 DEFAULT_MODEL_REL_PATH="../llama-hf"
 DEFAULT_TOKENIZER_REL_PATH="../llama-hf/tokenizer.model"
 
-# --- Repo & Model Paths ---
 if [[ "$RUN_LOCATION" == "insomnia" ]]; then
-  INSOMNIA_BASE_DIR="/insomnia001/depts/edu/COMSE6998/sg3790"
-  CURRENT_REPO_DIR="${INSOMNIA_BASE_DIR}/foundation-model-stack"
-  SLURM_SCRIPT_PATH="${CURRENT_REPO_DIR}/scripts/llama_ring/run_inference.slurm"
-  DEFAULT_MODEL_ABS_PATH="${INSOMNIA_BASE_DIR}/llama-hf"
-  DEFAULT_TOKENIZER_ABS_PATH="${INSOMNIA_BASE_DIR}/llama-hf/tokenizer.model"
+  BASE_DIR="/insomnia001/depts/edu/COMSE6998/sg3790"
+  CURRENT_REPO_DIR="${BASE_DIR}/foundation-model-stack"
+  SLURM_SCRIPT_PATH="${CURRENT_REPO_DIR}/scripts/llama_ring/benchmark.slurm"
+  DEFAULT_MODEL_ABS_PATH="${BASE_DIR}/llama-hf"
+  DEFAULT_TOKENIZER_ABS_PATH="${BASE_DIR}/llama-hf/tokenizer.model"
 else
   CURRENT_REPO_DIR="$LOCAL_REPO_DIR"
   DEFAULT_MODEL_ABS_PATH="${CURRENT_REPO_DIR}/${DEFAULT_MODEL_REL_PATH}"
   DEFAULT_TOKENIZER_ABS_PATH="${CURRENT_REPO_DIR}/${DEFAULT_TOKENIZER_REL_PATH}"
 fi
 
-
 echo "[INFO] cd into $CURRENT_REPO_DIR"
 cd "$CURRENT_REPO_DIR"
 
 if [[ "$RUN_LOCATION" == "insomnia" ]]; then
-  echo "[INFO] Fetching latest changes and resetting local branch..."
-  # Fetch latest changes from origin
+  echo "[INFO] Fetching latest changes..."
   git fetch origin || echo "[WARN] git fetch failed"
-  # Reset the current branch hard to its origin counterpart
-  git reset --hard origin/$(git rev-parse --abbrev-ref HEAD) || echo "[WARN] git reset --hard failed"
+  git reset --hard origin/$(git rev-parse --abbrev-ref HEAD) || echo "[WARN] git reset failed"
 fi
 
 echo "[INFO] pip install -e ."
@@ -57,6 +50,7 @@ cd "$HOME"
 echo "[INFO] Cleaning old outputs…"
 rm -f "$HOME"/inference_insomnia_*.out "${CURRENT_REPO_DIR}/testing/inference_local_*.out"
 
+# --- Cleanup on exit ---
 cleanup() {
   echo; echo "[INFO] Cleaning up…"
   if [[ "$RUN_LOCATION" == "insomnia" && -n "${job_id:-}" ]]; then
@@ -68,45 +62,57 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-# Build args
-script_args=(); script_args+=("$@")
-if ! printf '%s\n' "${script_args[@]}" | grep -q -- '--model_path'; then
-  script_args+=(--model_path "$DEFAULT_MODEL_ABS_PATH")
+# --- Script Args ---
+passthrough_args=()
+nproc_value=2 # Default value for nproc_per_node
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --nproc)
+      nproc_value="$2"
+      shift 2
+      ;;
+    *)
+      passthrough_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if ! printf '%s\n' "${passthrough_args[@]}" | grep -q -- '--model_path'; then
+  passthrough_args+=(--model_path "$DEFAULT_MODEL_ABS_PATH")
 fi
-if ! printf '%s\n' "${script_args[@]}" | grep -q -- '--tokenizer'; then
-  script_args+=(--tokenizer "$DEFAULT_TOKENIZER_ABS_PATH")
+if ! printf '%s\n' "${passthrough_args[@]}" | grep -q -- '--tokenizer'; then
+  passthrough_args+=(--tokenizer "$DEFAULT_TOKENIZER_ABS_PATH")
 fi
 
-echo "[INFO] Launching inference with args: ${script_args[*]}"
+if [[ "$RUN_LOCATION" == "local" ]]; then
+  echo "[INFO] Using nproc_per_node: $nproc_value for local run."
+fi
+echo "[INFO] Launching benchmark with passthrough args: ${passthrough_args[*]}"
 
 job_id=""; pid=""
 
-if [[ "$RUN_LOCATION" != "insomnia" ]]; then
-  # local
-  # Define output file with timestamp before running the command
+if [[ "$RUN_LOCATION" == "local" ]]; then
   timestamp=$(date +%Y%m%d_%H%M%S)
   output_file="${CURRENT_REPO_DIR}/testing/inference_local_${timestamp}.out"
-  echo "[INFO] torchrun (nproc=2) → $output_file"
-  torchrun --nproc_per_node=2 \
-    "$CURRENT_REPO_DIR/scripts/inference.py" \
+  echo "[INFO] torchrun (nproc=$nproc_value) → $output_file"
+
+  torchrun --nproc_per_node="$nproc_value" \
+    "$CURRENT_REPO_DIR/scripts/llama_ring/benchmark_ring.py" \
     --architecture llama --variant 7b \
-    --device_type cpu --default_dtype fp16 \
-    --model_source hf --no_use_cache \
-    --distributed --distributed_strategy ring \
-    "${script_args[@]}" \
+    --device_type cpu --dtype float16 \
+    "${passthrough_args[@]}" \
     >"$output_file" 2>&1 &
   pid=$!
-  # Construct filename after getting PID
-  echo "[SUCCESS] local PID=$pid"
+  echo "[SUCCESS] Local PID=$pid"
   wait_cmd="ps -p $pid"
 else
-  # insomnia
   echo "[INFO] sbatch ${SLURM_SCRIPT_PATH} ${script_args[*]}"
-  sbatch_out=$(sbatch "$SLURM_SCRIPT_PATH" "${script_args[@]}" 2>&1) || {
+  sbatch_out=$(sbatch "$SLURM_SCRIPT_PATH" "${passthrough_args[@]}" 2>&1) || {
     echo "[ERROR] sbatch failed: $sbatch_out"; exit 1
   }
   job_id=$(echo "$sbatch_out" | grep -oP 'Submitted batch job \K[0-9]+')
-  # Match the updated Slurm script's #SBATCH --output pattern
   output_file="${HOME}/inference_insomnia_${job_id}.out"
   echo "[SUCCESS] Slurm job $job_id"
   wait_cmd="squeue -u $USER"
@@ -115,8 +121,8 @@ fi
 echo "[INFO] Monitor with: $wait_cmd"
 echo "[INFO] Will tail: $output_file"
 
-# wait & tail
-for i in {1..12}; do
+# Wait until output file appears
+for i in {1..36}; do
   if [[ -s "$output_file" ]]; then
     echo; echo "[INFO] Tailing…"; tail -n +1 -f "$output_file"; exit 0
   fi

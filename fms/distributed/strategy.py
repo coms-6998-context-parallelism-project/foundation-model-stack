@@ -1,6 +1,6 @@
 import os
 from abc import abstractmethod
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.distributed
@@ -161,78 +161,94 @@ class TensorParallelStrategy(DistributedStrategy):
         return tp_wrapping.apply_tp(block, self.group)
 
 
-
-from torch import Tensor 
+from torch import Tensor
 import torch.distributed as dist
 
-
 class RingAttentionStrategy(DistributedStrategy):
-    """
-    Distributed strategy for ring attention with automatic input padding.
-    Ensures tensors gathered across ranks are the same shape.
-    """
+    """Distributed strategy for ring attention with fixed block size."""
 
-    def __init__(self, block_size: int, group=None, from_meta=False):
+    def __init__(self, block_size: int = 2048, group: Optional[dist.ProcessGroup] = None, from_meta: bool = False):
         super().__init__(from_meta)
-        assert torch.distributed.is_initialized(), "Requires initialized process group"
-        self.group = group or torch.distributed.GroupMember.WORLD
-        self.rank = self.group.rank()
-        self.world_size = self.group.size()
         self.block_size = block_size
-        self._original_seq_len = None
+        
+        if dist.is_initialized():
+            self.group = group if group is not None else dist.GroupMember.WORLD
+            self.rank: int = self.group.rank()
+            self.world_size: int = self.group.size()
+        else: # Handle non-distributed case (e.g. nproc=1 local run)
+            self.group = None # type: ignore
+            self.rank = 0
+            self.world_size = 1
+            # print0("[INFO] RingAttentionStrategy: torch.distributed not initialized. Defaulting to world_size=1, rank=0.")
 
-    def _distribute_module(self, module: nn.Module, final_layers: bool = False) -> nn.Module:
-        return module
+        # State tracked per forward pass
+        self._original_seq_len: Optional[int] = None
+        self._local_valid_len: Optional[int] = None # Tokens on this rank before padding
 
-    def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module:
-        return block
+    # No-op for distributing modules/layers in Ring Attention
+    def _distribute_module(self, module: nn.Module, final_layers: bool = False) -> nn.Module: return module
+    def _distribute_layer(self, block: nn.Module, layer: int) -> nn.Module: return block
 
     def _pad_to_block_size(self, x: Tensor, dim: int = 1) -> Tensor:
-        """Pads tensor along a dimension to block_size if needed."""
+        """Pads tensor along dim to self.block_size."""
         length = x.size(dim)
-        if length >= self.block_size:
-            return x
+        if length == self.block_size: return x
+        assert length < self.block_size, f"Rank {self.rank}: Len {length} >= block_size {self.block_size} on dim {dim}"
         pad_shape = list(x.shape)
         pad_shape[dim] = self.block_size - length
         pad = torch.zeros(*pad_shape, dtype=x.dtype, device=x.device)
         return torch.cat([x, pad], dim=dim)
 
     def shard_input(self, x: Tensor) -> Tensor:
+        """Shards input along dim 1, pads shard to block_size."""
         if self.world_size == 1:
             self._original_seq_len = x.size(1)
             self._local_valid_len = x.size(1)
             return x
 
-        batch_size, seq_len = x.size(0), x.size(1)
+        seq_len = x.size(1)
         self._original_seq_len = seq_len
+
         start = self.rank * self.block_size
         end = min(start + self.block_size, seq_len)
+        self._local_valid_len = max(0, end - start) # Valid tokens on this rank
 
-        self._local_valid_len = end - start  # 👈 Fix is here
-        shard = x[:, start:end, :]
-        return self._pad_to_block_size(shard, dim=1)
+        shard = x[:, start:end, ...] if self._local_valid_len > 0 else torch.empty_like(x[:, :0, ...])
+        padded_shard = self._pad_to_block_size(shard, dim=1)
 
+        # Rigor: Assert output shape
+        assert padded_shard.size(1) == self.block_size, f"Rank {self.rank}: Shard pad failed: {padded_shard.size(1)} != {self.block_size}"
+        assert padded_shard.device == x.device, f"Rank {self.rank}: Shard device mismatch"
+        assert padded_shard.dtype == x.dtype, f"Rank {self.rank}: Shard dtype mismatch"
 
-    def gather_output(self, x_local: Tensor) -> Tensor:
-        if self.world_size == 1:
-            return x_local
+        return padded_shard
 
-        padded_list = [torch.empty_like(x_local) for _ in range(self.world_size)]
-        dist.all_gather(padded_list, x_local.contiguous(), group=self.group)
-        full = torch.cat(padded_list, dim=1)
-        if self._original_seq_len and full.size(1) > self._original_seq_len:
-            return full[:, :self._original_seq_len]
-        return full
+    def get_local_valid_len(self) -> int:
+        """Returns the valid (non-padded) sequence length on the local rank."""
+        assert self._local_valid_len is not None, "get_local_valid_len called before shard_input."
+        return self._local_valid_len
 
     def gather_tensor(self, tensor: Tensor, dim: int = 1) -> Tensor:
-        if self.world_size == 1:
-            return tensor
+        """Gathers tensors from all ranks along dim, pads, concatenates, slices if dim=1."""
+        if self.world_size == 1: return tensor
 
-        tensor = self._pad_to_block_size(tensor, dim=dim)
-        gathered = [torch.empty_like(tensor) for _ in range(self.world_size)]
-        dist.all_gather(gathered, tensor.contiguous(), group=self.group)
-        result = torch.cat(gathered, dim=dim)
+        # Pad tensor on this rank before gathering
+        tensor_padded = self._pad_to_block_size(tensor, dim=dim)
+        assert tensor_padded.size(dim) == self.block_size, f"Rank {self.rank}: Gather input pad failed: {tensor_padded.size(dim)} != {self.block_size} on dim {dim}"
+        assert tensor_padded.device == tensor.device, f"Rank {self.rank}: Gather device mismatch"
+        assert tensor_padded.dtype == tensor.dtype, f"Rank {self.rank}: Gather dtype mismatch"
 
-        if dim == 1 and self._original_seq_len and result.size(dim) > self._original_seq_len:
+
+        gathered_list = [torch.empty_like(tensor_padded) for _ in range(self.world_size)]
+        dist.all_gather(gathered_list, tensor_padded.contiguous(), group=self.group)
+        result = torch.cat(gathered_list, dim=dim)
+
+        # If gathering seq dim, slice back to original length
+        if dim == 1:
+            assert self._original_seq_len is not None, f"Rank {self.rank}: gather_tensor (dim=1) called before shard_input."
+            expected_cat_len = self.block_size * self.world_size
+            assert result.size(dim) == expected_cat_len, f"Rank {self.rank}: Gather concat failed: {result.size(dim)} != {expected_cat_len}"
             result = result.narrow(dim, 0, self._original_seq_len)
+            assert result.size(dim) == self._original_seq_len, f"Rank {self.rank}: Gather slice failed: {result.size(dim)} != {self._original_seq_len}"
+
         return result

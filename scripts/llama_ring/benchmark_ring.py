@@ -4,6 +4,7 @@ import statistics
 import random
 import warnings
 import time
+import gc
 import torch
 import numpy as np
 import torch.distributed as dist
@@ -274,6 +275,7 @@ def main():
             mem_before_model_del = get_memory_snapshot(args.device_type, rank)
             print_memory_snapshot(f"Before Model Deletion ({strategy_label})", mem_before_model_del, rank)
             del model
+            gc.collect()
             if args.device_type == "cuda":
                 torch.cuda.empty_cache()
             # print_memory_snapshot(f"After Model Deletion ({strategy_label})", get_memory_snapshot(args.device_type, rank), rank) # Optional

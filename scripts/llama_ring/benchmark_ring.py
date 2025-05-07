@@ -7,6 +7,7 @@ import time
 import torch
 import numpy as np
 import torch.distributed as dist
+import psutil # For CPU memory
 from pathlib import Path
 
 from fms import models
@@ -58,13 +59,46 @@ def setup_model(args, strategy=None, dtype=None):
         data_type=dtype
     )
 
+def get_memory_snapshot(device_type, rank=0):
+    """Gets a snapshot of current and peak memory usage."""
+    if rank != 0: # Memory reporting primarily for rank 0
+        return {}
+
+    process = psutil.Process(os.getpid())
+    rss_mb = process.memory_info().rss / (1024 * 1024)
+    snapshot = {"cpu_rss_mb": rss_mb}
+
+    if device_type == "cuda":
+        snapshot["cuda_allocated_mb"] = torch.cuda.memory_allocated() / (1024 * 1024)
+        snapshot["cuda_reserved_mb"] = torch.cuda.memory_reserved() / (1024 * 1024)
+        snapshot["cuda_max_allocated_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        snapshot["cuda_max_reserved_mb"] = torch.cuda.max_memory_reserved() / (1024 * 1024)
+    elif device_type == "mps":
+        snapshot["mps_allocated_mb"] = torch.mps.current_allocated_memory() / (1024 * 1024)
+        # MPS doesn't have a direct equivalent for max_memory_allocated easily accessible here
+    return snapshot
+
+def print_memory_snapshot(label, snapshot, rank=0):
+    if rank == 0 and snapshot: # Ensure snapshot is not empty (e.g., from non-rank 0)
+        print0(f"[Memory ({label})] CPU RSS: {snapshot.get('cpu_rss_mb', 0):.2f} MB")
+        if "cuda_allocated_mb" in snapshot:
+            print0(f"  CUDA Allocated: {snapshot['cuda_allocated_mb']:.2f} MB | Max Allocated: {snapshot['cuda_max_allocated_mb']:.2f} MB")
+            print0(f"  CUDA Reserved: {snapshot['cuda_reserved_mb']:.2f} MB | Max Reserved: {snapshot['cuda_max_reserved_mb']:.2f} MB")
+        elif "mps_allocated_mb" in snapshot:
+            print0(f"  MPS Allocated: {snapshot['mps_allocated_mb']:.2f} MB")
+
 def run_generation_benchmark(model, tokenizer, initial_ids, num_tokens_to_gen, label, device):
     rank = dist.get_rank() if dist.is_initialized() else 0
     print0(f"\n[Benchmark] {label}: Generating {num_tokens_to_gen} tokens...")
     current_ids = initial_ids.clone()
     past_key_value_states = None
     token_times, generated_text = [], []
-
+    
+    # Memory profiling for generation
+    if device.type == "cuda" and rank == 0:
+        torch.cuda.reset_peak_memory_stats() # Reset peak for this specific generation run
+    
+    mem_before_gen = get_memory_snapshot(device.type, rank)
     for i in range(num_tokens_to_gen):
         input_ids = current_ids if past_key_value_states is None else current_ids[:, -1:]
         if device.type == "cuda":
@@ -85,6 +119,9 @@ def run_generation_benchmark(model, tokenizer, initial_ids, num_tokens_to_gen, l
 
         current_ids = torch.cat([current_ids, next_token], dim=1)
 
+    mem_after_gen = get_memory_snapshot(device.type, rank)
+    print_memory_snapshot(f"During Generation ({label}) - Before", mem_before_gen, rank)
+    print_memory_snapshot(f"During Generation ({label}) - After (Peak for CUDA)", mem_after_gen, rank)
     if rank == 0:
         avg_time = statistics.mean(token_times)
         median_time = statistics.median(token_times)
@@ -141,7 +178,7 @@ def main():
     if not args.run_ring_first:
         strategies.reverse()
 
-    prompt_n_values = [10, 20, 50, 100, 200, 300, 400]
+    prompt_n_values = [10, 20, 50, 100]#, 200, 300, 400]
 
     for strategy_label, strategy in strategies:
         print0(f"\n=== Benchmarking: {strategy_label} ===")
@@ -152,6 +189,8 @@ def main():
             warnings.filterwarnings("ignore", message=r"Keys from checkpoint.*rotary_emb\.inv_freq")
             model = setup_model(args, strategy, dtype=parsed_dtype).eval()
             torch.set_grad_enabled(False)
+            mem_after_model_load = get_memory_snapshot(args.device_type, rank)
+            print_memory_snapshot(f"After Model Load ({strategy_label})", mem_after_model_load, rank)
             warnings.resetwarnings()
 
         if world_size > 1:
@@ -190,9 +229,12 @@ def main():
                 dist.barrier()
 
         if model is not None:
+            mem_before_model_del = get_memory_snapshot(args.device_type, rank)
+            print_memory_snapshot(f"Before Model Deletion ({strategy_label})", mem_before_model_del, rank)
             del model
             if args.device_type == "cuda":
                 torch.cuda.empty_cache()
+            # print_memory_snapshot(f"After Model Deletion ({strategy_label})", get_memory_snapshot(args.device_type, rank), rank) # Optional
 
         if world_size > 1:
             dist.barrier()

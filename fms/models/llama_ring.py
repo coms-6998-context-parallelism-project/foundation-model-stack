@@ -223,7 +223,8 @@ def _perform_shadow_standard_attention_pass(
     mask_global: Optional[torch.Tensor], # This is the original global mask
     position_ids_global: Optional[torch.Tensor], # Global position ids
     is_causal_mask_global: bool, # From original call
-    attn_algorithm: Optional[str]
+    attn_algorithm: Optional[str],
+    block_size: int # Added for precise mask slicing
 ) -> dict:
     """Performs a standard LLaMABlock forward pass for debugging comparison."""
     print(f"[DEBUG L_shadow {self_block.layer_idx}] Performing standard shadow pass...")
@@ -237,6 +238,8 @@ def _perform_shadow_standard_attention_pass(
     # Store inputs
     debug_data["noring_x_norm_global"] = x_norm_global.detach().clone().cpu()
     debug_data["noring_residual_global_input"] = residual_global.detach().clone().cpu()
+    # As per user's provided diff, adding this potentially redundant key
+    debug_data["noring_residual_input_global"] = residual_global.detach().clone().cpu()
 
     # 1. Attention part
     # MultiHeadAttention.forward populates its debug_dict. We'll use a temporary one.
@@ -261,44 +264,54 @@ def _perform_shadow_standard_attention_pass(
     )
     # Dropout after attention is handled by self_block.eval() mode
 
-    # Store Q, K, V after RoPE (if any) and before SDP
+    # Transfer relevant items from MHA's debug dict to the main debug_data with correct "noring_..._global" keys
     if f"{attn_key_prefix_shadow}_q_final" in attn_debug_dict_shadow:
-        debug_data["noring_q_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_q_final"]
+        debug_data["noring_q_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_q_final"].detach().clone().cpu()
     if f"{attn_key_prefix_shadow}_k_final" in attn_debug_dict_shadow:
-        debug_data["noring_k_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_k_final"]
+        debug_data["noring_k_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_k_final"].detach().clone().cpu()
     if f"{attn_key_prefix_shadow}_v_final" in attn_debug_dict_shadow:
-        debug_data["noring_v_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_v_final"]
+        debug_data["noring_v_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_v_final"].detach().clone().cpu()
     
     # Capture SDP scores and probs from MHA's debug dict
-    if f"{attn_key_prefix_shadow}_sdp_scores" in attn_debug_dict_shadow:
-        debug_data["noring_sdp_scores_kblock0_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_sdp_scores"]
-    if f"{attn_key_prefix_shadow}_sdp_probs" in attn_debug_dict_shadow:
+    # MHA populates _sdp_scores_kblock0 and _sdp_probs_kblock0
+    if f"{attn_key_prefix_shadow}_sdp_scores_kblock0" in attn_debug_dict_shadow:
+        debug_data["noring_sdp_scores_kblock0_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_sdp_scores_kblock0"].detach().clone().cpu()
+    if f"{attn_key_prefix_shadow}_sdp_probs_kblock0" in attn_debug_dict_shadow:
         # These are global probs, for comparison with ring's k_block0, we'll slice later
-        debug_data["noring_sdp_probs_kblock0_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_sdp_probs"]
+        debug_data["noring_sdp_probs_kblock0_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_sdp_probs_kblock0"].detach().clone().cpu()
 
     # Capture raw context (probs @ V) from MHA's debug dict
     if f"{attn_key_prefix_shadow}_context_raw" in attn_debug_dict_shadow:
-        debug_data["noring_context_raw_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_context_raw"]
+        debug_data["noring_context_raw_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_context_raw"].detach().clone().cpu()
     
     # Capture post-dense output from MHA's debug dict
     if f"{attn_key_prefix_shadow}_attn_out_dense" in attn_debug_dict_shadow:
-        debug_data["noring_attn_dense_out_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_attn_out_dense"]
+        debug_data["noring_attn_dense_out_global"] = attn_debug_dict_shadow[f"{attn_key_prefix_shadow}_attn_out_dense"].detach().clone().cpu()
     else: # Fallback, though it should be populated by MHA
         debug_data["noring_attn_dense_out_global"] = attn_out_dense.detach().clone().cpu()
 
-    # Capture mask slice for comparison with ring's first k-block sum_pass mask
-    # Assuming rank 0's valid length (block_size) for Tq_local and Tk_local for the first block.
-    # This requires strategy to be available or block_size to be known.
-    # For now, let's assume self_block.config.emb_dim can give an idea of block_size if needed,
-    # or better, pass block_size if available.
-    # A simpler approach for now: if mask_global exists, log its sum. Detailed slice later.
-    if mask_global is not None:
-        # For comparison with ring's k_block0, we'd slice this: mask_global[:, :, 0:T_r0, 0:K_block_len_r0]
-        # T_r0 and K_block_len_r0 are typically strategy.block_size for rank 0.
-        # Let's just log the sum of the relevant part for now.
-        # This part is tricky as strategy isn't directly here. We'll refine if needed.
-        # For now, just log the sum of the whole mask for general info.
-        debug_data["noring_mask_global_sum_for_shadow"] = mask_global.sum().detach().clone().cpu()
+    # Mask sum for comparison with ring's first k-block sum_pass mask sum
+    # Uses the passed 'block_size' parameter.
+    if mask_global is not None and block_size > 0:
+        rank0_start_offset = 0
+        # Query slice length is min of block_size and actual global query sequence length
+        q_slice_len = min(block_size, x_norm_global.size(1))
+        # Key slice length for the first K-block is block_size
+        k_slice_len = block_size
+
+        mask_slice_k0 = None
+        if q_slice_len > 0: # Only slice if there are queries to consider
+            if mask_global.ndim == 4: # B, H, Tq_global, Tk_global
+                mask_slice_k0 = mask_global[:, :, rank0_start_offset : rank0_start_offset + q_slice_len, 0 : k_slice_len]
+            elif mask_global.ndim == 3: # B, Tq_global, Tk_global
+                mask_slice_k0 = mask_global[:, rank0_start_offset : rank0_start_offset + q_slice_len, 0 : k_slice_len]
+            elif mask_global.ndim == 2: # Tq_global, Tk_global
+                mask_slice_k0 = mask_global[rank0_start_offset : rank0_start_offset + q_slice_len, 0 : k_slice_len]
+        
+        if mask_slice_k0 is not None and mask_slice_k0.numel() > 0:
+            debug_data["noring_mask_slice_sumpass_kblock0_global_sum"] = mask_slice_k0.sum().detach().clone().cpu()
+        else:
+            print(f"[DEBUG L_shadow {self_block.layer_idx}] Mask slice for k0 sum was empty or not determined. Global mask shape: {mask_global.shape}, q_slice_len: {q_slice_len}, k_slice_len: {k_slice_len}")
 
     # 2. First Residual Connection
     # residual_global is the original input `x` to the block
@@ -325,7 +338,7 @@ def _perform_shadow_standard_attention_pass(
     block_output_final = ff_out_raw + x_after_attn_residual
     debug_data["noring_block_output_global"] = block_output_final.detach().clone().cpu()
     
-    print(f"[DEBUG L_shadow {self_block.layer_idx}] Standard shadow pass placeholder completed.")
+    print(f"[DEBUG L_shadow {self_block.layer_idx}] Standard shadow pass completed. Populated {len(debug_data)} keys.")
     sys.stdout.flush()
     return debug_data
 
@@ -420,6 +433,27 @@ def _forward_ring_attention(
 
     # Construct a debug label if needed for print statements, using layer_idx
     local_debug_label = f"L{layer_idx}_R{rank}"
+
+    # Handle position_ids consistently:
+    # Rank 0 determines global position_ids if not provided, then all ranks get their shard.
+    # This ensures RoPE uses consistent positions.
+    if position_ids is None and valid_len > 0: # If this rank has valid tokens and no pos_ids
+        # Create local portion of global position_ids if they are None
+        # This will be used by RingAttentionHelper.forward if it needs to construct them.
+        # However, for the shadow pass, we need the true global ones.
+        # The RingAttentionHelper will receive these sharded pos_ids.
+        # If world_size > 1, these will be overwritten by broadcasted ones from rank 0.
+        current_rank_start_offset = rank * strategy.block_size
+        position_ids = torch.arange(
+            current_rank_start_offset, current_rank_start_offset + T_padded,
+            dtype=torch.long, device=x.device
+        ).unsqueeze(0).expand(B, -1)
+        # Mask out padding positions for these locally generated IDs
+        pad_mask = torch.arange(T_padded, device=x.device).expand(B, -1) >= valid_len
+        position_ids[pad_mask] = -1 # Mark padding positions
+    
+    # For the shadow pass, global_position_ids will be reconstructed/used on rank 0.
+    # For the ring pass, each rank needs its correct shard of position_ids.
 
     # --- Debug Start ---
     # Condition for this rank to participate in debug prints/orchestration
@@ -536,7 +570,8 @@ def _forward_ring_attention(
                     mask, 
                     pos_ids_global_reconstructed,
                     is_causal_mask, 
-                    attn_algorithm
+                    attn_algorithm,
+                    strategy.block_size # Pass block_size for mask calculation
                 )
             self.train()
         

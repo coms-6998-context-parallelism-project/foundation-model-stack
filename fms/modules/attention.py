@@ -2,6 +2,7 @@ import abc
 from typing import Any, Mapping, Optional, Tuple
 
 import torch
+import math
 import torch.distributed
 from torch import Tensor, nn
 from torch.distributed.distributed_c10d import ProcessGroup
@@ -450,18 +451,49 @@ class MultiHeadAttention(nn.Module):
 
         if debug_dict is not None:
             # Manual calculation for sdp_scores and sdp_probs for debugging
-            # These are calculated *before* the fused F.scaled_dot_product_attention
-            # scores_raw shape: (B, H, Tq, Tk)
-            scores_raw = torch.matmul(queries, keys_e.transpose(-2, -1))
-            if self.scale_factor is not None:
-                scores_raw = scores_raw / self.scale_factor
+            # This section aims to replicate the score calculation before softmax,
+            # including scaling and all applicable masks, as F.scaled_dot_product_attention would.
+            _q_debug = queries
+            _k_debug = keys_e # keys_e is already expanded for GQA if needed
+
+            # Determine scale factor for debug path, mimicking F.sdpa's default
+            _scale_factor_for_debug = self.scale_factor
+            if _scale_factor_for_debug is None:
+                _scale_factor_for_debug = 1.0 / math.sqrt(_q_debug.size(-1))
             
-            scores_for_probs = scores_raw
-            if attn_mask is not None:
-                # Assuming attn_mask is additive. If boolean, it would be applied differently.
-                scores_for_probs = scores_for_probs + attn_mask.to(scores_raw.dtype)
-            debug_dict[f"{debug_key_prefix}_sdp_scores_kblock0"] = scores_for_probs.detach().clone().cpu()
-            debug_dict[f"{debug_key_prefix}_sdp_probs_kblock0"] = F.softmax(scores_for_probs, dim=-1).detach().clone().cpu()
+            # 1. Compute scaled scores
+            scores_debug = torch.matmul(_q_debug, _k_debug.transpose(-2, -1)) * _scale_factor_for_debug
+            
+            # 2. Apply effective attention bias (combining explicit mask and internal causal mask)
+            L_debug, S_debug = scores_debug.size(-2), scores_debug.size(-1)
+            # Start with zeros, assumes scores_debug is (B, H, L, S)
+            # attn_bias_debug will be broadcasted or added.
+            # For simplicity in debug, we'll construct a bias that can be added directly.
+            # This might need adjustment if head dimensions vary wildly or mask is not (L,S) or (1,L,S)
+            attn_bias_debug_for_add = torch.zeros_like(scores_debug, device=_q_debug.device, dtype=_q_debug.dtype)
+
+            if is_causal_mask: # This is the is_causal_mask flag passed to MHA
+                # Mimic internal causal mask applied by F.sdpa
+                # Create a causal mask for (L_debug, S_debug) and expand to scores_debug shape
+                causal_mask_mat = torch.ones(L_debug, S_debug, dtype=torch.bool, device=_q_debug.device).tril(diagonal=0)
+                attn_bias_debug_for_add.masked_fill_(causal_mask_mat.logical_not().unsqueeze(0).unsqueeze(0), float("-inf"))
+
+            if attn_mask is not None: # This is the explicit mask passed to MHA (e.g., padding mask)
+                effective_attn_mask_for_debug = attn_mask
+                if attn_mask.dtype == torch.bool:
+                    # Convert boolean mask to float mask for addition
+                    # True means keep (0), False means mask out (-inf)
+                    float_bool_mask = torch.zeros_like(attn_mask, dtype=_q_debug.dtype)
+                    float_bool_mask.masked_fill_(attn_mask.logical_not(), float("-inf"))
+                    effective_attn_mask_for_debug = float_bool_mask
+                
+                # Add explicit mask to the (potentially already causally biased) scores
+                attn_bias_debug_for_add = attn_bias_debug_for_add + effective_attn_mask_for_debug.to(_q_debug.dtype)
+
+            scores_final_debug = scores_debug + attn_bias_debug_for_add
+
+            debug_dict[f"{debug_key_prefix}_sdp_scores_kblock0"] = scores_final_debug.detach().clone().cpu()
+            debug_dict[f"{debug_key_prefix}_sdp_probs_kblock0"] = F.softmax(scores_final_debug, dim=-1).detach().clone().cpu()
 
         if attn_algorithm:
             # Pick which fused attn kernels will run.

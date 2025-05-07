@@ -167,7 +167,7 @@ import torch.distributed as dist
 class RingAttentionStrategy(DistributedStrategy):
     """Distributed strategy for ring attention with fixed block size."""
 
-    def __init__(self, block_size: int = 32, group: Optional[dist.ProcessGroup] = None, from_meta: bool = False):
+    def __init__(self, block_size: int = 2048, group: Optional[dist.ProcessGroup] = None, from_meta: bool = False):
         super().__init__(from_meta)
         self.block_size = block_size
         
@@ -223,12 +223,26 @@ class RingAttentionStrategy(DistributedStrategy):
 
         return padded_shard
 
-    def shard_position_ids(self, position_ids_to_shard: Tensor, *args, **kwargs) -> Tensor:
+    def shard_global_position_ids(self, global_position_ids: Tensor, target_rank: int) -> Tensor:
         """
-        Shards position_ids along dim 1, pads shard to block_size.
-        This is a new method based on the modified calls.
+        Takes global position_ids and returns the specific shard for target_rank, padded to block_size.
+        Assumes global_position_ids are (B, Global_Seq_Len).
         """
-        return self.shard_input(position_ids_to_shard) # Can reuse shard_input logic for now
+        if self.world_size == 1:
+            # If only one rank, it gets the whole (potentially already block-sized) tensor.
+            # No sharding needed, but ensure it's padded if it's shorter than block_size.
+            return self._pad_to_block_size(global_position_ids, dim=1)
+
+        B, global_seq_len = global_position_ids.shape
+        
+        start = target_rank * self.block_size
+        end = min(start + self.block_size, global_seq_len)
+        local_valid_len_for_target_rank = max(0, end - start)
+
+        shard = global_position_ids[:, start:end] if local_valid_len_for_target_rank > 0 else torch.empty_like(global_position_ids[:, :0])
+        padded_shard = self._pad_to_block_size(shard, dim=1)
+        assert padded_shard.size(1) == self.block_size, f"Rank {self.rank} (sharding for {target_rank}): Pos ID shard pad failed: {padded_shard.size(1)} != {self.block_size}"
+        return padded_shard
 
     def get_local_valid_len(self) -> int:
         """Returns the valid (non-padded) sequence length on the local rank."""

@@ -36,9 +36,7 @@ def parse_args():
     parser.add_argument("--variant", type=str, default="7b")
     parser.add_argument("--model_path", type=str, default=str(model_dir))
     parser.add_argument("--tokenizer", type=str, default=str(tokenizer_path), help="Full path to the tokenizer.model file")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--prompt", type=str, default=", ".join([str(i) for i in range(0,10)]),
-                    help="Optional specific prompt text to use instead of random tokens.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for generation.")
     parser.add_argument("--num_tokens_to_benchmark", type=int, default=5, help="Number of tokens to generate and benchmark.")
     parser.add_argument("--run_ring_first", action="store_true", help="Explicitly run Ring Attention first (default). Set --no-run_ring_first to run Regular first.")
     parser.add_argument("--no-run_ring_first", dest="run_ring_first", action="store_false")
@@ -201,6 +199,10 @@ def main():
         # Ensure rank 0 has loaded before others proceed
         dist.barrier()
         if rank != 0: # Load on other ranks after rank 0
+            # Suppress tokenizer loading messages on non-rank0 to avoid clutter
+            # This is a simple way; a more robust way might involve a custom tokenizer loader
+            # that respects rank for printing.
+            # For now, assume tokenizer.get_tokenizer is quiet or its output is acceptable.
              tokenizer = tokenizers.get_tokenizer(args.tokenizer)
 
     # Use tokenizer's pad_id if available, otherwise default to 0
@@ -208,88 +210,99 @@ def main():
 
     # Prepare input IDs - only rank 0 needs to print info and create tensor
     ids = None
-    if rank == 0:
-        if args.prompt:
-            print0(f"[INFO] Using prompt: '{args.prompt}'")
-            tokens = tokenizer.tokenize(args.prompt)
-            prompt_ids_list = tokenizer.convert_tokens_to_ids(tokens)
-            prompt_len = len(prompt_ids_list)
-            print0(f"[INFO] Using prompt length: {prompt_len}")
-            # Directly use the tokenized prompt without padding/truncation
-            ids_tensor = torch.tensor(prompt_ids_list, dtype=torch.long).unsqueeze(0).repeat(args.batch_size, 1)
-        else:
-            # Fallback if no prompt is given (though the default prompt exists)
-            # We need a length, let's default to a small value like 10 if --seq_len is gone
-            prompt_len = 10
-            print0(f"[INFO] No prompt specified, generating random token IDs for sequence length: {prompt_len}")
-            ids_tensor = torch.randint(tokenizer.vocab_size(), (args.batch_size, prompt_len), dtype=torch.long)
 
-        # Move tensor to device after creation
-        ids = ids_tensor.to(device)
+    # Define N values for prompt generation
+    prompt_n_values = [10, 20, 50, 100, 200, 300, 400, 500]
 
-    if world_size > 1:
-        # Broadcast the input tensor from rank 0 to all other ranks
-        # Create a placeholder on other ranks first
-        if rank != 0:
-            # Need shape info from rank 0
-            shape_list = [None] # Placeholder for shape tuple
-            dist.broadcast_object_list(shape_list, src=0)
-            ids_shape = shape_list[0]
-            ids = torch.empty(ids_shape, dtype=torch.long, device=device)
-        elif rank == 0: # Rank 0 needs to provide the shape
-            dist.broadcast_object_list([ids.shape], src=0)
-
-        # Use broadcast instead of broadcast_object_list for tensors
-        dist.broadcast(ids, src=0)
-        dist.barrier() # Ensure all ranks have the tensor
-
-    # Define benchmark order (Default: Ring first)
-    order = [("Ring Attention", "ring"), ("Regular Attention", NoOpStrategy)]
+    # Define strategies to benchmark
+    strategies_to_benchmark = [("Ring Attention", "ring"), ("Regular Attention", NoOpStrategy)]
     if not args.run_ring_first:
-        order.reverse()
+        strategies_to_benchmark.reverse()
 
     print0(f"[INFO] Using model: {args.model_path}")
     print0(f"[INFO] Using tokenizer: {args.tokenizer}")
-    print0(f"[INFO] Batch size: {args.batch_size}, Input Seq length: {ids.shape[1]}") # Print actual length
 
-    for label, strategy in order:
-        is_regular_run = (strategy is NoOpStrategy)
-        should_run_this_rank = not (is_regular_run and rank != 0)
+    for strategy_label, strategy_param in strategies_to_benchmark:
+        print0(f"\n\n==================== BENCHMARKING STRATEGY: {strategy_label} ====================")
+
+        # Determine if this rank should participate in setting up THIS strategy's model
+        is_regular_run_for_strategy = (strategy_param is NoOpStrategy)
+        should_setup_model_this_rank = not (is_regular_run_for_strategy and rank != 0)
+        
+        model = None
+        if should_setup_model_this_rank:
+            if is_regular_run_for_strategy:
+                 print0(f"[INFO] Rank {rank} setting up {strategy_label} model...")
+            else: # Ring Attention
+                 print(f"[INFO] Rank {rank} setting up {strategy_label} model...") # Print on all ranks for Ring
+
+            # Suppress the specific warning about inv_freq keys
+            warnings.filterwarnings("ignore", message=r"Keys from checkpoint \(adapted to FMS\) not copied into model:.*rotary_emb\.inv_freq")
+            model = setup_model(args, strategy_param, dtype=parsed_dtype) # Pass dtype to setup
+            warnings.resetwarnings() # Reset warnings filter after model setup
+        
+        if world_size > 1:
+            dist.barrier() # Ensure model is set up on relevant ranks before proceeding
+
+        for n_val in prompt_n_values:
+            benchmark_label_for_n = f"{strategy_label} (N={n_val})"
+            print0(f"\n===== PROMPT N={n_val} (approx {n_val} tokens) for {benchmark_label_for_n} =====")
+            
+            ids = None
+            current_prompt_actual_len = 0 # Store actual tokenized length
+            if rank == 0:
+                # Generate prompt text for n_val
+                prompt_text = ", ".join([str(i) for i in range(n_val)]) # Simple numeric prompt
+                print0(f"[INFO] Using prompt text: '{prompt_text}'")
+                tokens = tokenizer.tokenize(prompt_text)
+                prompt_ids_list = tokenizer.convert_tokens_to_ids(tokens)
+                current_prompt_actual_len = len(prompt_ids_list)
+                print0(f"[INFO] Actual tokenized prompt length: {current_prompt_actual_len}")
+                ids_tensor = torch.tensor(prompt_ids_list, dtype=torch.long).unsqueeze(0).repeat(args.batch_size, 1)
+                ids = ids_tensor.to(device)
+            
+            if world_size > 1:
+                # Broadcast shape first
+                shape_list = [None]
+                if rank == 0:
+                    shape_list[0] = ids.shape
+                dist.broadcast_object_list(shape_list, src=0)
+                
+                if rank != 0:
+                    ids_shape = shape_list[0]
+                    ids = torch.empty(ids_shape, dtype=torch.long, device=device)
+                
+                # Broadcast tensor content
+                dist.broadcast(ids, src=0)
+                dist.barrier() # Ensure all ranks have the tensor for this N
+
+            # Print batch size and actual input sequence length for this N
+            # This needs to be done after ids is available on all ranks if world_size > 1, or just on rank 0
+            if rank == 0: # Only rank 0 prints this as ids shape is same for all
+                 print0(f"[INFO] Batch size: {args.batch_size}, Input Seq length for N={n_val}: {ids.shape[1]}")
 
         # Skip Ring Attention only if it's a multi-GPU scenario (world_size > 1) 
         # AND torch.distributed is not initialized.
         # If world_size is 1 (e.g., nproc 1 local run), RingAttentionStrategy will handle it.
-        if strategy == "ring" and world_size > 1 and not dist.is_initialized():
-            print0(f"\n[WARNING] Skipping '{label}' for world_size={world_size} because torch.distributed is not initialized.")
+        if strategy_param == "ring" and world_size > 1 and not dist.is_initialized():
+            print0(f"\n[WARNING] Skipping '{strategy_label}' for world_size={world_size} because torch.distributed is not initialized.")
             print0("[INFO] This usually requires running with torchrun or within a Slurm job launched with torchrun for multi-GPU.")
             continue
 
-        model = None
-        if should_run_this_rank:
-            if is_regular_run:
-                 print0(f"[INFO] Rank {rank} setting up Regular Attention benchmark...")
-            else:
-                 print(f"[INFO] Rank {rank} setting up Ring Attention benchmark...") # Print on all ranks for Ring
+            # Run benchmark only on ranks that have the model for this strategy
+            if should_setup_model_this_rank: # If this rank has the model
+                run_generation_benchmark(model, tokenizer, ids, args.num_tokens_to_benchmark, benchmark_label_for_n, device)
+            
+            if world_size > 1:
+                dist.barrier() # Sync after each N value benchmark run
 
-            # Suppress the specific warning about inv_freq keys
-            warnings.filterwarnings("ignore", message=r"Keys from checkpoint \(adapted to FMS\) not copied into model:.*rotary_emb\.inv_freq")
-            model = setup_model(args, strategy, dtype=parsed_dtype) # Pass dtype to setup
-            warnings.resetwarnings() # Reset warnings filter after model setup
-
-        # Barrier to ensure all ranks wait for model setup on active ranks
-        if world_size > 1:
-            dist.barrier()
-
-        # Run benchmark only on ranks that loaded the model
-        if should_run_this_rank:
-            run_generation_benchmark(model, tokenizer, ids, args.num_tokens_to_benchmark, label, device)
-
-            # Clean up model memory
+        # Clean up model after all N_VALS for this strategy
+        if model is not None: # model would be None on ranks that didn't set it up
             del model
             if args.device_type == "cuda":
                 torch.cuda.empty_cache()
 
-        # Barrier after each benchmark iteration to ensure synchronization before the next loop or exit
+        # Barrier after a full strategy benchmark (all Ns done, model cleaned up)
         if world_size > 1:
             dist.barrier()
 

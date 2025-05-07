@@ -418,7 +418,7 @@ class RingAttentionHelper:
                 # Clamp s - max_score to a tighter range for softmax stability
                 # Revert to using exp_min, exp_max derived from accum_dtype for clamping s - max_score
                 s_minus_max = s - max_score
-                s_minus_max_clamped = s_minus_max#.clamp(min=exp_min, max=exp_max)
+                s_minus_max_clamped = s_minus_max.clamp(min=exp_min, max=exp_max)
                 
                 # If s_minus_max_clamped contains -inf (e.g., s was -inf and max_score was finite),
                 # replace these -inf with exp_min before exponentiation.

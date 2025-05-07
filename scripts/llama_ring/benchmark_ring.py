@@ -181,6 +181,11 @@ def main():
     prompt_n_values = [10, 20, 50, 100]#, 200, 300, 400]
 
     for strategy_label, strategy in strategies:
+
+        if args.device_type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
         print0(f"\n=== Benchmarking: {strategy_label} ===")
         should_run = strategy is not NoOpStrategy or rank == 0
         model = None

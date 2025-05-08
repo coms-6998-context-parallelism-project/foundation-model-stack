@@ -169,7 +169,7 @@ class TensorParallelStrategy(DistributedStrategy):
 class RingAttentionStrategy(DistributedStrategy):
     def __init__(
         self,
-        block_size: int = 64,
+        block_size: int = 2048,
         group: Optional[dist.ProcessGroup] = None,
         from_meta: bool = False
     ):
@@ -211,25 +211,6 @@ class RingAttentionStrategy(DistributedStrategy):
     ) -> nn.Module:
         return block
 
-    def shard_input(
-        self, x: torch.Tensor
-    ) -> torch.Tensor:
-        seq_len = x.size(1)
-        self._original_seq_len = seq_len
-
-        if self.world_size == 1:
-            self._local_valid_len = seq_len
-            return x
-        start = self.rank * self.block_size
-        end = min(start + self.block_size, seq_len)
-        self._local_valid_len = max(0, end - start)
-        if self._local_valid_len > 0:
-            raw = x.narrow(1, start, self._local_valid_len)
-        else:
-            raw = x.new_empty((x.size(0), 0, x.size(2)))
-
-        # *** HERE: pad every shard out to block_size ***
-        return self._pad_to_block_size(raw, dim=1)
 
     def _ring_shift_tensor(
         self,
@@ -241,16 +222,14 @@ class RingAttentionStrategy(DistributedStrategy):
 
         send_to   = (self.rank + 1) % self.world_size
         recv_from = (self.rank - 1 + self.world_size) % self.world_size
-        seq_dim   = 2
 
-        # We trust that `tensor` is already exactly [B, H, block_size, ...]
         to_send = tensor.contiguous()
 
         recv_buf = torch.empty_like(to_send)
-        # single‐element int for how many real tokens the peer actually sent
         recv_len = torch.empty(1, dtype=torch.int32, device=tensor.device)
         send_len = torch.tensor([valid_seq_len], dtype=torch.int32, device=tensor.device)
 
+        # need to be careful for 2 gpu case to avoid blocking
         ops = [
             P2POp(dist.isend, send_len, peer=send_to),
             P2POp(dist.irecv, recv_len, peer=recv_from),
@@ -271,11 +250,17 @@ class RingAttentionStrategy(DistributedStrategy):
     def gather_tensor(
         self, tensor: torch.Tensor, dim: int = 1
     ) -> torch.Tensor:
+        """
+        Simple all gather given everything is padded 
+        """
         if self.world_size == 1:
             return tensor
         t = tensor.contiguous()
-        if t.size(dim) != self.block_size:
-            t = self._pad_to_block_size(t, dim)
+
+        # padding no longer required 
+        # if t.size(dim) != self.block_size:
+        #     t = self._pad_to_block_size(t, dim)
+
         gathered = [torch.empty_like(t) for _ in range(self.world_size)]
         torch.distributed.all_gather(gathered, t, group=self.group)
         result = torch.cat(gathered, dim=dim)
@@ -283,12 +268,31 @@ class RingAttentionStrategy(DistributedStrategy):
             assert self._original_seq_len is not None
             result = result.narrow(dim, 0, self._original_seq_len)
         return result
+    
+    def shard_input(
+        self, x: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        We pad input to block size
+        """
+        seq_len = x.size(1)
+        self._original_seq_len = seq_len
+
+        start = self.rank * self.block_size
+        end = min(start + self.block_size, seq_len)
+        self._local_valid_len = max(0, end - start)
+        if self._local_valid_len > 0:
+            raw = x.narrow(1, start, self._local_valid_len)
+        else:
+            raw = x.new_empty((x.size(0), 0, x.size(2)))
+
+        return self._pad_to_block_size(raw, dim=1)
+
 
 
     def shard_position_ids(self, position_ids: torch.Tensor) -> torch.Tensor:
         """
-        Slice the [B, L] position_ids block for this rank,
-        pad with -1 up to block_size.
+        We pad with -1 up to block_size.
         """
         seq_len = position_ids.size(1)
         start = self.rank * self.block_size
@@ -308,8 +312,7 @@ class RingAttentionStrategy(DistributedStrategy):
 
     def shard_mask(self, mask: torch.Tensor) -> torch.Tensor:
         """
-        Slice the [B,1,L,L] or [B,H,L,L] mask for this rank,
-        pad both query & key dims with -inf so pads never attend.
+        We pad both query & key dims with -inf so pads never attend.
         """
         L = mask.size(-1)
         start = self.rank * self.block_size
@@ -323,14 +326,12 @@ class RingAttentionStrategy(DistributedStrategy):
             shape[-2] = shape[-1] = 0
             m = mask.new_empty(shape)
 
-        # pad query-axis (dim=-2)
         pad_q = m.new_full(
             list(m.shape[:-2]) + [self.block_size - m.size(-2), m.size(-1)],
             float("-inf")
         )
         m = torch.cat([m, pad_q], dim=-2)
 
-        # pad key-axis (dim=-1)
         pad_k = m.new_full(
             list(m.shape[:-2]) + [self.block_size, self.block_size - m.size(-1)],
             float("-inf")

@@ -80,7 +80,7 @@ class RingAttentionKernel:
         q_fp32 = q.to(accum_dtype)
         k_fp32 = k.to(accum_dtype)
         v_fp32 = v.to(accum_dtype)
-        mask = mask.to(accum_dtype)
+        mask = mask
 
         # Pre-allocate buffers
         nheads = q_fp32.shape[1]

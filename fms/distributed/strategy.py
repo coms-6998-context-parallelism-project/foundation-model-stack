@@ -224,10 +224,12 @@ class RingAttentionStrategy(DistributedStrategy):
         end = min(start + self.block_size, seq_len)
         self._local_valid_len = max(0, end - start)
         if self._local_valid_len > 0:
-            return x.narrow(1, start, self._local_valid_len)
-        shp = list(x.shape)
-        shp[1] = 0
-        return torch.empty(*shp, dtype=x.dtype, device=x.device)
+            raw = x.narrow(1, start, self._local_valid_len)
+        else:
+            raw = x.new_empty((x.size(0), 0, x.size(2)))
+
+        # *** HERE: pad every shard out to block_size ***
+        return self._pad_to_block_size(raw, dim=1)
 
     def _ring_shift_tensor(
         self,
@@ -235,47 +237,32 @@ class RingAttentionStrategy(DistributedStrategy):
         valid_seq_len: int
     ) -> Tuple[torch.Tensor, int]:
         if self.world_size == 1:
-            if valid_seq_len == 0:
-                empty_shape = list(tensor.shape)
-                empty_shape[2] = 0
-                return torch.empty(*empty_shape, dtype=tensor.dtype, device=tensor.device), 0
-            idx = [slice(None)] * tensor.ndim
-            idx[2] = slice(0, valid_seq_len)
-            return tensor[tuple(idx)].clone(), valid_seq_len
+            return tensor, valid_seq_len
 
-        send_to = (self.rank + 1) % self.world_size
+        send_to   = (self.rank + 1) % self.world_size
         recv_from = (self.rank - 1 + self.world_size) % self.world_size
-        seq_dim = 2
+        seq_dim   = 2
 
-        if valid_seq_len == 0:
-            empty_shape = list(tensor.shape)
-            empty_shape[seq_dim] = 0
-            to_send = torch.empty(*empty_shape, dtype=tensor.dtype, device=tensor.device)
-        else:
-            idx = [slice(None)] * tensor.ndim
-            idx[seq_dim] = slice(0, valid_seq_len)
-            to_send = tensor[tuple(idx)]
+        # We trust that `tensor` is already exactly [B, H, block_size, ...]
+        to_send = tensor.contiguous()
 
-        padded = self._pad_to_block_size(to_send, dim=seq_dim).contiguous()
-        recv_buf = torch.empty_like(padded)
+        recv_buf = torch.empty_like(to_send)
+        # single‐element int for how many real tokens the peer actually sent
         recv_len = torch.empty(1, dtype=torch.int32, device=tensor.device)
         send_len = torch.tensor([valid_seq_len], dtype=torch.int32, device=tensor.device)
 
         ops = [
             P2POp(dist.isend, send_len, peer=send_to),
             P2POp(dist.irecv, recv_len, peer=recv_from),
-            P2POp(dist.isend, padded, peer=send_to),
-            P2POp(dist.irecv, recv_buf, peer=recv_from)
+            P2POp(dist.isend, to_send, peer=send_to),
+            P2POp(dist.irecv, recv_buf, peer=recv_from),
         ]
         reqs = dist.batch_isend_irecv(ops)
         for req in reqs:
             req.wait()
 
-        new_len = recv_len.item()
-        assert 0 <= new_len <= self.block_size
-        idx2 = [slice(None)] * recv_buf.ndim
-        idx2[seq_dim] = slice(0, new_len)
-        return recv_buf[tuple(idx2)].contiguous(), new_len
+        new_len = int(recv_len.item())
+        return recv_buf.contiguous(), new_len
 
     def get_local_valid_len(self) -> int:
         assert self._local_valid_len is not None
@@ -296,3 +283,56 @@ class RingAttentionStrategy(DistributedStrategy):
             assert self._original_seq_len is not None
             result = result.narrow(dim, 0, self._original_seq_len)
         return result
+
+
+    def shard_position_ids(self, position_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Slice the [B, L] position_ids block for this rank,
+        pad with -1 up to block_size.
+        """
+        seq_len = position_ids.size(1)
+        start = self.rank * self.block_size
+        end   = min(start + self.block_size, seq_len)
+        valid = max(0, end - start)
+
+        if valid > 0:
+            raw = position_ids.narrow(1, start, valid)
+        else:
+            raw = position_ids.new_empty((position_ids.size(0), 0))
+
+        pad_amt = self.block_size - raw.size(1)
+        if pad_amt > 0:
+            pad = raw.new_full((raw.size(0), pad_amt), -1)
+            raw = torch.cat([raw, pad], dim=1)
+        return raw
+
+    def shard_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Slice the [B,1,L,L] or [B,H,L,L] mask for this rank,
+        pad both query & key dims with -inf so pads never attend.
+        """
+        L = mask.size(-1)
+        start = self.rank * self.block_size
+        end   = min(start + self.block_size, L)
+        valid = max(0, end - start)
+
+        if valid > 0:
+            m = mask[..., start:end, start:end]
+        else:
+            shape = list(mask.shape)
+            shape[-2] = shape[-1] = 0
+            m = mask.new_empty(shape)
+
+        # pad query-axis (dim=-2)
+        pad_q = m.new_full(
+            list(m.shape[:-2]) + [self.block_size - m.size(-2), m.size(-1)],
+            float("-inf")
+        )
+        m = torch.cat([m, pad_q], dim=-2)
+
+        # pad key-axis (dim=-1)
+        pad_k = m.new_full(
+            list(m.shape[:-2]) + [self.block_size, self.block_size - m.size(-1)],
+            float("-inf")
+        )
+        return torch.cat([m, pad_k], dim=-1)

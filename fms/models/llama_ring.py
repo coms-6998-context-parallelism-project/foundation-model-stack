@@ -21,7 +21,7 @@ def ring_forward(
     attn_algorithm=None,
     distributed_strategy: Optional[DistributedStrategy] = None,
 ):
-    print(x.shape)
+
     residual = x 
     x_norm = self.ln(x)
 
@@ -63,28 +63,14 @@ class RingAttentionKernel:
         position_ids: Optional[Tensor] = None,
         causal: bool = False,
     ) -> Tensor:
-
-        batch_size, num_valid_tokens, emb_dim = x_norm.shape 
-        assert num_valid_tokens == valid_len
+        print(valid_len, end = ", ")
+        batch_size, block_size, emb_dim = x_norm.shape 
+        assert block_size == strategy.block_size
         current_rank_token_global_start_idx = strategy.rank * strategy.block_size
 
-        # compute position ids
-        if position_ids is not None:
-            position_ids_for_rope_computation = position_ids[:, current_rank_token_global_start_idx : current_rank_token_global_start_idx + valid_len]
-        elif valid_len > 0:
-            position_ids_for_rope_computation = torch.arange(current_rank_token_global_start_idx, current_rank_token_global_start_idx + valid_len, device=x_norm.device).unsqueeze(0).expand(batch_size, -1)
-        else: 
-            position_ids_for_rope_computation = None
-        # compute QKV + RoPE
-        
-        if valid_len>0:
-            q, k, v = RingAttentionKernel._compute_qkv_and_rope(
-                attn_module, x_norm, position_ids_for_rope_computation
-            )
-        else:
-            nheads, emb_kq_per_head, emb_v_per_head = attn_module.nheads, attn_module.emb_kq_per_head, attn_module.emb_v_per_head
-            q = k = torch.empty((batch_size, nheads, 0, emb_kq_per_head), device=x_norm.device, dtype=x_norm.dtype)
-            v = torch.empty((batch_size, nheads, 0, emb_v_per_head), device=x_norm.device, dtype=x_norm.dtype)
+        q, k, v = RingAttentionKernel._compute_qkv_and_rope(
+            attn_module, x_norm, position_ids
+        )
 
         scale = attn_module.scale_factor or math.sqrt(attn_module.emb_kq_per_head)
         accum_dtype = torch.float32
@@ -93,22 +79,22 @@ class RingAttentionKernel:
         q_fp32 = q.to(accum_dtype)
         k_fp32 = k.to(accum_dtype)
         v_fp32 = v.to(accum_dtype)
-        mask_fp32 = mask.to(accum_dtype) if mask is not None else None
+        mask = mask.to(accum_dtype)
 
         # Pre-allocate reduction buffers
         nheads = q_fp32.shape[1]
         emb_v_per_head = v_fp32.shape[-1]
-        max_score_buffer = torch.full((batch_size, nheads, num_valid_tokens, 1),
+        max_score_buffer = torch.full((batch_size, nheads, block_size, 1),
                                    torch.finfo(accum_dtype).min,
                                    device=q_fp32.device, dtype=accum_dtype)
-        numerator_buffer = torch.zeros((batch_size, nheads, num_valid_tokens, emb_v_per_head), 
+        numerator_buffer = torch.zeros((batch_size, nheads, block_size, emb_v_per_head), 
                                      device=q_fp32.device, dtype=accum_dtype)
-        denominator_buffer = torch.zeros((batch_size, nheads, num_valid_tokens, 1), 
+        denominator_buffer = torch.zeros((batch_size, nheads, block_size, 1), 
                                        device=q_fp32.device, dtype=accum_dtype)
 
         # Pre-compute global indices for queries and a base for keys
         query_global_indices = torch.arange(current_rank_token_global_start_idx, 
-                                            current_rank_token_global_start_idx + num_valid_tokens, 
+                                            current_rank_token_global_start_idx + block_size, 
                                             device=q_fp32.device)
         # Assuming strategy.block_size is the max possible length for a received K block
         base_key_indices_for_block = torch.arange(0, strategy.block_size, device=q_fp32.device)
@@ -116,17 +102,14 @@ class RingAttentionKernel:
 
         # main ring attention 
         out = RingAttentionKernel._compute_attention_ring(
-            q_fp32, k_fp32, v_fp32, mask_fp32, strategy, 
-            current_rank_token_global_start_idx, num_valid_tokens, scale, causal,
+            q_fp32, k_fp32, v_fp32, mask, strategy, 
+            current_rank_token_global_start_idx, block_size, scale, causal,
             max_score_buffer, numerator_buffer, denominator_buffer,
             query_global_indices, base_key_indices_for_block
         )
 
-        if valid_len:
-            proj = out.transpose(1, 2).reshape(batch_size, valid_len, -1)
-            out = attn_module.dense(proj.to(x_norm.dtype)) # Cast back to original dtype
-        else:
-            out = torch.empty((batch_size, 0, emb_dim), device=x_norm.device, dtype=x_norm.dtype)
+        proj = out.transpose(1, 2).reshape(batch_size, strategy.block_size, -1)
+        out = attn_module.dense(proj.to(x_norm.dtype)) # Cast back to original dtype
 
         return out
 
@@ -166,10 +149,10 @@ class RingAttentionKernel:
         q_fp32: Tensor,
         k_fp32: Tensor, # Initial K for this rank
         v_fp32: Tensor, # Initial V for this rank
-        mask_fp32: Optional[Tensor],
+        mask: Optional[Tensor],
         strategy: RingAttentionStrategy,
         q_start: int, # global start index for queries in q
-        num_valid_tokens: int,   # number of queries in q for this rank's block (num_queries_in_block)
+        block_size: int,   # number of queries in q for this rank's block (num_queries_in_block)
         scale: float,
         causal: bool,
         # Pre-allocated buffers and indices
@@ -181,12 +164,12 @@ class RingAttentionKernel:
     ) -> Tensor:
         
         RingAttentionKernel._max_pass(
-            q_fp32, k_fp32.clone(), mask_fp32, q_start, num_valid_tokens, strategy, scale, causal, 
+            q_fp32, k_fp32.clone(), mask, q_start, block_size, strategy, scale, causal, 
             max_score_buffer, query_global_indices, base_key_indices_for_block
         )
 
         RingAttentionKernel._sum_pass(
-            q_fp32, k_fp32.clone(), v_fp32.clone(), mask_fp32, q_start, num_valid_tokens, 
+            q_fp32, k_fp32.clone(), v_fp32.clone(), mask, q_start, block_size, 
             max_score_buffer, strategy, scale, causal,
             numerator_buffer, denominator_buffer, query_global_indices, base_key_indices_for_block
         )
@@ -220,11 +203,11 @@ class RingAttentionKernel:
     
     @staticmethod
     def _max_pass(
-        q_fp32: Tensor,
-        k_fp32_current: Tensor, # This tensor will be shifted in place (or rather, reassigned)
-        mask_fp32: Optional[Tensor],
+        q: Tensor,
+        k: Tensor, # This tensor will be shifted in place (or rather, reassigned)
+        mask: Optional[Tensor],
         q_start: int, # global start index for queries in q
-        num_valid_tokens: int,   # number of queries in q for this rank's block
+        block_size: int,   # number of queries in q for this rank's block
         strategy: RingAttentionStrategy,
         scale: float,
         causal: bool,
@@ -235,25 +218,26 @@ class RingAttentionKernel:
     ) -> Tensor:
         # max_score_buffer is already initialized to min float value
 
+        q_fp32, k_fp32_current, mask_current = q, k, mask
+
         for i in range(strategy.world_size):
             source_rank = (strategy.rank - i) % strategy.world_size
             block_offset_for_source_rank = source_rank * strategy.block_size
             k_len_current_block = k_fp32_current.shape[2]
             
-            if num_valid_tokens and k_len_current_block:
+            if block_size and k_len_current_block:
                 # Use precomputed base_key_indices and slice if k_len_current_block is smaller
                 key_indices_slice = base_key_indices_for_block[:k_len_current_block]
                 key_block_global_indices = key_indices_slice + block_offset_for_source_rank
                 
-                current_attention_mask_slice = (mask_fp32[..., q_start:q_start+num_valid_tokens, block_offset_for_source_rank:block_offset_for_source_rank+k_len_current_block]
-                        if mask_fp32 is not None else None)
-                current_scores = RingAttentionKernel._attn_scores(q_fp32, k_fp32_current, query_global_indices, key_block_global_indices, scale, current_attention_mask_slice, causal)
+                current_scores = RingAttentionKernel._attn_scores(q_fp32, k_fp32_current, query_global_indices, key_block_global_indices, scale, mask_current, causal)
                 torch.maximum(max_score_buffer, current_scores.amax(dim=-1, keepdim=True), out=max_score_buffer)
 
             # no need for last round communication
             if i < strategy.world_size - 1:
                 # ring attention communication -- shift kvs
                 k_fp32_current, _ = strategy._ring_shift_tensor(k_fp32_current, k_len_current_block)
+                mask_current, _ = strategy._ring_shift_tensor(mask_current, k_len_current_block)
 
     @staticmethod
     def _sum_pass(
@@ -262,7 +246,7 @@ class RingAttentionKernel:
         v: Tensor,
         mask: Optional[Tensor],
         q_start: int, # global start index for queries in q
-        num_valid_tokens: int,   # number of queries in q for this rank's block
+        block_size: int,   # number of queries in q for this rank's block
         max_score: Tensor,
         strategy: RingAttentionStrategy,
         scale: float,
@@ -275,7 +259,7 @@ class RingAttentionKernel:
     ) -> Tuple[Tensor, Tensor]:
         # numerator_buffer and denominator_buffer are already initialized to zeros
         # q, k, v are already in accum_dtype
-        q_fp32, k_fp32_current, v_fp32_current = q, k, v # Use current to denote they will be shifted
+        q_fp32, k_fp32_current, v_fp32_current, mask_current = q, k, v, mask
         
         accum_dtype_val = q_fp32.dtype # Get the actual accum_dtype from the tensor
         log_min_exp_threshold = math.log(torch.finfo(accum_dtype_val).tiny) + 1.0
@@ -286,14 +270,12 @@ class RingAttentionKernel:
             block_offset_for_source_rank = source_rank * strategy.block_size
             k_len_current_block = k_fp32_current.shape[2]
 
-            if num_valid_tokens and k_len_current_block:
+            if block_size and k_len_current_block:
                 # Use precomputed base_key_indices and slice if k_len_current_block is smaller
                 key_indices_slice = base_key_indices_for_block[:k_len_current_block]
                 key_block_global_indices = key_indices_slice + block_offset_for_source_rank
 
-                current_attention_mask_slice = (mask[..., q_start:q_start+num_valid_tokens, block_offset_for_source_rank:block_offset_for_source_rank+k_len_current_block]
-                        if mask is not None else None) # mask is already fp32 if not None
-                current_scores = RingAttentionKernel._attn_scores(q_fp32, k_fp32_current, query_global_indices, key_block_global_indices, scale, current_attention_mask_slice, causal)
+                current_scores = RingAttentionKernel._attn_scores(q_fp32, k_fp32_current, query_global_indices, key_block_global_indices, scale, mask_current, causal)
                 score_delta = torch.where(torch.isneginf(max_score), float("-inf"), current_scores - max_score)
                 exp_scores = torch.exp(score_delta.clamp(min=log_min_exp_threshold, max=log_max_exp_threshold))
                 exp_scores = exp_scores.masked_fill(torch.isneginf(max_score), 0.0)
@@ -305,4 +287,5 @@ class RingAttentionKernel:
                 # ring attention communication -- shift kvs
                 k_fp32_current, _ = strategy._ring_shift_tensor(k_fp32_current, k_len_current_block)
                 v_fp32_current, _ = strategy._ring_shift_tensor(v_fp32_current, k_len_current_block)
+                mask_current, _ = strategy._ring_shift_tensor(mask_current, k_len_current_block)
     

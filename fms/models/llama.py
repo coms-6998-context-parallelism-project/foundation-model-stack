@@ -357,7 +357,9 @@ class LLaMA(nn.Module):
         # x_in: batch_size x seq_len
         # mask: batch_size x seq_len x seq_len
         # bias: nheads x seq_len x seq_len
-        original_seq_len = x_in.size(1) # Capture original sequence length
+        batch_size       = x_in.size(0)
+        original_seq_len = x_in.size(1) 
+
         if past_key_value_states is None or len(past_key_value_states) == 0:
             past_key_value_states = [None for _ in range(len(self.layers))]
 
@@ -382,7 +384,23 @@ class LLaMA(nn.Module):
         x_in = self.shared(x_in)
 
         if isinstance(distributed_strategy, RingAttentionStrategy):
-            x_in = self.distributed_strategy.shard_input(x_in)
+
+            x_in = distributed_strategy.shard_input(x_in)      
+
+            if mask is None:
+                mask_full = x_in.new_zeros((batch_size, 1, original_seq_len, original_seq_len))
+            else:
+                mask_full = mask
+            mask = distributed_strategy.shard_mask(mask_full)      
+
+            if position_ids is None:
+                 # shape (B, L)
+                pos_full = torch.arange(
+                     original_seq_len, device=x_in.device
+                 ).unsqueeze(0).expand(batch_size, -1)
+            else:
+                 pos_full = position_ids
+            position_ids = distributed_strategy.shard_position_ids(pos_full)
 
 
         # this is the output cache for all the decoder layers

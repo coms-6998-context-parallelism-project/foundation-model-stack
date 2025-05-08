@@ -62,6 +62,14 @@ def init_csv_logging(csv_filepath, rank):
             csv_writer = None
             csv_file_handle = None
 
+def close_csv_logging():
+    global csv_file_handle, csv_writer
+    if csv_file_handle:
+        csv_file_handle.close()
+        print0("[INFO] CSV logging file closed.")
+        csv_file_handle = None
+        csv_writer = None
+
 def log_to_csv(event_type, key, value, strategy_label="N/A", prompt_n="N/A"):
     if csv_writer:
         timestamp = time_module.strftime("%Y-%m-%d %H:%M:%S")

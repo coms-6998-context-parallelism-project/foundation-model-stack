@@ -3,7 +3,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Tuple
 
-from fms.models.ring_attention_helper import RingAttentionHelper
 import torch
 import torch.nn as nn
 
@@ -14,11 +13,7 @@ from fms.distributed.strategy import (
     RingAttentionStrategy,
     TensorParallelStrategy,
 )
-
-from fms.models.llama_ring import (
-    forward_ring,
-    _forward_ring_attention,
-)
+from fms.models.llama_ring import RingAttentionKernel # Import the new kernel
 
 
 from fms.modules.attention import MultiHeadAttention
@@ -72,9 +67,6 @@ class LLaMABlock(nn.Module):
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
 
-        # Make _forward_ring_attention available as an instance method
-        self._forward_ring_attention = _forward_ring_attention.__get__(self, LLaMABlock)
-
         self.ln = LayerNormParameterized(
             self.config.emb_dim,
             elementwise_scale=True,
@@ -124,8 +116,6 @@ class LLaMABlock(nn.Module):
         if self.config.p_dropout != 0:
             self.dropout = nn.Dropout(self.config.p_dropout)
 
-        self.ring_helper = None # Initialize to None, will be created on first use with the correct strategy
-
     def forward(
         self,
         x,
@@ -140,17 +130,25 @@ class LLaMABlock(nn.Module):
     ):
 
         if isinstance(distributed_strategy, RingAttentionStrategy):
-            # print(torch.distributed.get_rank(), x.shape)
-            return forward_ring(
-                self,
-                x,
-                mask=mask,
-                position_ids=position_ids,
-                past_key_value_state=past_key_value_state,
-                use_cache=use_cache,
+            # assert local_valid_len is not None, "local_valid_len must be provided for RingAttentionStrategy"
+
+            # Apply input norm for attention, as RingAttentionKernel expects normalized input
+            x_norm = self.ln(x)
+            
+            # RingAttentionKernel.forward handles the entire block's operations
+            # (Attn -> Residual -> LN -> FFN -> Residual)
+            output_from_kernel, cache_from_kernel = RingAttentionKernel.forward(
+                x_norm=x_norm, # Normalized input for attention
+                residual=x,     # Original input for the first residual connection
+                attn_module=self.attn,
+                ff=self.ff_sub_layer,
+                ff_norm=self.ff_ln, # Norm before FFN
+                strategy=distributed_strategy,
+                valid_len=distributed_strategy._local_valid_len,
+                mask=mask, # Global mask
+                position_ids=position_ids, # Sharded position_ids
+                past_key_value_state=None, 
                 is_causal_mask=is_causal_mask,
-                attn_algorithm=attn_algorithm,
-                distributed_strategy=distributed_strategy,
             )
         
 

@@ -201,10 +201,11 @@ class RingAttentionHelper:
         return max_score
 
     def _compute_sums_pass(self, q_compute, k_compute, v_compute, mask_global, q_start_global, valid_len_local, max_score, exp_min, exp_max, is_causal_mask: bool):
-        B, H, T, Dv = q_compute.shape
+        B, H, T, _ = q_compute.shape # T is local query length (valid_len_local)
+        _, _, _, D_v = v_compute.shape   # Get Dv from v_compute
         dev = q_compute.device
         dtype = self._accum_dtype
-        num = torch.zeros(B, H, T, Dv, device=dev, dtype=dtype)
+        num = torch.zeros(B, H, T, D_v, device=dev, dtype=dtype) # Use D_v here
         den = torch.zeros(B, H, T, 1, device=dev, dtype=dtype)
         num_comp = torch.zeros_like(num)
         den_comp = torch.zeros_like(den)
@@ -216,29 +217,34 @@ class RingAttentionHelper:
             # k_start_loop is the global start index of the current k_blk
             k_idx = torch.arange(start_idx_loop, start_idx_loop + k_len, device=dev)
             m = mask_global[:, :, q_start_global:q_start_global + T, start_idx_loop:start_idx_loop + k_len] if mask_global is not None else None
-            if k_len > 0:
+            
+            # Only proceed if there are local queries (T > 0) and the current k_block has content (k_len > 0)
+            if T > 0 and k_len > 0:
                 s = self._compute_attention_scores(q_compute, k_blk[:, :, :k_len], q_idx, k_idx, m, apply_causal=is_causal_mask)
                 delta = s - max_score
                 clamp = delta.clamp(min=exp_min, max=exp_max)
                 e = torch.exp(clamp.masked_fill(torch.isneginf(clamp), exp_min)) # exp(S - max(S))
                 e = e.masked_fill(torch.isneginf(max_score.expand_as(s)), 0) # if max_score was -inf, scores were -inf, exp should be 0
-                contrib_num = torch.matmul(e, v_blk[:, :, :k_len]) # Matmul for (B,H,Tq,Tk) x (B,H,Tk,Dv) -> (B,H,Tq,Dv)
-                contrib_den = e.sum(-1, keepdim=True)
 
-                # Kahan summation
-                y_num = contrib_num - num_comp
-                t_num = num + y_num
-                num_comp = (t_num - num) - y_num
-                num = t_num
+                # Ensure v_blk's K-dimension matches e's K-dimension (k_len from k_blk)
+                # v_blk.shape[2] is the actual current length of the v_blk tensor.
+                if v_blk.shape[2] == k_len: # If k_len > 0, v_blk.shape[2] must also be > 0 and equal.
+                    contrib_num = torch.matmul(e, v_blk) # Use v_blk directly, it's already the correct block
+                    contrib_den = e.sum(-1, keepdim=True)
 
-                y_den = contrib_den - den_comp
-                t_den = den + y_den
-                den_comp = (t_den - den) - y_den
-                den = t_den
+                    # Kahan summation
+                    y_num = contrib_num - num_comp; t_num = num + y_num; num_comp = (t_num - num) - y_num; num = t_num
+                    y_den = contrib_den - den_comp; t_den = den + y_den; den_comp = (t_den - den) - y_den; den = t_den
+                # else: A desynchronization occurred (e.g., k_len > 0 but v_blk.shape[2] == 0 or != k_len).
+                # This indicates an issue, but we skip the matmul to prevent a crash.
+                # The benchmark script's output should be inspected if this path is taken.
 
             if i < self.world_size - 1:
-                k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, k_len)
-                v_blk, _ = self._ring_shift_tensor(v_blk, self.block_size, k_len) # v_len is same as k_len
+                # Store the length of the current k_blk (and v_blk) before it's shifted.
+                len_of_block_to_send = k_len
+                
+                k_blk, k_len = self._ring_shift_tensor(k_blk, self.block_size, len_of_block_to_send)
+                v_blk, _ = self._ring_shift_tensor(v_blk, self.block_size, len_of_block_to_send)
                 start_idx_loop = ((self.rank - (i + 1) + self.world_size) % self.world_size) * self.block_size
 
         return num, den

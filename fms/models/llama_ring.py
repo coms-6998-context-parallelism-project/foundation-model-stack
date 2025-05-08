@@ -1,118 +1,232 @@
-from typing import Any, List, Mapping, Optional, Tuple, Union # Keep necessary types
-
+import math
 import torch
 import torch.nn as nn
-import torch.distributed as dist
+from torch import Tensor
+from typing import Optional, Tuple
 
-# Keep only FMS components used directly in these functions or their type hints
-from fms.models.ring_attention_helper import RingAttentionHelper
-from fms.distributed.strategy import DistributedStrategy, RingAttentionStrategy # Need both for type hints
+from fms.modules.attention import MultiHeadAttention
+from fms.distributed.strategy import RingAttentionStrategy
 
+class RingAttentionKernel:
 
-# Assigned to LLaMABlock.forward when RingAttentionStrategy is used
-def forward_ring(
-    self: nn.Module, # LLaMABlock instance
-    x: torch.Tensor,
-    *,
-    mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.Tensor] = None,
-    past_key_value_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    use_cache: bool = False, # Passed from LLaMA model
-    is_causal_mask: bool = False,
-    attn_algorithm: Optional[str] = None,
-    distributed_strategy: Optional[DistributedStrategy] = None, # Expected RingAttentionStrategy
-    # Add debug passthrough
-    debug_label: str = "RingAttentionBlock",
-    layer_idx: int = -1,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
+    @staticmethod
+    def forward(
+        x_norm: Tensor,
+        attn_module: MultiHeadAttention,
+        strategy: RingAttentionStrategy,
+        valid_len: int,
+        *,
+        mask: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
+        past_key_value_state: Optional[Tuple[Tensor, Tensor]] = None,
+        causal: bool = False,
+    ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
 
-    # Dispatch to helper function assigned to the block
-    # Unpacks 3 values from _forward_ring_attention
-    x_out, cache_out, _ = self._forward_ring_attention(
-        x,
-        mask=mask,
-        position_ids=position_ids,
-        past_key_value_state=past_key_value_state,
-        use_cache=use_cache,
-        is_causal_mask=is_causal_mask,
-        strategy=distributed_strategy,
-        debug_label=debug_label,
-        layer_idx=layer_idx,
-    )
+        batch_size, num_valid_tokens_input_shard, emb_dim = x_norm.shape 
+        assert num_valid_tokens_input_shard == valid_len
+        current_rank_token_global_start_idx = strategy.rank * strategy.block_size
 
-    first_block_debug_out_ring = None
-    # We need rank here. The `self` is LLaMABlock, strategy is passed.
-    rank_for_ring = distributed_strategy.rank if isinstance(distributed_strategy, RingAttentionStrategy) else 0
+        # slice to valid length to be safe
+        current_rank_input_slice = x_norm[:, :valid_len]
 
-    if rank_for_ring == 0 and layer_idx == 0: # Collect for layer 0, rank 0 portion
-        # x_out is the sharded, padded output of the block for this rank
-        # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank_for_ring}, Tensor: LLaMABlock_final_output_RING_Rank0_portion): norm = {torch.linalg.norm(x_out.float()).item()}")
-        first_block_debug_out_ring = x_out.clone() # Collect sharded output
+        if position_ids is not None:
+            position_ids_for_rope_computation = position_ids[:, current_rank_token_global_start_idx : current_rank_token_global_start_idx + valid_len]
+        elif valid_len > 0:
+            position_ids_for_rope_computation = torch.arange(current_rank_token_global_start_idx, current_rank_token_global_start_idx + valid_len, device=x_norm.device).unsqueeze(0).expand(batch_size, -1)
+        else:
+            position_ids_for_rope_computation = None
 
-    if use_cache:
-        # When use_cache is True, return the main output, the cache, and optionally debug info
-        return x_out, cache_out #, first_block_debug_out_ring # Decide if debug info is part of cache tuple
-    else:
-        # When use_cache is False, only return the main tensor output
-        return x_out # first_block_debug_out_ring can be handled differently if needed
+        # compute QKV + RoPE
+        if valid_len:
+            q, k, v = RingAttentionKernel._compute_qkv_and_rope(
+                attn_module, current_rank_input_slice, position_ids_for_rope_computation
+            )
+            kv_cache = (k, v)
+        else:
+            nheads, emb_kq_per_head, emb_v_per_head = attn_module.nheads, attn_module.emb_kq_per_head, attn_module.emb_v_per_head
+            q = k = torch.empty((batch_size, nheads, 0, emb_kq_per_head), device=x_norm.device, dtype=x_norm.dtype)
+            v = torch.empty((batch_size, nheads, 0, emb_v_per_head), device=x_norm.device, dtype=x_norm.dtype)
+            kv_cache = None
 
+        scale = attn_module.scale_factor or math.sqrt(attn_module.emb_kq_per_head)
+        
+        accum_dtype = torch.float32
 
-# Assigned to LLaMABlock._forward_ring_attention
-def _forward_ring_attention(
-    self: nn.Module, # LLaMABlock instance
-    x: torch.Tensor, # Sharded, padded input
-    *,
-    mask: Optional[torch.Tensor],
-    position_ids: Optional[torch.Tensor],
-    past_key_value_state: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    use_cache: bool,
-    is_causal_mask: bool,
-    strategy: DistributedStrategy, # Expected RingAttentionStrategy
-    # Add debug passthrough
-    debug_label: str = "RingAttentionBlock", # Default, will be overridden
-    layer_idx: int = -1, # Default, will be overridden
-) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Any]: # Returns (output, cache, extra)
-
-    assert isinstance(strategy, RingAttentionStrategy), f"Expected RingAttentionStrategy, got {type(strategy)}"
-
-    residual = x
-    x_norm_local = self.ln(x)
-
-    rank = strategy.rank # Get rank from strategy
-    correct_valid_len = strategy.get_local_valid_len() # Valid tokens on this rank
-
-    # Lazy init RingAttentionHelper on first call with this strategy
-    if self.ring_helper is None or self.ring_helper.strategy is not strategy:
-        self.ring_helper = RingAttentionHelper(
-            attn_module=self.attn,
-            strategy=strategy,
-            llama_block=self,
-            use_cache=use_cache,
-            ff=self.ff_sub_layer,
-            ff_norm=self.ff_ln,
+        # main ring attention 
+        out = RingAttentionKernel._compute_attention_ring(
+            q, k, v, mask, strategy, current_rank_token_global_start_idx, valid_len, scale, accum_dtype, causal # valid_len is num_valid_tokens for this rank
         )
 
-    # Debug print for input to RingAttentionHelper.forward (Rank 0's portion)
-    if rank == 0 and layer_idx == 0:
-        # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: input_to_RingHelper_x_norm_local_Rank0): norm = {torch.linalg.norm(x_norm_local.float()).item()}")
-        pass
+        if valid_len:
+            proj = out.transpose(1, 2).reshape(batch_size, valid_len, -1)
+            out = attn_module.dense(proj)
+        else:
+            out = torch.empty((batch_size, 0, emb_dim), device=x_norm.device, dtype=x_norm.dtype)
 
-    # Call helper's core logic
-    output, cache_from_helper, extra_output = self.ring_helper.forward(
-        x_norm_local,
-        mask=mask,
-        strategy=strategy,
-        position_ids=position_ids, # Pass global position_ids
-        past_key_value_state=past_key_value_state,
-        is_causal_mask=is_causal_mask,
-        valid_len=correct_valid_len,
-        residual=residual,
-    )
+        return out, kv_cache
+
+
+    @staticmethod
+    def _compute_qkv_and_rope(
+        attn: MultiHeadAttention,
+        x: Tensor,
+        rope_position_ids: Optional[Tensor]
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        batch_size, seq_len, _ = x.shape # x is current_rank_input_slice, so seq_len is valid_len for this rank
+        q_proj, k_proj, v_proj = attn.in_proj(x, None, None)
+        nheads, kvheads = attn.nheads, attn.kvheads
+        emb_kq_per_head, emb_v_per_head = attn.emb_kq_per_head, attn.emb_v_per_head
+
+        # reshape & apply RoPE if needed
+        q = q_proj.view(batch_size, seq_len, nheads, emb_kq_per_head)
+        k = k_proj.view(batch_size, seq_len, kvheads, emb_kq_per_head)
+        v = v_proj.view(batch_size, seq_len, kvheads, emb_v_per_head)
+        if attn.position_encoder and seq_len:
+            assert rope_position_ids is not None
+            valid_rope_pos_mask = rope_position_ids.ne(-1)
+            if valid_rope_pos_mask.any():
+                rope_internal_max_seq_len = getattr(attn.position_encoder, "max_seq_len", 2048)
+                clamped_rope_ids = rope_position_ids.clamp(0, rope_internal_max_seq_len - 1)
+                q, k = attn.position_encoder.adjusted_qk(q, k, clamped_rope_ids)
+
+        q, k, v = [x_tensor.permute(0, 2, 1, 3) for x_tensor in (q, k, v)]
+        if nheads != kvheads:
+            kv_to_q_head_ratio = nheads // kvheads
+            k = k.repeat_interleave(kv_to_q_head_ratio, dim=1)
+            v = v.repeat_interleave(kv_to_q_head_ratio, dim=1)
+        return q, k, v
     
-    # Debug print for output of RingAttentionHelper.forward (Rank 0's portion)
-    # This 'output' is the block's final output for this rank, padded.
-    if rank == 0 and layer_idx == 0:
-        # print(f"DEBUG ({debug_label}, Layer {layer_idx}, Rank {rank}, Tensor: output_from_RingHelper_BlockOutput_Rank0_portion): norm = {torch.linalg.norm(output.float()).item()}")
-        pass
+    @staticmethod
+    def _compute_attention_ring(
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Optional[Tensor],
+        strategy: RingAttentionStrategy,
+        q_start: int, # global start index for queries in q
+        num_valid_tokens: int,   # number of queries in q for this rank's block (num_queries_in_block)
+        scale: float,
+        accum_dtype: torch.dtype,
+        causal: bool,
+    ) -> Tensor:
+        max_score = RingAttentionKernel._max_pass(
+            q, k, mask, q_start, num_valid_tokens, strategy, scale, causal, accum_dtype
+        )
+        numerator_out, denominator_out = RingAttentionKernel._sum_pass(
+            q, k, v, mask, q_start, num_valid_tokens, max_score, strategy, scale, accum_dtype, causal
+        )
+        if num_valid_tokens == 0:
+            return torch.empty((q.shape[0], q.shape[1], 0, v.shape[-1]),
+                               device=q.device, dtype=q.dtype)
+        return (numerator_out / (denominator_out + torch.finfo(denominator_out.dtype).eps)).to(q.dtype)
+    
 
-    return output, cache_from_helper, extra_output
+    @staticmethod
+    def _attn_scores(
+        Q: Tensor,
+        K: Tensor,
+        query_indices: Tensor, # global indices for queries in Q
+        key_indices: Tensor,   # global indices for keys in K
+        scale: float,
+        mask: Optional[Tensor],
+        causal: bool,
+    ) -> Tensor:
+        batch_size, nheads, num_q, _ = Q.shape # num_q is num_queries_in_block for Q
+        num_k = K.shape[2]          # num_k is current_block_k_len for K
+        if num_q == 0 or num_k == 0:
+            return Q.new_empty((batch_size, nheads, num_q, num_k))
+
+        scores = torch.matmul(Q / scale, K.transpose(-2, -1))
+        if mask is not None:
+            scores = scores + mask.to(scores.dtype)
+        if causal:
+            # build a [1,1,q_len,k_len] mask where key_pos > query_pos
+            future_mask = (key_indices[None, :] > query_indices[:, None])
+            future_mask = future_mask.unsqueeze(0).unsqueeze(0) 
+            scores = scores.masked_fill(future_mask, float("-inf"))
+        return scores
+    @staticmethod
+    def _max_pass(
+        q: Tensor,
+        k: Tensor,
+        mask: Optional[Tensor],
+        q_start: int, # global start index for queries in q
+        num_valid_tokens: int,   # number of queries in q for this rank's block
+        strategy: RingAttentionStrategy,
+        scale: float,
+        causal: bool,
+        accum_dtype: torch.dtype,
+    ) -> Tensor:
+        batch_size, nheads, _, _ = q.shape
+        max_score = torch.full((batch_size, nheads, num_valid_tokens, 1),
+                               torch.finfo(accum_dtype).min,
+                               device=q.device, dtype=accum_dtype)
+        query_global_indices = torch.arange(q_start, q_start + num_valid_tokens, device=q.device)
+        q_fp32 = q.to(accum_dtype)
+        k_fp32 = k.to(accum_dtype)
+
+        for i in range(strategy.world_size):
+            source_rank = (strategy.rank - i) % strategy.world_size
+            block_offset_for_source_rank = source_rank * strategy.block_size
+            k_len_current_block = k_fp32.shape[2]
+            if num_valid_tokens and k_len_current_block:
+                key_block_global_indices = torch.arange(block_offset_for_source_rank, block_offset_for_source_rank + k_len_current_block, device=q.device)
+                current_attention_mask_slice = (mask[..., q_start:q_start+num_valid_tokens, block_offset_for_source_rank:block_offset_for_source_rank+k_len_current_block]
+                        if mask is not None else None)
+                current_scores = RingAttentionKernel._attn_scores(q_fp32, k_fp32, query_global_indices, key_block_global_indices, scale, current_attention_mask_slice, causal)
+                max_score = torch.maximum(max_score, current_scores.amax(dim=-1, keepdim=True))
+
+            # no need for last round communication
+            if i < strategy.world_size - 1:
+                k_fp32, _ = strategy._ring_shift_tensor(k_fp32, k_len_current_block)
+
+        return max_score
+
+    @staticmethod
+    def _sum_pass(
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Optional[Tensor],
+        q_start: int, # global start index for queries in q
+        num_valid_tokens: int,   # number of queries in q for this rank's block
+        max_score: Tensor,
+        strategy: RingAttentionStrategy,
+        scale: float,
+        accum_dtype: torch.dtype,
+        causal: bool,
+    ) -> Tuple[Tensor, Tensor]:
+        batch_size, nheads, _, _ = q.shape
+        emb_v_per_head = v.shape[-1]
+        numerator = torch.zeros((batch_size, nheads, num_valid_tokens, emb_v_per_head), device=q.device, dtype=accum_dtype)
+        denomminator = torch.zeros((batch_size, nheads, num_valid_tokens, 1), device=q.device, dtype=accum_dtype)
+        query_global_indices = torch.arange(q_start, q_start + num_valid_tokens, device=q.device)
+        q_fp32 = q.to(accum_dtype)
+        k_fp32 = k.to(accum_dtype)
+        v_fp32 = v.to(accum_dtype)
+        
+        log_min_exp_threshold = math.log(torch.finfo(accum_dtype).tiny) + 1.0
+        log_max_exp_threshold = math.log(torch.finfo(accum_dtype).max) - 1.0
+
+        for i in range(strategy.world_size):
+            source_rank = (strategy.rank - i) % strategy.world_size
+            block_offset_for_source_rank = source_rank * strategy.block_size
+            k_len_current_block = k_fp32.shape[2]
+            if num_valid_tokens and k_len_current_block:
+                key_block_global_indices = torch.arange(block_offset_for_source_rank, block_offset_for_source_rank + k_len_current_block, device=q.device)
+                current_attention_mask_slice = (mask[..., q_start:q_start+num_valid_tokens, block_offset_for_source_rank:block_offset_for_source_rank+k_len_current_block]
+                        if mask is not None else None)
+                current_scores = RingAttentionKernel._attn_scores(q_fp32, k_fp32, query_global_indices, key_block_global_indices, scale, current_attention_mask_slice, causal)
+                score_delta = torch.where(torch.isneginf(max_score), float("-inf"), current_scores - max_score)
+                exp_scores = torch.exp(score_delta.clamp(min=log_min_exp_threshold, max=log_max_exp_threshold))
+                exp_scores = exp_scores.masked_fill(torch.isneginf(max_score), 0.0)
+                numerator += torch.matmul(exp_scores, v_fp32.narrow(2, 0, k_len_current_block))
+                denomminator += exp_scores.sum(dim=-1, keepdim=True)
+            
+            # no need for last round communication
+            if i < strategy.world_size - 1:
+                k_fp32, _ = strategy._ring_shift_tensor(k_fp32, k_len_current_block)
+                v_fp32, _ = strategy._ring_shift_tensor(v_fp32, k_len_current_block)
+
+        return numerator, denomminator
+    

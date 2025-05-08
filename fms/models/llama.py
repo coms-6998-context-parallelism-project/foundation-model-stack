@@ -3,7 +3,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Tuple
 
-from fms.models.ring_attention_helper import RingAttentionHelper
 import torch
 import torch.nn as nn
 
@@ -14,11 +13,7 @@ from fms.distributed.strategy import (
     RingAttentionStrategy,
     TensorParallelStrategy,
 )
-
-from fms.models.llama_ring import (
-    forward_ring,
-    _forward_ring_attention,
-)
+from fms.models.llama_ring import RingAttentionKernel # Import the new kernel
 
 
 from fms.modules.attention import MultiHeadAttention
@@ -72,9 +67,6 @@ class LLaMABlock(nn.Module):
         emb_kq = self.config.emb_dim // self.config.nheads
         emb_v = self.config.emb_dim // self.config.nheads
 
-        # Make _forward_ring_attention available as an instance method
-        self._forward_ring_attention = _forward_ring_attention.__get__(self, LLaMABlock)
-
         self.ln = LayerNormParameterized(
             self.config.emb_dim,
             elementwise_scale=True,
@@ -124,8 +116,6 @@ class LLaMABlock(nn.Module):
         if self.config.p_dropout != 0:
             self.dropout = nn.Dropout(self.config.p_dropout)
 
-        self.ring_helper = None # Initialize to None, will be created on first use with the correct strategy
-
     def forward(
         self,
         x,
@@ -139,58 +129,58 @@ class LLaMABlock(nn.Module):
         distributed_strategy: Optional[DistributedStrategy] = None,
     ):
 
+        residual_pre_attn = x 
+        x_norm_for_attn = self.ln(x)
+
         if isinstance(distributed_strategy, RingAttentionStrategy):
-            # print(torch.distributed.get_rank(), x.shape)
-            return forward_ring(
-                self,
-                x,
+            x_attn_output, ring_kv_cache = RingAttentionKernel.forward(
+                x_norm=x_norm_for_attn,
+                attn_module=self.attn,
+                strategy=distributed_strategy,
+                valid_len=distributed_strategy._local_valid_len,
+                mask=mask, 
+                position_ids=position_ids, # Sharded position_ids
+                past_key_value_state=past_key_value_state, 
+                causal=is_causal_mask,
+            )
+            
+
+            x = x_attn_output
+            cache = ring_kv_cache
+
+        else:
+            self_attn_past_key_value = past_key_value_state
+            
+            attn_outputs = self.attn(
+                q=x_norm_for_attn,
                 mask=mask,
                 position_ids=position_ids,
-                past_key_value_state=past_key_value_state,
-                use_cache=use_cache,
-                is_causal_mask=is_causal_mask,
                 attn_algorithm=attn_algorithm,
-                distributed_strategy=distributed_strategy,
+                past_key_value_state=self_attn_past_key_value,
+                use_cache=use_cache,
+                is_self=True,
+                is_causal_mask=is_causal_mask,
             )
+            
+            if use_cache:
+                x, cache = attn_outputs
+            else:
+                x = attn_outputs
         
-
-
-        # if the cache is not empty, we need to get the kv cache for self and cross attention
-        self_attn_past_key_value = past_key_value_state
-        # if past_key_value_state is not None:
-        #     self_attn_past_key_value = past_key_value_state[:2]
-        # else:
-        #     self_attn_past_key_value = None
-
-        # first we do MHA and Add&Norm
-        residual = x
-        x = self.ln(x)
-        x = self.attn(
-            q=x,
-            mask=mask,
-            position_ids=position_ids,
-            attn_algorithm=attn_algorithm,
-            past_key_value_state=self_attn_past_key_value,
-            use_cache=use_cache,
-            is_self=True,
-            is_causal_mask=is_causal_mask,
-        )
-        cache = None
-        if use_cache:
-            x, cache = x
+        # Common operations after attention (for both Ring and Standard paths)
+        # First residual connection
         if self.config.p_dropout != 0:
             x = self.dropout(x)
-        # residual connection
-        x = x + residual
+        x = x + residual_pre_attn # Add to the original x
 
         # then we do FF and Add&Norm
-        residual = x
+        residual_pre_ffn = x
         x = self.ff_ln(x)
         x = self.ff_sub_layer(x)
         if self.config.p_dropout != 0:
             x = self.dropout(x)
         # another residual
-        x = x + residual
+        x = x + residual_pre_ffn
 
         if use_cache:
             return (x, cache)

@@ -8,7 +8,7 @@ from fms.modules.attention import MultiHeadAttention
 from fms.distributed.strategy import DistributedStrategy, RingAttentionStrategy
 
 
-
+# same signature and replacement for usual llama forward
 def ring_forward(
     self,
     x,
@@ -26,6 +26,7 @@ def ring_forward(
     x_norm = self.ln(x)
 
 
+    # the main calculation for ring attention
     x = RingAttentionKernel.ring_attention(
         x_norm=x_norm,
         attn_module=self.attn,
@@ -63,7 +64,7 @@ class RingAttentionKernel:
         position_ids: Optional[Tensor] = None,
         causal: bool = False,
     ) -> Tensor:
-        print(valid_len, end = ", ")
+
         batch_size, block_size, emb_dim = x_norm.shape 
         assert block_size == strategy.block_size
         current_rank_token_global_start_idx = strategy.rank * strategy.block_size
@@ -81,7 +82,7 @@ class RingAttentionKernel:
         v_fp32 = v.to(accum_dtype)
         mask = mask.to(accum_dtype)
 
-        # Pre-allocate reduction buffers
+        # Pre-allocate buffers
         nheads = q_fp32.shape[1]
         emb_v_per_head = v_fp32.shape[-1]
         max_score_buffer = torch.full((batch_size, nheads, block_size, 1),
@@ -92,7 +93,8 @@ class RingAttentionKernel:
         denominator_buffer = torch.zeros((batch_size, nheads, block_size, 1), 
                                        device=q_fp32.device, dtype=accum_dtype)
 
-        # Pre-compute global indices for queries and a base for keys
+        # Pre-compute global indices for queries and a base for keys - should really be the same as position ids,
+        # but serve different functions and differ by -1 padding
         query_global_indices = torch.arange(current_rank_token_global_start_idx, 
                                             current_rank_token_global_start_idx + block_size, 
                                             device=q_fp32.device)
@@ -233,9 +235,9 @@ class RingAttentionKernel:
             # no need for last round communication
             if i < strategy.world_size - 1:
                 # ring attention communication -- shift kvs
-                k_fp32_current, _ = strategy._ring_shift_tensor(k_fp32_current, k_len_current_block)
-                mask_current, _ = strategy._ring_shift_tensor(mask_current, k_len_current_block)
-
+                k_fp32_current, mask_current = strategy._ring_shift_tensors(
+                            [k_fp32_current, mask_current]
+                        )
     @staticmethod
     def _sum_pass(
         q: Tensor,
@@ -280,8 +282,6 @@ class RingAttentionKernel:
             if i < strategy.world_size - 1:
                 # ring attention communication -- shift kvs
 
-                # should ideally all happen in one pass together
-                k_fp32_current, _ = strategy._ring_shift_tensor(k_fp32_current, k_len_current_block)
-                v_fp32_current, _ = strategy._ring_shift_tensor(v_fp32_current, k_len_current_block)
-                mask_current, _ = strategy._ring_shift_tensor(mask_current, k_len_current_block)
-    
+                k_fp32_current, v_fp32_current, mask_current = strategy._ring_shift_tensors(
+                    [k_fp32_current, v_fp32_current, mask_current]
+                )

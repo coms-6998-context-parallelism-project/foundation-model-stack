@@ -212,36 +212,34 @@ class RingAttentionStrategy(DistributedStrategy):
         return block
 
 
-    def _ring_shift_tensor(
+    def _ring_shift_tensors(
         self,
-        tensor: torch.Tensor,
-        valid_seq_len: int
-    ) -> Tuple[torch.Tensor, int]:
+        tensors: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """
+        Perform a ring‑shift of each tensor in `tensors` across GPUs.
+        """
         if self.world_size == 1:
-            return tensor, valid_seq_len
+            return tensors
 
         send_to   = (self.rank + 1) % self.world_size
         recv_from = (self.rank - 1 + self.world_size) % self.world_size
 
-        to_send = tensor.contiguous()
+        # make sure everything is contiguous
+        to_send  = [t.contiguous() for t in tensors]
+        recv_bufs = [torch.empty_like(t).contiguous() for t in tensors]
 
-        recv_buf = torch.empty_like(to_send)
-        recv_len = torch.empty(1, dtype=torch.int32, device=tensor.device)
-        send_len = torch.tensor([valid_seq_len], dtype=torch.int32, device=tensor.device)
+        # build one big batch of send/recv ops
+        ops: List[P2POp] = []
+        for send_tensor, recv_buf in zip(to_send, recv_bufs):
+            ops.append(P2POp(dist.isend, send_tensor, peer=send_to))
+            ops.append(P2POp(dist.irecv, recv_buf,  peer=recv_from))
 
-        # need to be careful for 2 gpu case to avoid blocking
-        ops = [
-            P2POp(dist.isend, send_len, peer=send_to),
-            P2POp(dist.irecv, recv_len, peer=recv_from),
-            P2POp(dist.isend, to_send, peer=send_to),
-            P2POp(dist.irecv, recv_buf, peer=recv_from),
-        ]
         reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
+        for r in reqs:
+            r.wait()
 
-        new_len = int(recv_len.item())
-        return recv_buf.contiguous(), new_len
+        return recv_bufs
 
     def get_local_valid_len(self) -> int:
         assert self._local_valid_len is not None

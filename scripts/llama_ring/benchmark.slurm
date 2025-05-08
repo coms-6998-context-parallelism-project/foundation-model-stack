@@ -7,7 +7,7 @@
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:2
-#SBATCH --mem=100G
+#SBATCH --mem=70G
 #SBATCH --time=00:10:00
 #SBATCH --output=inference_insomnia_%j.out
 

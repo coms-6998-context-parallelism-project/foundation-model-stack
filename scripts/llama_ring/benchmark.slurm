@@ -3,6 +3,7 @@
 # Slurm script to run Ring Attention inference benchmark using 2 GPUs
 
 #SBATCH --account=edu
+#SBATCH --partition=short
 #SBATCH --job-name=ring_benchmark
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1

@@ -4,7 +4,7 @@
 
 This repository aims to implement the ring attention algorithm described in [Ring Attention with Blockwise Transformers for Near-Infinite Context](https://arxiv.org/abs/2310.01889). The aim of this algorithm is to extend the maximum sequence length feasible for traditional transformer algorithms by parallelising the attention and feed forward layers across context and split it across GPUs.
 
-Since this project is mainly focused on inference optimzations and we had direct instruction from IBM's Antoni Viros i Martin to forgo its usage, we did not use it for this project.
+Since this project is mainly focused on inference optimzations and we had direct instruction from IBM's Antoni Viros i Martin to forgo its usage, we did not use wandb for this project.
 
 ## Code Outline
 
@@ -106,4 +106,3 @@ torchrun --nproc_per_node=2 \
 As a first pass at this algorithim we implemented a fixed blocksize of distributing between GPUS. We ran the following experiment with 2 GPUs which is the max we were able to test with and is well below the regime we believe this algorithm would excel in. Despite that fact, we see promising results shown int he 1024 block size benchmarks when we approach maximum supported sequence length of 2048. Similarly for a block size of 2048, the maximum supported sequence length is 4096 which is also the maximum expected sequence length of llama 7b, and we can see that as we approach that sequence length ring attention scale better than the default attention algorithm.
 
 ![Token Latency](HPML_artifacts/inference_token_latency.png)
-

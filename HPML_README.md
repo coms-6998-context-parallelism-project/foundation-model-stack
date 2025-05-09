@@ -100,3 +100,10 @@ torchrun --nproc_per_node=2 \
   --no_use_cache \
   --distributed
 ```
+
+## Results
+
+As a first pass at this algorithim we implemented a fixed blocksize of distributing between GPUS. We ran the following experiment with 2 GPUs which is the max we were able to test with and is well below the regime we believe this algorithm would excel in. Despite that fact, we see promising results shown int he 1024 block size benchmarks when we approach maximum supported sequence length of 2048. Similarly for a block size of 2048, the maximum supported sequence length is 4096 which is also the maximum expected sequence length of llama 7b, and we can see that as we approach that sequence length ring attention scale better than the default attention algorithm.
+
+![Token Latency](HPML_artifacts/inference_token_latency.png)
+

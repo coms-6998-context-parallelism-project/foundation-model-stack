@@ -4,7 +4,7 @@
 
 This repository aims to implement the ring attention algorithm described in [Ring Attention with Blockwise Transformers for Near-Infinite Context](https://arxiv.org/abs/2310.01889). The aim of this algorithm is to extend the maximum sequence length feasible for traditional transformer algorithms by parallelising the attention and feed forward layers across context and split it across GPUs.
 
-Since this project is mainly focused on inference optimzations and we had direct instruction from IBM's Antoni Viros i Martin to forgo its usage, we did not use it for this project.
+Since this project is mainly focused on inference optimzations and we had direct instruction from IBM's Antoni Viros i Martin to forgo its usage, we did not use wandb for this project.
 
 ## Code Outline
 

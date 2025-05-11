@@ -93,7 +93,7 @@ class RingAttentionKernel:
 
         scale = attn_module.scale_factor or math.sqrt(attn_module.emb_kq_per_head)
         
-        accum_dtype = torch.float32
+        accum_dtype = torch.float64
 
         # main ring attention 
         out = RingAttentionKernel._compute_attention_ring(

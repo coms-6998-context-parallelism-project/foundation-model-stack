@@ -169,7 +169,7 @@ class TensorParallelStrategy(DistributedStrategy):
 class RingAttentionStrategy(DistributedStrategy):
     def __init__(
         self,
-        block_size: int = 2048,
+        block_size: int = 4096,
         group: Optional[dist.ProcessGroup] = None,
         from_meta: bool = False
     ):

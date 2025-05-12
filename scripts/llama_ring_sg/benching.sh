@@ -67,7 +67,7 @@ torchrun --nproc_per_node="$nproc_value" \
   --architecture llama \
   --variant 7b \
   --device_type "$DEVICE_TYPE" \
-  --dtype float16 \
+  --dtype float32 \
   "${passthrough_args[@]}" \
   >"$output_file" 2>&1 &
 

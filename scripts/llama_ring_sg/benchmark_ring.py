@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default=str(model_dir))
     parser.add_argument("--tokenizer", type=str, default=str(tokenizer_path))
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_tokens_to_benchmark", type=int, default=5)
+    parser.add_argument("--num_tokens_to_benchmark", type=int, default=20)
     parser.add_argument("--run_ring_first", action="store_true")
     parser.add_argument("--no-run_ring_first", dest="run_ring_first", action="store_false")
     parser.add_argument("--csv_output_file", type=str, default="benchmark_log.csv", help="Path to the CSV file for logging benchmark results.")

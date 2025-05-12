@@ -6,11 +6,12 @@
 #SBATCH --job-name=ring_benchmark
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:2
 #SBATCH --mem=120G
 #SBATCH --time=00:10:00
 #SBATCH --output=inference_insomnia_%j.out
+#SBATCH --export=ALL,OMP_NUM_THREADS=4
 
 echo "========================================================"
 echo "Starting Ring Attention Benchmark on $(hostname) at $(date)"

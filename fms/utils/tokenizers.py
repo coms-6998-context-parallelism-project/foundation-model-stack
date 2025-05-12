@@ -123,7 +123,7 @@ class _HFTokenizer(BaseTokenizer):
     def __init__(self, name: str):
         from transformers import AutoTokenizer  # type: ignore
 
-        self.tokenizer = AutoTokenizer.from_pretrained(name)
+        self.tokenizer = AutoTokenizer.from_pretrained(name, local_files_only=True)
         super().__init__(self.tokenizer.bos_token_id, self.tokenizer.eos_token_id)
 
     def tokenize(self, text: str):

@@ -6,8 +6,9 @@
 #SBATCH --job-name=ring_benchmark
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:2
-#SBATCH --mem=70G
+#SBATCH --mem=120G
 #SBATCH --time=00:10:00
 #SBATCH --output=inference_insomnia_%j.out
 

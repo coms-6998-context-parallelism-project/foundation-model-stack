@@ -65,7 +65,7 @@ echo "[INFO] torchrun (nproc=$nproc_value) → $output_file"
 torchrun --nproc_per_node="$nproc_value" \
   scripts/llama_ring_sg/benchmark_ring.py \
   --architecture llama \
-  --variant 7b \
+  --variant 3-8b \
   --device_type "$DEVICE_TYPE" \
   --dtype float32 \
   "${passthrough_args[@]}" \

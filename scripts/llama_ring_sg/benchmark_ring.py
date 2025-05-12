@@ -293,7 +293,7 @@ def main():
     if not args.run_ring_first:
         strategies.reverse()
 
-    prompt_n_values = [10,200, 400, 1200, 2000]
+    prompt_n_values = [10,200, 400, 1200, 1600]
 
     for strategy_label, strategy in strategies:
 

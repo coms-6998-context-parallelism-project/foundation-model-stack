@@ -31,7 +31,7 @@ torchrun --nproc_per_node=2 \
   --architecture llama \
   --variant 7b \
   --model_path /insomnia001/depts/edu/COMSE6998/sg3790/llama-hf \
-  --tokenizer /insomnia001/depts/edu/COMSE6998/sg3790/llama-hf/tokenizer.model \
+  --tokenizer /insomnia001/depts/edu/COMSE6998/sg3790/llama-hf \
   --device_type cuda \
   --num_tokens_to_benchmark 15 \
   --batch_size 1 \

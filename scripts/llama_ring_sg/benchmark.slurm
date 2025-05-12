@@ -29,7 +29,7 @@ REPO_DIR="/insomnia001/depts/edu/COMSE6998/sg3790/foundation-model-stack"
 torchrun --nproc_per_node=2 \
   "${REPO_DIR}/scripts/llama_ring_sg/benchmark_ring.py" \
   --architecture llama \
-  --variant 7b \
+  --variant 3-8b \
   --model_path /insomnia001/depts/edu/COMSE6998/sg3790/llama-hf \
   --tokenizer /insomnia001/depts/edu/COMSE6998/sg3790/llama-hf \
   --device_type cuda \

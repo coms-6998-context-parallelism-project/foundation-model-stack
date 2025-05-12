@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument("--run_ring_first", action="store_true")
     parser.add_argument("--no-run_ring_first", dest="run_ring_first", action="store_false")
     parser.add_argument("--csv_output_file", type=str, default="benchmark_log.csv", help="Path to the CSV file for logging benchmark results.")
-    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float32", "float16", "bfloat16"])
+    parser.add_argument("--dtype", type=str, default="float16", choices=["float32", "float32", "float16", "bfloat16"])
     parser.set_defaults(run_ring_first=True)
     return parser.parse_args()
 
@@ -278,8 +278,8 @@ def main():
         initial_mem_snapshot = get_memory_snapshot(args.device_type, rank)
         print_memory_snapshot("Initial_Script_Load", initial_mem_snapshot, rank)
     except AttributeError:
-        print0(f"[WARNING] Invalid dtype '{args.dtype}', defaulting to float32.")
-        parsed_dtype = torch.float32
+        print0(f"[WARNING] Invalid dtype '{args.dtype}', defaulting to float16.")
+        parsed_dtype = torch.float16
 
     torch.set_default_dtype(parsed_dtype)
 
@@ -293,7 +293,7 @@ def main():
     if not args.run_ring_first:
         strategies.reverse()
 
-    prompt_n_values = [10,200, 400, 1200, 1600]
+    prompt_n_values = [10,200, 400, 1200, 1600, 2000]
 
     for strategy_label, strategy in strategies:
 

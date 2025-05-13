@@ -1,108 +1,122 @@
-# Context Parallelism Using Ring Attention in LLaMA
+# HPML Project: Implementing Context Parallelism in IBM's FMS using Ring Attention
 
-## Description
+## Team Information
 
-This repository aims to implement the ring attention algorithm described in [Ring Attention with Blockwise Transformers for Near-Infinite Context](https://arxiv.org/abs/2310.01889). The aim of this algorithm is to extend the maximum sequence length feasible for traditional transformer algorithms by parallelising the attention and feed forward layers across context and split it across GPUs.
+* **Team Name**: FMS-Ring
+* **Members**:
 
-Since this project is mainly focused on inference optimzations and we had direct instruction from IBM's Antoni Viros i Martin to forgo its usage, we did not use wandb for this project.
+  * Sadi Gulcelik (sg3790)
+  * Joshua Mathew (jm5915)
+  * Jaewon Lee (jl6367)
 
-## Code Outline
+---
 
-We fork off IBM's FMS open source pytorch library and modify the following key files:
-```
-fms/
-├── distributed/
-│   └── strategy.py
-├── models/
-│   ├── __init__.py
-│   └── llama.py
-│   └── llama_ring.py
+## 1. Problem Statement
 
-```
+Transformer-based large language models (LLMs) struggle with inference performance and memory use at long context lengths, due to the quadratic scaling of self-attention. We implement **Ring Attention**, a context-parallel self-attention strategy, within **IBM’s Foundation Model Stack (FMS)** to enable scalable inference across multiple GPUs. The goal is to alleviate memory bottlenecks and reduce latency for long sequences without modifying model weights or accuracy.
 
-The last file in that list was an addition by us which implements the core ring attention algorithm's computation which is effectively a re-implementation of the entire LLaMA_Block class where computations are tiled and KV caches are passed between GPUs. The other 3 files were modified so we could 
+---
 
-1) Initialize the distributed structures needed within ring attention
-2) overwrite the forward pass of LLaMA_Block with our implementation iff. a distributed_strategy flag is passed in during inference
+## 2. Model Description
 
+We use the **LLaMA 3 8B** model within IBM’s Foundation Model Stack (FMS). Key elements include:
 
-Within this repository we have another branch [fms-pr] which we aim to make an official pull-request with the original IBM repository 
-## Run instructions
+* **Framework**: PyTorch (via IBM FMS)
+* **Base Model**: LLaMA 3 8B (\~16 GB in FP32)
+* **Main Components**:
+  * `**RingAttentionStrategy**`: Orchestrates key/value sharding and inter-GPU communication in a ring topology
+  * `**LlamaRing**`: Implements attention computation across the ring
+* **Test Environments**:
+  * 2× NVIDIA L40S (Columbia Insomnia cluster)
+  * 4× NVIDIA L40S (external NVLink cluster)
 
-To properly run ring attention you will need access to multiple GPUs. The folowing commands assume this fact.
+---
 
-To run the benchmarks we ran 
-```bash
-# If you are on a cluster w/ slurm you can use the following 
+## 3. Final Results Summary
 
-# Assumes the following in your working dir:
-# foundation-model-stack/
-# ├── fms/
-# │   ├── models/
-# │   ├── modules/
-# │   └── utils/
-# └── tests/
-#
-# llama-hf/
-# ├── config/
-# ├── tokenizer/
-# └── convert.py
+| Metric                    | Value                                           |
+| ------------------------- | ----------------------------------------------- |
+| Final Accuracy            | Matches single-GPU baseline outputs             |
+| Max Context Length Tested | 6998 tokens                                     |
+| Inference Latency (FP32)  | \~6000 ms (baseline) → \~4000 ms (Ring, 4 GPUs) |
+| Model Size                | \~16 GB (FP32)                                  |
+| Training Time/Epoch       | N/A (inference-only project)                    |
+| Device                    | 2× / 4× NVIDIA L40S                             |
 
+---
 
-sbatch --output=bench.out foundation-model-stack/scripts/llama_ring/benchmark_ring.slurm
+## 4. Reproducibility Instructions
 
-# Alternatively call torchrun directly
-torchrun --nproc_per_node=2 \
-./scripts/llama_ring/benchmark_ring.py \
-  --architecture llama \
-  --variant 7b \
-  --model_path $PATH_TO_MODEL \
-  --tokenizer $PATH_TO_MODEL_TOKENIZER \
-  --device_type cuda \
-  --num_tokens_to_benchmark 30 \
-  --batch_size 1 \
-  --run_ring_first \
-  --prompt_len 100
-```
+### A. Requirements
 
-To just run inference
+Install all dependencies from the root of the FMS repository:
 
 ```bash
-# If you are on a cluster w/ slurm you can use the following 
-
-# Assumes the following in your working dir:
-# foundation-model-stack/
-# ├── fms/
-# │   ├── models/
-# │   ├── modules/
-# │   └── utils/
-# └── tests/
-#
-# llama-hf/
-# ├── config/
-# ├── tokenizer/
-# └── convert.py
-
-
-sbatch --output=inference.out foundation-model-stack/scripts/llama_ring/run_inference.slurm
-
-# Alternatively call torchrun directly
-torchrun --nproc_per_node=2 \
-  ./scripts/inference.py \
-  --architecture llama \
-  --variant 7b \
-  --model_path $PATH_TO_MODEL \
-  --tokenizer $PATH_TO_MODEL_TOKENIZER \
-  --model_source hf \
-  --device_type cuda \
-  --default_dtype fp16 \
-  --distributed_strategy ring \
-  --no_use_cache \
-  --distributed
+pip install -e .
 ```
 
-## Results
+---
 
-As a first pass at this algorithim we implemented a fixed blocksize of distributing between GPUS. We ran the following experiment with 2 GPUs which is the max we were able to test with and is well below the regime we believe this algorithm would excel in. Despite that fact, we see promising results shown int he 1024 block size benchmarks when we approach maximum supported sequence length of 2048. Similarly for a block size of 2048, the maximum supported sequence length is 4096 which is also the maximum expected sequence length of llama 7b, and we can see that as we approach that sequence length ring attention scale better than the default attention algorithm.
+### B. Wandb Dashboard
 
-![Token Latency](HPML_artifacts/inference_token_latency.png)
+Not used. Logs and performance metrics are written to `.out` files and `.csv` logs for analysis.
+
+---
+
+### C. Inference Only
+
+This is an inference-only project. Use the following commands:
+
+This is an inference-only project. To run inference from the root of the repository, use the following command:
+
+```bash
+torchrun --nproc_per_node=1 foundation-model-stack/scripts/inference.py --architecture llama --variant 7b --model_path ../llama-hf --model_source hf --tokenizer ../llama-hf/tokenizer.model --device_type mps --default_dtype fp16 --no_use_cache
+```
+
+**Notes:**
+* This command should be run from the root of the FMS repository.
+* `--model_path ../llama-hf` and `--tokenizer ../llama-hf/tokenizer.model` are relative paths. Ensure these point correctly to your model and tokenizer files from the repository root.
+* Key arguments:
+    * `--nproc_per_node`: Number of processes (e.g., GPUs) per node.
+    * `--default_dtype`: Data type for model weights and computations (e.g., `fp16`, `float32`).
+    * `--device_type`: The type of device to run on (e.g., `mps` for Apple Silicon, `cuda` for NVIDIA GPUs).
+
+---
+
+### D. Evaluation
+
+Benchmarking runs generate structured `.csv` output files using the `**sg_fast_benchmarking**` branch of our repo.
+We parse these in a **Jupyter notebook** for all latency and scaling visualizations.
+
+---
+
+### E. Quickstart: Minimum Reproducible Result
+
+```bash
+# Step 0: Clone the Repo
+
+# Step 1: Install FMS package
+pip install -e 
+
+# Step 2: Enter benchmark directory
+cd /scripts/llama_ring
+
+
+
+# Step 3: Run the benchmark
+./benchmark.sh --nproc 2 ring
+```
+
+**Logs:**
+
+* On Slurm: `~/inference_insomnia_<job_id>.out`
+* Locally: `testing/inference_local_<timestamp>.out`
+
+---
+
+## 5. Notes
+
+* `RingAttentionStrategy` and `LlamaRing` are our primary contributions to the FMS attention stack.
+* The code builds on IBM FMS’s support for FlashAttention and distributed inference.
+* Benchmark analysis is performed using a Jupyter notebook on `.csv` logs.
+* For cluster-specific jobs and extensions, see the `sg_fast_benchmarking` Git branch.
